@@ -158,6 +158,16 @@ docker compose up -d
 
 完整的首次使用流程见 [完整入门教程](https://docs.arc-reel.com/guide/getting-started)；生产部署、升级、备份和反向代理见 [部署与运维](https://docs.arc-reel.com/ops/deployment)。
 
+### Elysium 远程网关
+
+源码方式运行时，可用仓库内的幂等向导配置团队远程网关。向导固定使用 `http://43.154.247.11`，自动配置 `elysium-chat`、`elysium-image`、`elysium-video` 及全部兼容的默认模型槽位：
+
+```bash
+./scripts/setup_elysium_gateway.sh
+```
+
+向导会隐藏读取服务器签发的 API Key，并只把密钥写入本机 ArcReel 数据库；密钥不会进入命令行参数、环境变量或 Git。换电脑后，在新检出的仓库中重新运行一次向导即可。本网关当前不提供 Anthropic Messages 与文字转语音接口，因此 ArcReel 内嵌 Agent 和 TTS 仍需单独配置兼容供应商。
+
 ## 文档
 
 | 页面 | 内容 |

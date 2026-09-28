@@ -158,6 +158,16 @@ After signing in, open **Settings**, configure the ArcReel AI assistant and the 
 
 For the complete first-run workflow, see [Getting Started](https://docs.arc-reel.com/en/guide/getting-started). For production deployment, upgrades, backups, and reverse proxies, see [Deployment and Operations](https://docs.arc-reel.com/en/ops/deployment).
 
+### Elysium Remote Gateway
+
+When running from source, use the checked-in idempotent wizard to configure the team's remote gateway. It targets `http://43.154.247.11` and configures `elysium-chat`, `elysium-image`, `elysium-video`, and every compatible default model slot:
+
+```bash
+./scripts/setup_elysium_gateway.sh
+```
+
+The wizard reads the server-issued API key without echoing it and stores it only in the local ArcReel database. The key never enters command-line arguments, environment variables, or Git. Run the wizard once after checking out the repository on a new computer. The gateway currently exposes neither Anthropic Messages nor text-to-speech endpoints, so the embedded ArcReel Agent and TTS still require separate compatible providers.
+
 ## Documentation
 
 | Page | Purpose |
