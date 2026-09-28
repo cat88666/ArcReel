@@ -251,6 +251,7 @@ def check_sandbox_available(
 
 _DOCKERENV_PATH = Path("/.dockerenv")
 _CGROUP_PATH = Path("/proc/1/cgroup")
+_WEAKER_NESTED_SANDBOX_ENV = "ARCREEL_WEAKER_NESTED_SANDBOX"
 
 
 def detect_docker_environment(
@@ -271,6 +272,11 @@ def detect_docker_environment(
     except OSError:
         return False
     return "docker" in content or "podman" in content
+
+
+def should_enable_weaker_nested_sandbox(*, in_docker: bool) -> bool:
+    """容器或显式声明受限 user namespace 时启用 SDK 的嵌套沙箱模式。"""
+    return in_docker or os.environ.get(_WEAKER_NESTED_SANDBOX_ENV) == "1"
 
 
 # 初始化日志：模块导入期只挂 stream handler。
@@ -356,7 +362,13 @@ async def lifespan(app: FastAPI):
     # detect_docker_environment 仅在 sandbox 可用平台有意义（Linux 路径探测）；
     # Windows 回退时跳过，避免无意义的文件系统调用。
     is_docker = detect_docker_environment() if sandbox_enabled else False
-    logger.info("Sandbox runtime: enabled=%s docker=%s", sandbox_enabled, is_docker)
+    use_weaker_nested_sandbox = should_enable_weaker_nested_sandbox(in_docker=is_docker)
+    logger.info(
+        "Sandbox runtime: enabled=%s docker=%s weaker_nested=%s",
+        sandbox_enabled,
+        is_docker,
+        use_weaker_nested_sandbox,
+    )
 
     app.state.in_docker = is_docker
     app.state.sandbox_enabled = sandbox_enabled
@@ -456,7 +468,10 @@ async def lifespan(app: FastAPI):
     await startup_http_client()
 
     # Initialize async services
-    await assistant.assistant_service.startup(in_docker=is_docker, sandbox_enabled=sandbox_enabled)
+    await assistant.assistant_service.startup(
+        in_docker=use_weaker_nested_sandbox,
+        sandbox_enabled=sandbox_enabled,
+    )
     assistant.assistant_service.session_manager.start_patrol()
 
     logger.info("启动 GenerationWorker...")

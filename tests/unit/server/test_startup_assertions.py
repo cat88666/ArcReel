@@ -15,6 +15,7 @@ from server.app import (
     assert_no_provider_secrets_in_environ,
     check_sandbox_available,
     detect_docker_environment,
+    should_enable_weaker_nested_sandbox,
 )
 
 
@@ -262,6 +263,18 @@ def test_detect_docker_via_cgroup(tmp_path) -> None:
 
 def test_detect_no_docker(tmp_path) -> None:
     assert detect_docker_environment(dockerenv_path=tmp_path / "nope", cgroup_path=tmp_path / "also_nope") is False
+
+
+def test_weaker_nested_sandbox_can_be_enabled_for_restricted_native_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARCREEL_WEAKER_NESTED_SANDBOX", "1")
+
+    assert should_enable_weaker_nested_sandbox(in_docker=False) is True
+
+
+def test_weaker_nested_sandbox_stays_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ARCREEL_WEAKER_NESTED_SANDBOX", raising=False)
+
+    assert should_enable_weaker_nested_sandbox(in_docker=False) is False
 
 
 # bool 是 int 子类，``isinstance(True, int) and True > 0`` 为真——这一组三连测试
