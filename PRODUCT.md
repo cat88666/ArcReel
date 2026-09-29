@@ -43,7 +43,7 @@ web
 
 ## Brand Commitments
 
-- 名称 ArcReel，口号「Agent 驱动的 AI 视频创作工作台」（`BRAND.tagline` 默认值）。
+- 名称 ArcReel `BRAND.tagline` 默认值）。
 - **品牌名可动态配置**：品牌名与口号取自 `frontend/src/branding.ts` 的 `BRAND` 与 i18n 资源中的 `[[brand]]` 占位符，构建期可覆盖。
 - **术语表即界面用词**：`CONTEXT.md` 中的中文术语就是 UI 用词，其 `_Avoid_` 条目列出的说法禁止出现在界面上。
 
