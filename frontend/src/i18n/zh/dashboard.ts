@@ -458,6 +458,16 @@ export default {
 
   // ExportScopeDialog
   'export_scope_title': '选择导出范围',
+  'final_outputs': '成片预览与下载',
+  'final_outputs_hint': '查看 compose-video 已合成的完整视频',
+  'final_outputs_description': '这些视频由成片合成流程写入，可直接预览或下载。',
+  'final_outputs_empty': '还没有已合成的成片',
+  'final_outputs_loading': '正在读取成片',
+  'final_output_preview': '{{name}} 成片预览',
+  'final_output_download': '下载成片',
+  'final_output_load_failed': '读取成片失败：{{message}}',
+  'final_output_preview_failed': '加载预览失败：{{message}}',
+  'final_output_download_failed': '下载成片失败：{{message}}',
   'current_version_only': '仅当前版本',
   'recommended': '推荐',
   'small_size_hint': '不含版本历史，体积更小',

@@ -123,6 +123,29 @@ describe("GlobalHeader", () => {
     expect(useAppStore.getState().toast?.text).toContain("包含 1 条诊断");
   });
 
+  it("opens final output preview from the export menu", async () => {
+    vi.spyOn(API, "listFinalOutputs").mockResolvedValue({ outputs: [] });
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: {
+        title: "成片项目",
+        content_mode: "drama",
+        style: "Anime",
+        episodes: [],
+        characters: {},
+        scenes: {},
+        props: {},
+      },
+    });
+
+    renderHeader();
+    screen.getByRole("button", { name: "导出当前项目 ZIP" }).click();
+    (await screen.findByRole("button", { name: /成片预览与下载/ })).click();
+
+    expect(await screen.findByRole("dialog", { name: "成片预览与下载" })).toBeInTheDocument();
+    expect(API.listFinalOutputs).toHaveBeenCalledWith("demo");
+  });
+
   it("ad 参考生视频导出不做旧签名预检", async () => {
     vi.spyOn(API, "requestExportToken").mockResolvedValue({
       download_token: "test-download-token",

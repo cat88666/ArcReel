@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   Loader2,
   PackageCheck,
+  PlaySquare,
 } from "lucide-react";
 import { GlassPopover } from "@/components/ui/GlassPopover";
 import { PrimaryButton } from "@/components/ui/PrimaryButton";
@@ -15,7 +16,7 @@ import type { EpisodeMeta } from "@/types/project";
 import type { PresentationVariant } from "@/types/presentation";
 import { WARM_TONE } from "@/utils/severity-tone";
 
-export type ExportScope = "current" | "full" | "jianying-draft";
+export type ExportScope = "current" | "full" | "jianying-draft" | "final-output";
 
 const DRAFT_PATH_STORAGE_KEY = "arcreel_jianying_draft_path";
 
@@ -123,6 +124,13 @@ export function ExportScopeDialog({
           </div>
 
           <div className="flex flex-col gap-2">
+            <ScopeOption
+              icon={<PlaySquare className="h-4 w-4" />}
+              title={t("dashboard:final_outputs")}
+              hint={t("dashboard:final_outputs_hint")}
+              tone="accent"
+              onClick={() => onSelect("final-output")}
+            />
             <ScopeOption
               icon={<Package className="h-4 w-4" />}
               title={

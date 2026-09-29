@@ -34,6 +34,7 @@ SELF_AUTH_OPERATIONS = frozenset(
     {
         "GET /api/v1/projects/{name}/export",
         "GET /api/v1/projects/{name}/export/jianying-draft",
+        "GET /api/v1/projects/{project_name}/final-outputs/{filename}",
     }
 )
 
@@ -220,10 +221,11 @@ def test_trial_artifact_accepts_bearer_token(auth_coverage_client):
     [
         "/api/v1/projects/demo/export?download_token=not-a-valid-token",
         "/api/v1/projects/demo/export/jianying-draft?download_token=not-a-valid-token&episode=1&draft_path=/tmp/d",
+        "/api/v1/projects/demo/final-outputs/final.mp4?download_token=not-a-valid-token",
     ],
 )
-def test_export_endpoints_reject_forged_token(auth_coverage_client, path):
-    """导出走短时效下载 token，伪造的必须被 verify_download_token 拒绝。"""
+def test_download_endpoints_reject_forged_token(auth_coverage_client, path):
+    """下载走短时效 token，伪造的必须被 verify_download_token 拒绝。"""
     assert auth_coverage_client.get(path).status_code in (401, 403)
 
 

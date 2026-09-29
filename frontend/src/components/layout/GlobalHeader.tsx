@@ -12,6 +12,7 @@ import { useUsageHeaderStore } from "@/stores/usage-header-store";
 import { UsageHeaderEntry } from "@/components/usage/UsageHeaderEntry";
 import { WorkspaceNotificationsDrawer } from "./WorkspaceNotificationsDrawer";
 import { ExportScopeDialog } from "./ExportScopeDialog";
+import { FinalOutputsDialog } from "./FinalOutputsDialog";
 import { ProjectMenu } from "./ProjectMenu";
 import { PhaseStepper } from "./PhaseStepper";
 
@@ -49,6 +50,7 @@ export function GlobalHeader({ onNavigateBack }: GlobalHeaderProps) {
   const [notificationDrawerOpen, setNotificationDrawerOpen] = useState(false);
   const [exportingProject, setExportingProject] = useState(false);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [finalOutputsOpen, setFinalOutputsOpen] = useState(false);
   const [jianyingExporting, setJianyingExporting] = useState(false);
   const [exportDiagnostics, setExportDiagnostics] = useState<ExportDiagnostics | null>(null);
   const notificationAnchorRef = useRef<HTMLDivElement>(null);
@@ -74,6 +76,7 @@ export function GlobalHeader({ onNavigateBack }: GlobalHeaderProps) {
     if (!demoMode) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- 切入演示态时关闭已打开的导出弹窗，是有意的 UI 状态重置
     setExportDialogOpen(false);
+    setFinalOutputsOpen(false);
   }, [demoMode]);
 
   // 入口的数据随项目走：切到别的项目或演示项目时清空上一项目的用量，并收起悬浮层。
@@ -307,7 +310,12 @@ export function GlobalHeader({ onNavigateBack }: GlobalHeaderProps) {
               open={exportDialogOpen}
               onClose={() => setExportDialogOpen(false)}
               onSelect={(scope) => {
-                if (scope !== "jianying-draft") void handleExportProject(scope);
+                if (scope === "final-output") {
+                  setExportDialogOpen(false);
+                  setFinalOutputsOpen(true);
+                } else if (scope !== "jianying-draft") {
+                  void handleExportProject(scope);
+                }
               }}
               anchorRef={exportAnchorRef}
               episodes={currentProjectData?.episodes ?? []}
@@ -374,6 +382,13 @@ export function GlobalHeader({ onNavigateBack }: GlobalHeaderProps) {
           </button>
         </div>
       </header>
+      {currentProjectName && finalOutputsOpen ? (
+        <FinalOutputsDialog
+          key={currentProjectName}
+          projectName={currentProjectName}
+          onClose={() => setFinalOutputsOpen(false)}
+        />
+      ) : null}
 
       {exportDiagnostics !== null && (
         <ArchiveDiagnosticsDialog

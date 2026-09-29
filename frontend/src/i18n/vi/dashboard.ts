@@ -451,6 +451,16 @@ export default {
 
   // ExportScopeDialog
   'export_scope_title': 'Chọn phạm vi xuất',
+  'final_outputs': 'Xem trước và tải video hoàn chỉnh',
+  'final_outputs_hint': 'Xem video hoàn chỉnh do compose-video tạo',
+  'final_outputs_description': 'Các video này được tạo bởi quy trình ghép video hoàn chỉnh và có thể xem trước hoặc tải xuống.',
+  'final_outputs_empty': 'Chưa có video hoàn chỉnh nào được ghép',
+  'final_outputs_loading': 'Đang tải video hoàn chỉnh',
+  'final_output_preview': 'Xem trước video hoàn chỉnh {{name}}',
+  'final_output_download': 'Tải video',
+  'final_output_load_failed': 'Không thể tải danh sách video: {{message}}',
+  'final_output_preview_failed': 'Không thể tải bản xem trước: {{message}}',
+  'final_output_download_failed': 'Không thể tải video xuống: {{message}}',
   'current_version_only': 'Chỉ phiên bản hiện tại',
   'recommended': 'Khuyến nghị',
   'small_size_hint': 'Không có lịch sử phiên bản, kích thước nhỏ hơn',

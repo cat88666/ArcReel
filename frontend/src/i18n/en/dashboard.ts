@@ -458,6 +458,16 @@ export default {
 
   // ExportScopeDialog
   'export_scope_title': 'Select Export Scope',
+  'final_outputs': 'Preview and Download Final Videos',
+  'final_outputs_hint': 'View complete videos created by compose-video',
+  'final_outputs_description': 'These videos were created by the final composition workflow and are ready to preview or download.',
+  'final_outputs_empty': 'No final videos have been composed yet',
+  'final_outputs_loading': 'Loading final videos',
+  'final_output_preview': '{{name}} final video preview',
+  'final_output_download': 'Download Video',
+  'final_output_load_failed': 'Failed to load final videos: {{message}}',
+  'final_output_preview_failed': 'Failed to load preview: {{message}}',
+  'final_output_download_failed': 'Failed to download video: {{message}}',
   'current_version_only': 'Current Version Only',
   'recommended': 'Recommended',
   'small_size_hint': 'No version history, smaller size',

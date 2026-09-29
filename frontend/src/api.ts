@@ -555,6 +555,33 @@ class API {
     return `${API_BASE}/projects/${encodeURIComponent(projectName)}/export?download_token=${encodeURIComponent(downloadToken)}&scope=${encodeURIComponent(scope)}`;
   }
 
+  static async listFinalOutputs(
+    projectName: string,
+  ): Promise<{ outputs: { name: string; size: number }[] }> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/final-outputs`);
+  }
+
+  static async requestFinalOutputToken(
+    projectName: string,
+    filename: string,
+  ): Promise<{ download_token: string; expires_in: number }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/final-outputs/${encodeURIComponent(filename)}/token`,
+      { method: "POST" },
+    );
+  }
+
+  static getFinalOutputUrl(
+    projectName: string,
+    filename: string,
+    downloadToken: string,
+    download = false,
+  ): string {
+    const query = new URLSearchParams({ download_token: downloadToken });
+    if (download) query.set("download", "true");
+    return `${API_BASE}/projects/${encodeURIComponent(projectName)}/final-outputs/${encodeURIComponent(filename)}?${query}`;
+  }
+
   /** 构造剪映草稿下载 URL */
   static getJianyingDraftDownloadUrl(
     projectName: string,
