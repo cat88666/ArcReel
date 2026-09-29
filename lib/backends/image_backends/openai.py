@@ -127,21 +127,40 @@ class OpenAIImageBackend:
         return await (self._generate_edit(request) if has_refs else self._generate_create(request))
 
     async def _generate_create(self, request: ImageGenerationRequest) -> ImageGenerationResult:
+        kwargs = self._build_create_kwargs(request)
+        logger.info("调用 %s 图片 SDK (T2I) kwargs=%s", self.name, format_kwargs_for_log(kwargs))
+        response = await self._client.images.generate(**kwargs)
+        return await self._save_and_return(response, request)
+
+    def _build_create_kwargs(self, request: ImageGenerationRequest) -> dict:
+        """按当前端点契约组装 images.generate 参数。"""
         kwargs = {
             "model": self._model,
             "prompt": request.prompt,
             "n": 1,
         }
         kwargs.update(_resolve_openai_params(request.image_size, request.aspect_ratio))
-        logger.info("调用 %s 图片 SDK (T2I) kwargs=%s", self.name, format_kwargs_for_log(kwargs))
-        response = await self._client.images.generate(**kwargs)
-        return await self._save_and_return(response, request)
+        return kwargs
+
+    def _build_edit_kwargs(self, request: ImageGenerationRequest, image_files: list) -> dict:
+        """按当前端点契约组装 images.edit 参数。"""
+        kwargs = {
+            "model": self._model,
+            "image": image_files,
+            "prompt": request.prompt,
+        }
+        kwargs.update(_resolve_openai_params(request.image_size, request.aspect_ratio))
+        return kwargs
+
+    def _result_quality(self, request: ImageGenerationRequest) -> str | None:
+        return _quality_for(request.image_size)
 
     async def _generate_edit(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         refs = request.reference_images
-        if len(refs) > _MAX_REFERENCE_IMAGES:
-            logger.warning("参考图数量 %d 超过上限 %d，截断", len(refs), _MAX_REFERENCE_IMAGES)
-            refs = refs[:_MAX_REFERENCE_IMAGES]
+        max_reference_images = self.max_reference_images
+        if len(refs) > max_reference_images:
+            logger.warning("参考图数量 %d 超过上限 %d，截断", len(refs), max_reference_images)
+            refs = refs[:max_reference_images]
 
         def _open_refs() -> tuple[ExitStack, list]:
             """在 ExitStack 内打开所有参考图，保证部分 open 失败时已打开句柄被释放。"""
@@ -170,14 +189,7 @@ class OpenAIImageBackend:
                     model=self._model,
                     detail="all reference images failed to open",
                 )
-            # I2I 与 T2I 对称下传 size/quality——否则 images.edit 不带 size，比例由上游默认决定，
-            # 项目 aspect_ratio 静默失效（用户实测正是 I2I 路径出图比例错）。
-            edit_kwargs: dict = {
-                "model": self._model,
-                "image": image_files,
-                "prompt": request.prompt,
-            }
-            edit_kwargs.update(_resolve_openai_params(request.image_size, request.aspect_ratio))
+            edit_kwargs = self._build_edit_kwargs(request, image_files)
             logger.info(
                 "调用 %s 图片 SDK (I2I) kwargs=%s",
                 self.name,
@@ -197,7 +209,7 @@ class OpenAIImageBackend:
             )
         await save_image_from_response_item(data[0], request.output_path)
         logger.info("OpenAI 图片生成完成: %s", request.output_path)
-        quality = _quality_for(request.image_size)
+        quality = self._result_quality(request)
 
         img_in = img_out = txt_in = txt_out = None
         usage = getattr(response, "usage", None)

@@ -24,6 +24,7 @@ from arcreel_market_core.video_backend_contract import ReferenceAudioMode, Video
 from lib.backends.audio_backends.openai import OpenAIAudioBackend
 from lib.backends.image_backends.base import ImageCapability
 from lib.backends.image_backends.dashscope import DashScopeImageBackend
+from lib.backends.image_backends.elysium import ElysiumImageBackend
 from lib.backends.image_backends.gemini import GeminiImageBackend
 from lib.backends.image_backends.kling import KlingImageBackend
 from lib.backends.image_backends.minimax import MiniMaxImageBackend
@@ -233,6 +234,12 @@ def _build_openai_images(provider, model_id: str) -> CustomImageBackend:
     return CustomImageBackend(provider_id=provider.provider_id, delegate=delegate, model=model_id)
 
 
+def _build_elysium_images(provider, model_id: str) -> CustomImageBackend:
+    base_url = ensure_openai_base_url(provider.base_url)
+    delegate = ElysiumImageBackend(api_key=provider.api_key, base_url=base_url, model=model_id)
+    return CustomImageBackend(provider_id=provider.provider_id, delegate=delegate, model=model_id)
+
+
 def _build_openai_images_generations(provider, model_id: str) -> CustomImageBackend:
     base_url = ensure_openai_base_url(provider.base_url)
     delegate = OpenAIImageBackend(
@@ -372,6 +379,16 @@ ENDPOINT_REGISTRY: dict[str, EndpointSpec] = {
         request_path_template="/v1/images/{generations,edits}",
         image_capabilities=frozenset({ImageCapability.TEXT_TO_IMAGE, ImageCapability.IMAGE_TO_IMAGE}),
         build_backend=_build_openai_images,
+    ),
+    "elysium-images": EndpointSpec(
+        key="elysium-images",
+        media_type="image",
+        family="elysium",
+        display_name_key="endpoint_elysium_images_display",
+        request_method="POST",
+        request_path_template="/v1/images/{generations,edits}",
+        image_capabilities=frozenset({ImageCapability.TEXT_TO_IMAGE, ImageCapability.IMAGE_TO_IMAGE}),
+        build_backend=_build_elysium_images,
     ),
     "openai-images-generations": EndpointSpec(
         key="openai-images-generations",

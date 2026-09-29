@@ -180,6 +180,7 @@ def test_model_definitions_are_independent() -> None:
     first[0]["display_name"] = "changed"
 
     assert gateway_config.model_definitions()[0]["display_name"] == "Elysium Chat"
+    assert gateway_config.model_definitions()[1]["endpoint"] == "elysium-images"
     assert json.loads(gateway_config.model_definitions()[2]["supported_durations"]) == list(range(1, 16))
 
 

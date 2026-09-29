@@ -1264,6 +1264,7 @@ export default {
   'endpoint_openai_chat_display': 'OpenAI 文本',
   'endpoint_gemini_generate_display': 'Gemini 文本',
   'endpoint_openai_images_display': 'OpenAI 图片',
+  'endpoint_elysium_images_display': 'Elysium 图片',
   'endpoint_openai_images_generations_display': 'OpenAI 图片（仅文生图）',
   'endpoint_openai_images_edits_display': 'OpenAI 图片（仅图生图）',
   'endpoint_gemini_image_display': 'Gemini 图片',

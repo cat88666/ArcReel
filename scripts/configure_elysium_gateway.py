@@ -41,7 +41,7 @@ MODEL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
         "model_id": "elysium-image",
         "display_name": "Elysium Image",
-        "endpoint": "openai-images",
+        "endpoint": "elysium-images",
         "is_default": True,
         "is_enabled": True,
     },

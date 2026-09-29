@@ -1247,6 +1247,7 @@ export default {
   'endpoint_openai_chat_display': 'OpenAI Chat Completions',
   'endpoint_gemini_generate_display': 'Google Gemini',
   'endpoint_openai_images_display': 'Ảnh OpenAI',
+  'endpoint_elysium_images_display': 'Ảnh Elysium',
   'endpoint_openai_images_generations_display': 'Ảnh OpenAI (chỉ T2I)',
   'endpoint_openai_images_edits_display': 'Ảnh OpenAI (chỉ I2I)',
   'endpoint_gemini_image_display': 'Ảnh Google Gemini',
