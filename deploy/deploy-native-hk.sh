@@ -55,7 +55,7 @@ COPYFILE_DISABLE=1 tar \
     --exclude='*.pyc' \
     -cf - \
     pyproject.toml uv.lock README.md \
-    lib server alembic alembic.ini scripts agent_runtime_profile public frontend/dist \
+    lib packages server alembic alembic.ini scripts agent_runtime_profile public frontend/dist \
     | tar -xf - -C "$temp_dir/app"
 printf '%s\n' "$release_id" > "$temp_dir/app/.deployment-version"
 COPYFILE_DISABLE=1 tar -C "$temp_dir/app" -czf "$archive" .
