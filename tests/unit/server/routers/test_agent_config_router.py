@@ -101,8 +101,8 @@ async def test_create_with_preset(agent_config_client) -> None:
     assert cred["display_name"] == "DeepSeek"
     assert cred["api_key_masked"].startswith("sk-")
     assert cred["icon_key"] == "DeepSeek"
-    # 第一条凭证应自动 active
-    assert cred["is_active"] is True
+    # 新凭证必须先测试再显式激活。
+    assert cred["is_active"] is False
 
 
 @pytest.mark.asyncio
@@ -204,11 +204,11 @@ async def test_test_connection_rejects_unsupported_base_url(agent_config_client)
     assert "sk-x" not in resp.text
 
 
-async def _seed_custom_provider(db_factory, *, base_url: str, api_key: str) -> int:
+async def _seed_custom_provider(db_factory, *, base_url: str, api_key: str, discovery_format: str = "anthropic") -> int:
     async with db_factory() as session:
         provider = await CustomProviderRepository(session).create_provider(
             display_name="Relay",
-            discovery_format="anthropic",
+            discovery_format=discovery_format,
             base_url=base_url,
             api_key=api_key,
         )
@@ -258,6 +258,23 @@ async def test_create_from_custom_provider_prefers_request_base_url(agent_config
     stored = await _stored_credential(db_factory, resp.json()["id"])
     assert stored.base_url == "https://relay.example.com/anthropic"
     assert stored.api_key == "sk-p"
+
+
+@pytest.mark.asyncio
+async def test_create_from_openai_provider_requires_explicit_anthropic_base_url(
+    agent_config_client, db_factory
+) -> None:
+    provider_id = await _seed_custom_provider(
+        db_factory,
+        base_url="https://relay.example.com/v1",
+        api_key="sk-p",
+        discovery_format="openai",
+    )
+    resp = await agent_config_client.post(
+        "/api/v1/agent/credentials",
+        json={"preset_id": "__custom__", "from_custom_provider_id": provider_id},
+    )
+    assert resp.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -332,7 +349,7 @@ async def test_delete_active_blocked(agent_config_client) -> None:
     created = (
         await agent_config_client.post(
             "/api/v1/agent/credentials",
-            json={"preset_id": "deepseek", "api_key": "sk"},
+            json={"preset_id": "deepseek", "api_key": "sk", "activate": True},
         )
     ).json()
     resp = await agent_config_client.delete(f"/api/v1/agent/credentials/{created['id']}")
@@ -347,10 +364,10 @@ async def test_delete_nonexistent_returns_404(agent_config_client) -> None:
 
 @pytest.mark.asyncio
 async def test_delete_inactive_returns_204(agent_config_client) -> None:
-    # 第一条自动 active
+    # 第一条显式 active
     await agent_config_client.post(
         "/api/v1/agent/credentials",
-        json={"preset_id": "deepseek", "api_key": "sk-A"},
+        json={"preset_id": "deepseek", "api_key": "sk-A", "activate": True},
     )
     # 第二条显式 activate=False，可删
     second = (
@@ -368,10 +385,16 @@ async def test_delete_inactive_returns_204(agent_config_client) -> None:
 
 @pytest.mark.asyncio
 async def test_activate_credential_switches(agent_config_client, monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    invalidate = AsyncMock()
+    service = SimpleNamespace(session_manager=SimpleNamespace(invalidate_provider_credentials=invalidate))
+    monkeypatch.setattr("server.routers.assistant.get_assistant_service", lambda: service)
     a = (
         await agent_config_client.post(
             "/api/v1/agent/credentials",
-            json={"preset_id": "deepseek", "api_key": "sk-A"},
+            json={"preset_id": "deepseek", "api_key": "sk-A", "activate": True},
         )
     ).json()
     b = (
@@ -391,6 +414,7 @@ async def test_activate_credential_switches(agent_config_client, monkeypatch) ->
     flags = {c["id"]: c["is_active"] for c in listing}
     assert flags[a["id"]] is False
     assert flags[b["id"]] is True
+    assert invalidate.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -428,6 +452,48 @@ async def test_test_connection_draft_calls_run_test(agent_config_client, monkeyp
     assert "discovery_probe" not in body
     assert "derived_discovery_root" not in body
     fake.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_test_connection_draft_can_use_imported_provider_key(
+    agent_config_client, db_factory, monkeypatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from lib.config import anthropic_probe as probe_mod
+
+    provider_id = await _seed_custom_provider(
+        db_factory,
+        base_url="https://relay.example.com/v1",
+        api_key="sk-provider",
+        discovery_format="openai",
+    )
+    expected = probe_mod.TestConnectionResponse(
+        overall="ok",
+        messages_probe=probe_mod.ProbeResult(success=True, status_code=200, latency_ms=10, error=None),
+        diagnosis=None,
+        suggestion=None,
+        messages_url="https://relay.example.com/v1/messages",
+    )
+    fake = AsyncMock(return_value=expected)
+    monkeypatch.setattr(agent_config, "run_test", fake)
+
+    resp = await agent_config_client.post(
+        "/api/v1/agent/test-connection",
+        json={
+            "preset_id": "__custom__",
+            "from_custom_provider_id": provider_id,
+            "base_url": "https://relay.example.com",
+            "model": "elysium-chat",
+        },
+    )
+    assert resp.status_code == 200
+    fake.assert_awaited_once_with(
+        preset_id="__custom__",
+        base_url="https://relay.example.com",
+        api_key="sk-provider",
+        model="elysium-chat",
+    )
 
 
 @pytest.mark.asyncio

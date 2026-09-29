@@ -373,7 +373,25 @@ describe("AddCredentialModal", () => {
       discovery_format: "openai",
       base_url: "https://api.deepseek.com",
       api_key_masked: "sk-abcd…1234",
-      models: [],
+      models: [
+        {
+          id: 1,
+          model_id: "elysium-chat",
+          display_name: "Elysium Chat",
+          endpoint: "openai-chat",
+          is_default: true,
+          is_enabled: true,
+          price_unit: null,
+          price_input: null,
+          price_output: null,
+          currency: null,
+          supported_durations: null,
+          resolution: null,
+          system_capabilities: null,
+          capability_overrides: null,
+          global_bucket_refs: null,
+        },
+      ],
       created_at: "2026-05-11T00:00:00Z",
       image_max_workers: null,
       video_max_workers: null,
@@ -440,22 +458,28 @@ describe("AddCredentialModal", () => {
     const apiKeyInput = () =>
       screen.getByLabelText(/anthropic[_ ]?api[_ ]?key|Anthropic API 密钥/i) as HTMLInputElement;
 
-    it("prefills base_url and leaves the key to the server", async () => {
+    it("requires an Anthropic base_url for an OpenAI provider and preselects its text model", async () => {
       await renderAndImport();
 
       const baseUrlInput = (await screen.findByLabelText(
         /base[_ ]url|代理地址/i,
       )) as HTMLInputElement;
       await waitFor(() => {
-        expect(baseUrlInput.value).toBe("https://api.deepseek.com");
+        expect(baseUrlInput.value).toBe("");
       });
       expect(apiKeyInput().value).toBe("");
       expect(apiKeyInput()).toBeDisabled();
       expect(apiKeyInput().placeholder).toMatch(/DeepSeek \(Custom\)/);
+      expect(screen.getByLabelText(/default[_ ]?model|默认模型/i)).toHaveValue("elysium-chat");
+      expect(screen.getByLabelText(/subagent[_ ]?model|子智能体模型/i)).toHaveValue("elysium-chat");
     });
 
-    it("submits the provider id instead of an api_key", async () => {
+    it("submits the provider id and explicit Anthropic base_url instead of an api_key", async () => {
       const onSubmit = await renderAndImport();
+
+      fireEvent.change(await screen.findByLabelText(/base[_ ]url|代理地址/i), {
+        target: { value: "https://api.deepseek.com/anthropic" },
+      });
 
       const submit = screen.getByRole("button", { name: /^(add|添加)$/i });
       await waitFor(() => expect(submit).toBeEnabled());
@@ -465,9 +489,10 @@ describe("AddCredentialModal", () => {
       const payload = onSubmit.mock.calls[0][0];
       expect(payload.from_custom_provider_id).toBe(42);
       expect(payload.preset_id).toBe("__custom__");
-      // 预填地址未改动时交给服务端取供应商的当前地址
-      expect(payload.base_url).toBeUndefined();
+      expect(payload.base_url).toBe("https://api.deepseek.com/anthropic");
       expect(payload.api_key).toBeUndefined();
+      expect(payload.model).toBe("elysium-chat");
+      expect(payload.subagent_model).toBe("elysium-chat");
     });
 
     it("submits an edited base_url as an override", async () => {
@@ -487,12 +512,43 @@ describe("AddCredentialModal", () => {
       expect(payload.base_url).toBe("https://api.deepseek.com/anthropic");
     });
 
+    it("tests an imported provider with its server-side key", async () => {
+      const spy = vi.spyOn(API, "testAgentConnectionDraft").mockResolvedValue({
+        overall: "ok",
+        messages_probe: { success: true, status_code: 200, latency_ms: 10, error: null },
+        diagnosis: null,
+        suggestion: null,
+        messages_url: "https://api.deepseek.com/anthropic/v1/messages",
+      });
+      await renderAndImport();
+      fireEvent.change(await screen.findByLabelText(/base[_ ]url|代理地址/i), {
+        target: { value: "https://api.deepseek.com/anthropic" },
+      });
+
+      const testButton = screen.getByTestId("test-connection");
+      expect(testButton).toBeEnabled();
+      fireEvent.click(testButton);
+
+      await waitFor(() =>
+        expect(spy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            from_custom_provider_id: 42,
+            api_key: undefined,
+            model: "elysium-chat",
+          }),
+        ),
+      );
+    });
+
     it("switching back to manual entry submits the typed key without the provider id", async () => {
       const onSubmit = await renderAndImport();
 
       fireEvent.click(await screen.findByTestId("api-key-manual-entry"));
       expect(apiKeyInput()).toBeEnabled();
       fireEvent.change(apiKeyInput(), { target: { value: "sk-typed" } });
+      fireEvent.change(screen.getByLabelText(/base[_ ]url|代理地址/i), {
+        target: { value: "https://api.deepseek.com/anthropic" },
+      });
       fireEvent.click(screen.getByRole("button", { name: /^(add|添加)$/i }));
 
       await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));

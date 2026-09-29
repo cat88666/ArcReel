@@ -134,6 +134,24 @@ class TestSessionManager:
         assert managed.get_pending_question_payloads() == []
 
     @pytest.mark.asyncio
+    async def test_invalidate_provider_credentials_evicts_live_sessions(self, session_manager, monkeypatch):
+        first = ManagedSession(session_id="s1", actor=None)
+        second = ManagedSession(session_id="s2", actor=None)
+        session_manager.sessions = {"s1": first, "s2": second}
+
+        evicted = []
+
+        async def fake_evict(managed):
+            evicted.append(managed.session_id)
+            session_manager.sessions.pop(managed.session_id, None)
+
+        monkeypatch.setattr(session_manager, "_evict_one", fake_evict)
+        await session_manager.invalidate_provider_credentials()
+
+        assert sorted(evicted) == ["s1", "s2"]
+        assert session_manager.sessions == {}
+
+    @pytest.mark.asyncio
     async def test_build_options_and_connect_paths(self, session_manager, meta_store, monkeypatch):
         async def _fake_env():
             return {}

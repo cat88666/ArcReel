@@ -115,7 +115,7 @@ class CreateCredentialRequest(BaseModel):
     sonnet_model: str | None = None
     opus_model: str | None = None
     subagent_model: str | None = None
-    activate: bool | None = None  # None = 自动 (无 active 时自动 set active)
+    activate: bool = False
 
 
 class UpdateCredentialRequest(BaseModel):
@@ -164,8 +164,9 @@ async def _resolve_key_source(
 ) -> tuple[str, str | None]:
     """确定新凭证的 (api_key, 待归一的 base_url)。
 
-    给出 from_custom_provider_id 时密钥取自该供应商，请求未带 base_url 则沿用供应商的地址；
-    否则密钥取自请求体。两种来源不可同时给出。
+    给出 from_custom_provider_id 时密钥取自该供应商。Anthropic 格式供应商可沿用地址；
+    OpenAI 格式供应商必须显式给出 Anthropic 调用根，避免把 ``/v1`` 复制成
+    ``/v1/v1/messages``。否则密钥取自请求体。两种来源不可同时给出。
     """
     if body.from_custom_provider_id is None:
         if not body.api_key:
@@ -178,7 +179,15 @@ async def _resolve_key_source(
         raise HTTPException(status_code=404, detail=_t("provider_not_found"))
     if not provider.api_key:
         raise HTTPException(status_code=422, detail=_t("agent_import_provider_no_key"))
+    if provider.discovery_format != "anthropic" and not body.base_url:
+        raise HTTPException(status_code=422, detail=_t("agent_base_url_required_custom"))
     return provider.api_key, body.base_url or provider.base_url
+
+
+async def _invalidate_live_agent_sessions() -> None:
+    from server.routers.assistant import get_assistant_service
+
+    await get_assistant_service().session_manager.invalidate_provider_credentials()
 
 
 # ── Credential endpoints ───────────────────────────────────────────
@@ -227,16 +236,12 @@ async def create_credential(
         opus_model=body.opus_model,
         subagent_model=body.subagent_model,
     )
-    # 自动 active 策略：activate=True，或 (activate=None 且当前无 active)
-    should_activate = body.activate is True
-    if body.activate is None:
-        existing_active = await repo.get_active()
-        if existing_active is None:
-            should_activate = True
-    if should_activate:
+    if body.activate:
         await repo.set_active(cred.id)
     await session.commit()
     await session.refresh(cred)
+    if body.activate:
+        await _invalidate_live_agent_sessions()
     return _cred_to_response(cred)
 
 
@@ -262,6 +267,8 @@ async def update_credential(
     if cred is None:
         raise HTTPException(status_code=404, detail=_t("agent_credential_not_found"))
     await session.commit()
+    if cred.is_active:
+        await _invalidate_live_agent_sessions()
     return _cred_to_response(cred)
 
 
@@ -300,6 +307,7 @@ async def activate_credential(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=_t("agent_credential_not_found")) from exc
     await session.commit()
+    await _invalidate_live_agent_sessions()
     return ActivateResponse(active_id=cred_id)
 
 
@@ -329,7 +337,8 @@ class TestConnectionResponseModel(BaseModel):
 class TestConnectionRequest(BaseModel):
     preset_id: str | None = None
     base_url: str | None = None
-    api_key: str
+    api_key: str | None = None
+    from_custom_provider_id: int | None = None
     model: str | None = None
 
 
@@ -372,11 +381,25 @@ async def _run_and_serialize(
 async def run_draft_connection_test(
     body: TestConnectionRequest,
     _t: Translator,
+    session: AsyncSession = Depends(get_async_session),
 ) -> TestConnectionResponseModel:
+    if body.from_custom_provider_id is None:
+        if not body.api_key:
+            raise HTTPException(status_code=422, detail=_t("agent_api_key_required"))
+        api_key = body.api_key
+    else:
+        if body.api_key is not None:
+            raise HTTPException(status_code=422, detail=_t("agent_api_key_source_conflict"))
+        provider = await CustomProviderRepository(session).get_provider(body.from_custom_provider_id)
+        if provider is None:
+            raise HTTPException(status_code=404, detail=_t("provider_not_found"))
+        if not provider.api_key:
+            raise HTTPException(status_code=422, detail=_t("agent_import_provider_no_key"))
+        api_key = provider.api_key
     return await _run_and_serialize(
         preset_id=body.preset_id,
         base_url=body.base_url,
-        api_key=body.api_key,
+        api_key=api_key,
         model=body.model,
         _t=_t,
     )

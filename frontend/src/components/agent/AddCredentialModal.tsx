@@ -233,7 +233,20 @@ export function AddCredentialModal({
     // 切到 __custom__：避免预设的 messages_url 覆盖导入的 base_url
     form.setPreset(customSentinelId);
     form.setApiKey("");
-    form.setBaseUrl(provider.base_url);
+    // 自定义供应商的发现协议都不是 Anthropic，不能直接把其 base_url 交给 Claude SDK。
+    // 用户必须显式填写双协议网关的 Anthropic 根地址。
+    form.setBaseUrl("");
+    const textModel =
+      provider.models.find((m) => m.is_enabled && m.is_default && m.endpoint === "openai-chat") ??
+      provider.models.find((m) => m.is_enabled && m.endpoint === "openai-chat");
+    if (textModel) {
+      form.setModel(textModel.model_id);
+      form.setHaikuModel(textModel.model_id);
+      form.setSonnetModel(textModel.model_id);
+      form.setOpusModel(textModel.model_id);
+      form.setSubagentModel(textModel.model_id);
+      setAdvancedOpen(true);
+    }
     if (!form.displayName.trim()) {
       form.setDisplayName(provider.display_name);
     }
@@ -266,7 +279,8 @@ export function AddCredentialModal({
       const res = await API.testAgentConnectionDraft({
         preset_id: form.presetId,
         base_url: submitBaseUrl,
-        api_key: form.apiKey,
+        api_key: importSource ? undefined : form.apiKey,
+        from_custom_provider_id: importSource?.id,
         model: form.model || undefined,
       });
       if (session !== sessionRef.current) return;
@@ -289,16 +303,13 @@ export function AddCredentialModal({
     setSubmitError(null);
     try {
       const req = form.buildRequest();
-      // 预填地址未改动时不带 base_url，由服务端取供应商提交时的地址；用户改过才作为覆盖提交
-      const baseUrlOverride =
-        importSource && form.baseUrl.trim() !== importSource.base_url ? req.base_url : undefined;
       await onSubmit(
         importSource
           ? {
               ...req,
               api_key: undefined,
-              base_url: baseUrlOverride,
               from_custom_provider_id: importSource.id,
+              activate: false,
             }
           : req,
       );
@@ -635,8 +646,7 @@ export function AddCredentialModal({
             disabled={
               testing ||
               submitting ||
-              importSource !== null ||
-              !form.apiKey.trim() ||
+              (!importSource && !form.apiKey.trim()) ||
               !form.baseUrl.trim() ||
               baseUrlRejected
             }

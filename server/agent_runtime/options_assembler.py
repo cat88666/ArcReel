@@ -66,6 +66,9 @@ async def load_provider_env_overrides() -> dict[str, str]:
     async with async_session_factory() as session:
         anthropic_env = await build_anthropic_env_dict(session)
 
+    if not anthropic_env.get("ANTHROPIC_API_KEY", "").strip():
+        raise RuntimeError("Agent Anthropic credential is not configured")
+
     result = dict(anthropic_env)
     for key in OTHER_PROVIDER_ENV_KEYS:
         result[key] = ""

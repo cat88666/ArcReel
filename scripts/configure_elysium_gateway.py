@@ -20,10 +20,13 @@ from urllib import error, request
 from lib.config.service import ConfigService
 from lib.db import close_db
 from lib.db.engine import async_session_factory
+from lib.db.repositories.agent_credential_repo import AgentCredentialRepository
 from lib.db.repositories.custom_provider_repo import CustomProviderRepository
 
 GATEWAY_BASE_URL = "http://43.154.247.11"
 PROVIDER_DISPLAY_NAME = "Elysium Gateway"
+AGENT_CREDENTIAL_DISPLAY_NAME = "Elysium Agent (Qwen3.8)"
+AGENT_MODEL = "elysium-chat"
 
 MODEL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
@@ -110,10 +113,11 @@ def validate_gateway(
     return available
 
 
-async def apply_configuration(api_key: str) -> tuple[int, bool]:
-    """Create or reconcile the provider and its global defaults."""
+async def apply_configuration(api_key: str) -> tuple[int, bool, int]:
+    """Create or reconcile the provider, Agent credential, and global defaults."""
     async with async_session_factory() as session:
         provider_repo = CustomProviderRepository(session)
+        agent_repo = AgentCredentialRepository(session)
         config_service = ConfigService(session)
         providers = await provider_repo.list_providers()
         matches = [
@@ -146,8 +150,36 @@ async def apply_configuration(api_key: str) -> tuple[int, bool]:
 
         for key, value in default_settings(provider.id).items():
             await config_service.set_setting(key, value)
+
+        agent_credentials = await agent_repo.list_for_user()
+        agent_matches = [
+            credential
+            for credential in agent_credentials
+            if credential.display_name == AGENT_CREDENTIAL_DISPLAY_NAME
+            or credential.base_url.rstrip("/") == GATEWAY_BASE_URL
+        ]
+        if len(agent_matches) > 1:
+            raise RuntimeError("multiple Elysium Agent credentials exist; resolve duplicates first")
+        agent_values = {
+            "preset_id": "__custom__",
+            "display_name": AGENT_CREDENTIAL_DISPLAY_NAME,
+            "base_url": GATEWAY_BASE_URL,
+            "api_key": api_key,
+            "model": AGENT_MODEL,
+            "haiku_model": AGENT_MODEL,
+            "sonnet_model": AGENT_MODEL,
+            "opus_model": AGENT_MODEL,
+            "subagent_model": AGENT_MODEL,
+        }
+        if agent_matches:
+            agent_credential = await agent_repo.update(agent_matches[0].id, **agent_values)
+            if agent_credential is None:
+                raise RuntimeError("Elysium Agent credential disappeared during reconciliation")
+        else:
+            agent_credential = await agent_repo.create(**agent_values)
+        await agent_repo.set_active(agent_credential.id)
         await session.commit()
-        return provider.id, created
+        return provider.id, created, agent_credential.id
 
 
 def _parse_args() -> argparse.Namespace:
@@ -171,11 +203,12 @@ async def _run() -> int:
         return 2
 
     available = validate_gateway(api_key)
-    provider_id, created = await apply_configuration(api_key)
+    provider_id, created, agent_credential_id = await apply_configuration(api_key)
     action = "created" if created else "updated"
     print(f"Elysium gateway {action}: custom-{provider_id}")
     print(f"Gateway: {GATEWAY_BASE_URL}")
     print(f"Models: {', '.join(available)}")
+    print(f"Active Agent credential: {agent_credential_id} ({AGENT_MODEL})")
     print("Restart ArcReel if it was already running.")
     return 0
 

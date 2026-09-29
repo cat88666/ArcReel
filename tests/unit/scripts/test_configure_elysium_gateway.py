@@ -21,10 +21,26 @@ class _Provider:
 
 
 @dataclass
+class _AgentCredential:
+    id: int
+    preset_id: str
+    display_name: str
+    base_url: str
+    api_key: str
+    model: str | None
+    haiku_model: str | None
+    sonnet_model: str | None
+    opus_model: str | None
+    subagent_model: str | None
+    is_active: bool = False
+
+
+@dataclass
 class _State:
     providers: list[_Provider] = field(default_factory=list)
     models: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     settings: dict[str, str] = field(default_factory=dict)
+    agent_credentials: list[_AgentCredential] = field(default_factory=list)
     commits: int = 0
 
 
@@ -78,6 +94,30 @@ class _ProviderRepo:
 
     async def replace_models(self, provider_id: int, models: list[dict[str, Any]]) -> None:
         self.state.models[provider_id] = models
+
+
+class _AgentCredentialRepo:
+    def __init__(self, session: _Session):
+        self.state = session.state
+
+    async def list_for_user(self) -> list[_AgentCredential]:
+        return self.state.agent_credentials
+
+    async def create(self, **values: Any) -> _AgentCredential:
+        credential = _AgentCredential(id=1, **values)
+        self.state.agent_credentials.append(credential)
+        return credential
+
+    async def update(self, credential_id: int, **values: Any) -> _AgentCredential:
+        credential = self.state.agent_credentials[0]
+        assert credential.id == credential_id
+        for key, value in values.items():
+            setattr(credential, key, value)
+        return credential
+
+    async def set_active(self, credential_id: int) -> None:
+        for credential in self.state.agent_credentials:
+            credential.is_active = credential.id == credential_id
 
 
 class _ConfigService:
@@ -163,10 +203,11 @@ async def test_apply_configuration_is_idempotent(monkeypatch: pytest.MonkeyPatch
     state = _State()
     monkeypatch.setattr(gateway_config, "async_session_factory", _SessionFactory(state))
     monkeypatch.setattr(gateway_config, "CustomProviderRepository", _ProviderRepo)
+    monkeypatch.setattr(gateway_config, "AgentCredentialRepository", _AgentCredentialRepo)
     monkeypatch.setattr(gateway_config, "ConfigService", _ConfigService)
 
-    assert await gateway_config.apply_configuration("first-key") == (1, True)
-    assert await gateway_config.apply_configuration("replacement-key") == (1, False)
+    assert await gateway_config.apply_configuration("first-key") == (1, True, 1)
+    assert await gateway_config.apply_configuration("replacement-key") == (1, False, 1)
 
     assert len(state.providers) == 1
     assert state.providers[0].api_key == "replacement-key"
@@ -176,4 +217,15 @@ async def test_apply_configuration_is_idempotent(monkeypatch: pytest.MonkeyPatch
         "elysium-video",
     ]
     assert state.settings["default_video_backend_r2v"] == "custom-1/elysium-video"
+    assert len(state.agent_credentials) == 1
+    agent_credential = state.agent_credentials[0]
+    assert agent_credential.api_key == "replacement-key"
+    assert agent_credential.is_active is True
+    assert {
+        agent_credential.model,
+        agent_credential.haiku_model,
+        agent_credential.sonnet_model,
+        agent_credential.opus_model,
+        agent_credential.subagent_model,
+    } == {"elysium-chat"}
     assert state.commits == 2

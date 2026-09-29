@@ -1316,6 +1316,16 @@ class SessionManager:
         managed.cancel_pending_questions(reason)
         await self._evict_one(managed)
 
+    async def invalidate_provider_credentials(self) -> None:
+        """Disconnect every resident SDK client after the active Agent credential changes."""
+        sessions = list(self.sessions.values())
+        if not sessions:
+            return
+        await asyncio.gather(
+            *[self.close_session(s.session_id, reason="Agent credential changed") for s in sessions],
+            return_exceptions=True,
+        )
+
     async def _evict_one(self, managed: ManagedSession) -> None:
         """Gracefully disconnect an actor, cancel as fallback, and remove from registry."""
         session_id = managed.session_id

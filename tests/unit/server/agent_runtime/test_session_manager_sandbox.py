@@ -61,6 +61,23 @@ async def test_build_options_includes_sandbox_settings(
     assert str(proj_dir / "project.json") in opts.sandbox["filesystem"]["denyWrite"]
 
 
+@pytest.mark.asyncio
+async def test_build_options_rejects_missing_managed_agent_credential(
+    fs_session_manager: SessionManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proj_dir = fs_session_manager.layout.projects_dir / "test_proj"
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "project.json").write_text('{"title": "t"}', encoding="utf-8")
+
+    async def fake_anthropic_env(_session):
+        return {"ANTHROPIC_API_KEY": "", "ANTHROPIC_BASE_URL": "", "ANTHROPIC_MODEL": ""}
+
+    monkeypatch.setattr("lib.config.service.build_anthropic_env_dict", fake_anthropic_env)
+
+    with pytest.raises(RuntimeError, match="Agent Anthropic credential is not configured"):
+        await fs_session_manager._build_options("test_proj")
+
+
 def test_session_manager_wires_env_resolved_roots_into_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """SessionManager 负责 env 解析（ARCREEL_PROFILE_DIR / data_root 参数），把 resolve
     后的根路径喂给 AgentAccessPolicy——用户把数据/profile 目录搬到任意位置（含 repo 外）

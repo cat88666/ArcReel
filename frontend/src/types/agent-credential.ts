@@ -53,7 +53,7 @@ export interface CreateAgentCredentialRequest {
   sonnet_model?: string | null;
   opus_model?: string | null;
   subagent_model?: string | null;
-  activate?: boolean | null;
+  activate?: boolean;
 }
 
 export type UpdateAgentCredentialRequest = Partial<
@@ -94,6 +94,7 @@ export interface TestConnectionResponse {
 export interface TestConnectionRequest {
   preset_id?: string | null;
   base_url?: string | null;
-  api_key: string;
+  api_key?: string;
+  from_custom_provider_id?: number;
   model?: string | null;
 }
