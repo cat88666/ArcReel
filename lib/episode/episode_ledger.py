@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from lib.episode.episode_paths import episode_drafts_dir, episode_script_relpath
 from lib.infra.path_safety import safe_exists
 from lib.infra.text_utils import normalize_newlines
+from lib.script.source_loader.txt import decode_rtf
 
 logger = logging.getLogger(__name__)
 
@@ -158,12 +159,13 @@ def episode_outline_context(
 
 
 def normalize_source_text(text: str) -> str:
-    """账本坐标系的唯一归一化函数：Unicode NFC + 换行统一为 ``\\n``。
+    """账本坐标系的唯一归一化函数：RTF 提取 + Unicode NFC + 换行统一为 ``\\n``。
 
     source_range / planning_cursor 的偏移量全部落在本函数输出的坐标系内，
     任何按偏移切片源文的消费方必须先对源文执行本函数。
     """
-    return unicodedata.normalize("NFC", normalize_newlines(text))
+    plain_text = decode_rtf(text)
+    return unicodedata.normalize("NFC", normalize_newlines(plain_text if plain_text is not None else text))
 
 
 @dataclass

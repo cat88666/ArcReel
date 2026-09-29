@@ -128,7 +128,7 @@ from lib.script.script_review import (
     script_plan_path,
 )
 from lib.script.script_skeleton import resolve_declared_kind, resolve_kind_items, rewrite_episode_prefix
-from lib.speech.speech_composition import require_script_unit_admitted, video_unit_replan_problems
+from lib.speech.speech_composition import SpeechAdmissionError, require_script_unit_admitted, video_unit_replan_problems
 from lib.speech.speech_rate import project_speech_rate_override
 
 logger = logging.getLogger(__name__)
@@ -162,6 +162,10 @@ _VISUAL_RESPONSE_SCHEMA: dict[str, type[BaseModel]] = {
 _QUALITY_PROBE_SCENE_MIN_LEN = 40
 _QUALITY_PROBE_ACTION_MIN_LEN = 25
 _QUALITY_PROBE_UNIT_TEXT_MIN_LEN = 15
+
+# 旁白提示词编写若把角色对白混进已有 novel_text，后续分镜准入必然拒绝。让同一次正式生成
+# 在落盘前携带准入反馈重试，避免把已知不可执行的视觉层写入正式剧本。
+_NARRATION_SPEECH_GENERATION_ATTEMPTS = 3
 
 # 骨架种类 → 响应校验模型。模型类属上层依赖、不进 SKELETONS 窄表，映射留本地。
 # 键与 SKELETONS 逐一对应；新增第五种骨架时穷尽性断言逐个报红。
@@ -447,14 +451,34 @@ class ScriptGenerator:
             len(targets.entries),
             len(targets.items),
         )
-        result = await self._generate_text(
-            TextGenerationRequest(
-                prompt=await self._build_visual_prompt(episode, targets, instructions),
-                response_schema=_VISUAL_RESPONSE_SCHEMA[targets.kind],
-                max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+        base_prompt = await self._build_visual_prompt(episode, targets, instructions)
+        generation_prompt = base_prompt
+        authored: list[dict] = []
+        for attempt in range(_NARRATION_SPEECH_GENERATION_ATTEMPTS):
+            result = await self._generate_text(
+                TextGenerationRequest(
+                    prompt=generation_prompt,
+                    response_schema=_VISUAL_RESPONSE_SCHEMA[targets.kind],
+                    max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                )
             )
-        )
-        authored = self._merge_visual_layer(targets, self._parse_visual_layer(result.text, targets), episode)
+            authored = self._merge_visual_layer(targets, self._parse_visual_layer(result.text, targets), episode)
+            if targets.kind != "segments":
+                break
+            try:
+                for segment in authored:
+                    require_script_unit_admitted("segments", segment, ignore_marker=True)
+            except SpeechAdmissionError:
+                if attempt + 1 == _NARRATION_SPEECH_GENERATION_ATTEMPTS:
+                    raise
+                generation_prompt = (
+                    f"{base_prompt}\n\n"
+                    "# 发声准入修正\n"
+                    "上一次输出把角色对白与本分镜既有 novel_text 旁白混在同一视频单元，无法执行。"
+                    "请重新输出完整视觉层；所有 video_prompt.dialogue 必须是空数组 []，不得新增、复述或改写台词。"
+                )
+                continue
+            break
         script_data = self._authored_script(episode, targets, authored)
         pm = ProjectManager.for_project_dir(self.project_path)
         saved_path = await run_sync_transaction(

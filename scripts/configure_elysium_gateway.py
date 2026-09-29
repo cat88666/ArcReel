@@ -20,10 +20,15 @@ from urllib import error, request
 from lib.config.service import ConfigService
 from lib.db import close_db
 from lib.db.engine import async_session_factory
+from lib.db.repositories.agent_credential_repo import AgentCredentialRepository
 from lib.db.repositories.custom_provider_repo import CustomProviderRepository
 
 GATEWAY_BASE_URL = "http://43.154.247.11"
 PROVIDER_DISPLAY_NAME = "Elysium Gateway"
+AGENT_MODEL = "elysium-chat"
+AGENT_CONTEXT_WINDOW_TOKENS = 65_536
+AGENT_AUTO_COMPACT_WINDOW_TOKENS = 59_000
+AGENT_MAX_OUTPUT_TOKENS = 4_096
 
 MODEL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
@@ -90,9 +95,9 @@ def validate_gateway(
 ) -> list[str]:
     """Verify the remote gateway contract without making a paid generation call."""
     try:
-        with urlopen(f"{GATEWAY_BASE_URL}/health", timeout=10) as response:
+        with urlopen(f"{GATEWAY_BASE_URL}/readyz", timeout=10) as response:
             if response.status != 200:
-                raise RuntimeError(f"gateway health returned HTTP {response.status}")
+                raise RuntimeError(f"gateway readiness returned HTTP {response.status}")
         models_request = request.Request(
             f"{GATEWAY_BASE_URL}/v1/models",
             headers={"Authorization": f"Bearer {api_key}"},
@@ -114,6 +119,7 @@ async def apply_configuration(api_key: str) -> tuple[int, bool]:
     """Create or reconcile the provider and its global defaults."""
     async with async_session_factory() as session:
         provider_repo = CustomProviderRepository(session)
+        agent_repo = AgentCredentialRepository(session)
         config_service = ConfigService(session)
         providers = await provider_repo.list_providers()
         matches = [
@@ -146,6 +152,35 @@ async def apply_configuration(api_key: str) -> tuple[int, bool]:
 
         for key, value in default_settings(provider.id).items():
             await config_service.set_setting(key, value)
+
+        credentials = await agent_repo.list_for_user()
+        agent_matches = [
+            credential
+            for credential in credentials
+            if credential.display_name == PROVIDER_DISPLAY_NAME or credential.base_url.rstrip("/") == GATEWAY_BASE_URL
+        ]
+        if len(agent_matches) > 1:
+            raise RuntimeError("multiple Elysium gateway Agent credentials exist; resolve duplicates first")
+        agent_values = {
+            "preset_id": "__custom__",
+            "display_name": PROVIDER_DISPLAY_NAME,
+            "base_url": GATEWAY_BASE_URL,
+            "api_key": api_key,
+            "model": AGENT_MODEL,
+            "haiku_model": AGENT_MODEL,
+            "sonnet_model": AGENT_MODEL,
+            "opus_model": AGENT_MODEL,
+            "subagent_model": AGENT_MODEL,
+            "context_window_tokens": AGENT_CONTEXT_WINDOW_TOKENS,
+            "auto_compact_window_tokens": AGENT_AUTO_COMPACT_WINDOW_TOKENS,
+            "max_output_tokens": AGENT_MAX_OUTPUT_TOKENS,
+        }
+        if agent_matches:
+            agent_credential = await agent_repo.update(agent_matches[0].id, **agent_values)
+        else:
+            agent_credential = await agent_repo.create(**agent_values)
+        assert agent_credential is not None
+        await agent_repo.set_active(agent_credential.id)
         await session.commit()
         return provider.id, created
 

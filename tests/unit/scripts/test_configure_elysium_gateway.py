@@ -21,10 +21,29 @@ class _Provider:
 
 
 @dataclass
+class _AgentCredential:
+    id: int
+    preset_id: str
+    display_name: str
+    base_url: str
+    api_key: str
+    model: str | None
+    haiku_model: str | None
+    sonnet_model: str | None
+    opus_model: str | None
+    subagent_model: str | None
+    context_window_tokens: int | None
+    auto_compact_window_tokens: int | None
+    max_output_tokens: int | None
+    is_active: bool = False
+
+
+@dataclass
 class _State:
     providers: list[_Provider] = field(default_factory=list)
     models: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     settings: dict[str, str] = field(default_factory=dict)
+    agent_credentials: list[_AgentCredential] = field(default_factory=list)
     commits: int = 0
 
 
@@ -88,6 +107,30 @@ class _ConfigService:
         self.state.settings[key] = value
 
 
+class _AgentCredentialRepo:
+    def __init__(self, session: _Session):
+        self.state = session.state
+
+    async def list_for_user(self) -> list[_AgentCredential]:
+        return self.state.agent_credentials
+
+    async def create(self, **values: Any) -> _AgentCredential:
+        credential = _AgentCredential(id=1, **values)
+        self.state.agent_credentials.append(credential)
+        return credential
+
+    async def update(self, credential_id: int, **values: Any) -> _AgentCredential:
+        credential = self.state.agent_credentials[0]
+        assert credential.id == credential_id
+        for key, value in values.items():
+            setattr(credential, key, value)
+        return credential
+
+    async def set_active(self, credential_id: int) -> None:
+        for credential in self.state.agent_credentials:
+            credential.is_active = credential.id == credential_id
+
+
 class _Response(io.BytesIO):
     def __init__(self, payload: object, status: int = 200):
         super().__init__(json.dumps(payload).encode())
@@ -106,7 +149,7 @@ def test_validate_gateway_requires_all_shipped_models() -> None:
     def urlopen(target: str | request.Request, **_kwargs: Any) -> _Response:
         url = target.full_url if isinstance(target, request.Request) else target
         calls.append(url)
-        if url.endswith("/health"):
+        if url.endswith("/readyz"):
             return _Response({"status": "ok"})
         return _Response({"data": [{"id": model["model_id"]} for model in gateway_config.MODEL_DEFINITIONS]})
 
@@ -116,7 +159,7 @@ def test_validate_gateway_requires_all_shipped_models() -> None:
         "elysium-video",
     ]
     assert calls == [
-        "http://43.154.247.11/health",
+        "http://43.154.247.11/readyz",
         "http://43.154.247.11/v1/models",
     ]
 
@@ -124,7 +167,7 @@ def test_validate_gateway_requires_all_shipped_models() -> None:
 def test_validate_gateway_rejects_incomplete_catalog() -> None:
     def urlopen(target: str | request.Request, **_kwargs: Any) -> _Response:
         url = target.full_url if isinstance(target, request.Request) else target
-        if url.endswith("/health"):
+        if url.endswith("/readyz"):
             return _Response({"status": "ok"})
         return _Response({"data": [{"id": "elysium-chat"}]})
 
@@ -163,6 +206,7 @@ async def test_apply_configuration_is_idempotent(monkeypatch: pytest.MonkeyPatch
     state = _State()
     monkeypatch.setattr(gateway_config, "async_session_factory", _SessionFactory(state))
     monkeypatch.setattr(gateway_config, "CustomProviderRepository", _ProviderRepo)
+    monkeypatch.setattr(gateway_config, "AgentCredentialRepository", _AgentCredentialRepo)
     monkeypatch.setattr(gateway_config, "ConfigService", _ConfigService)
 
     assert await gateway_config.apply_configuration("first-key") == (1, True)
@@ -176,4 +220,13 @@ async def test_apply_configuration_is_idempotent(monkeypatch: pytest.MonkeyPatch
         "elysium-video",
     ]
     assert state.settings["default_video_backend_r2v"] == "custom-1/elysium-video"
+    assert len(state.agent_credentials) == 1
+    credential = state.agent_credentials[0]
+    assert credential.is_active is True
+    assert credential.api_key == "replacement-key"
+    assert credential.model == credential.haiku_model == credential.sonnet_model == "elysium-chat"
+    assert credential.opus_model == credential.subagent_model == "elysium-chat"
+    assert credential.context_window_tokens == 65536
+    assert credential.auto_compact_window_tokens == 59000
+    assert credential.max_output_tokens == 4096
     assert state.commits == 2

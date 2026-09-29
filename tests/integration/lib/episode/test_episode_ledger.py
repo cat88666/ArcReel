@@ -44,6 +44,17 @@ class TestNormalizeSourceText:
         assert normalize_source_text(nfd_cafe) == "café"
         assert normalize_source_text("a\r\nb\rc\nd") == "a\nb\nc\nd"
 
+    def test_legacy_rtf_txt_is_decoded_without_rewriting_source(self):
+        rtf = (
+            r"{\rtf1\ansi\ansicpg936\cocoartf2870"
+            "\n"
+            r"{\fonttbl\f0\fnil HelveticaNeue;}"
+            "\n"
+            r"\pard\f0\uc0\u27494 \u26494 \u26234 \u26007 \u35199 \u38376 \u24198 }"
+        )
+
+        assert normalize_source_text(rtf) == "武松智斗西门庆"
+
 
 class TestRegisterOrphanEpisodeEntries:
     def test_orphan_episode_file_creates_entry_without_source_range(self, tmp_path: Path):
@@ -159,6 +170,17 @@ class TestEpisodesWithoutSourceRange:
 
 
 class TestDiscoverSources:
+    def test_rtf_disguised_as_txt_is_exposed_as_plain_text(self, tmp_path: Path):
+        d = _project(tmp_path, novel=None)
+        rtf = r"{\rtf1\ansi\uc0\u31532 \u19968 \u31456 \par \u24320 \u22987 }"
+        source = d / "source" / "novel.txt"
+        source.write_text(rtf, encoding="utf-8")
+
+        docs = discover_sources(d)
+
+        assert docs[0].text == "第一章\n开始"
+        assert source.read_text(encoding="utf-8") == rtf
+
     def test_episode_files_are_derived_when_another_source_exists(self, tmp_path: Path):
         """目录另有原文时 episode_N.txt 是派生物，不进候选。"""
         d = _project(tmp_path)

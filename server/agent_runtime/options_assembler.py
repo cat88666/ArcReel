@@ -313,6 +313,8 @@ class OptionsAssembler:
         }
 
         provider_env = await self.build_provider_env_overrides()
+        # 私有百分比开关会覆盖凭证声明的公开 token 窗口，内嵌 Agent 始终清空。
+        provider_env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = ""
         provider_env.update(
             {
                 "ARCREEL_EMBEDDED_AGENT": "1",
