@@ -128,6 +128,45 @@ async def test_build_threads_injected_deps_into_options(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_sets_native_autocompaction_window(tmp_path: Path) -> None:
+    """内嵌 Agent 使用生效凭证显式声明的窗口，不自行猜供应商能力。"""
+
+    async def fake_loader():
+        return {
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "70",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "65536",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "59000",
+            "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096",
+        }
+
+    options = await _make_assembler(tmp_path, provider_env_loader=fake_loader).build("demo")
+
+    assert options.env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
+    assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "59000"
+    assert options.env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] == "1"
+    assert options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == ""
+    assert options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "4096"
+
+
+@pytest.mark.asyncio
+async def test_build_does_not_invent_context_capabilities(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """没有凭证能力声明时，不从进程环境向所有供应商注入 Elysium 参数。"""
+
+    async def fake_loader():
+        return {}
+
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "64000")
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "60000")
+    monkeypatch.setenv("ARCREEL_AGENT_MAX_OUTPUT_TOKENS", "3072")
+    options = await _make_assembler(tmp_path, provider_env_loader=fake_loader).build("demo")
+
+    assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in options.env
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in options.env
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in options.env
+
+
+@pytest.mark.asyncio
 async def test_build_injects_short_lived_arcreel_api_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

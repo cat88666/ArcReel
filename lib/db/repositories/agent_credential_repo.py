@@ -27,6 +27,9 @@ class AgentCredentialRepository(BaseRepository):
         sonnet_model: str | None = None,
         opus_model: str | None = None,
         subagent_model: str | None = None,
+        context_window_tokens: int | None = None,
+        auto_compact_window_tokens: int | None = None,
+        max_output_tokens: int | None = None,
         user_id: str = DEFAULT_USER_ID,
     ) -> AgentAnthropicCredential:
         cred = AgentAnthropicCredential(
@@ -40,6 +43,9 @@ class AgentCredentialRepository(BaseRepository):
             sonnet_model=sonnet_model,
             opus_model=opus_model,
             subagent_model=subagent_model,
+            context_window_tokens=context_window_tokens,
+            auto_compact_window_tokens=auto_compact_window_tokens,
+            max_output_tokens=max_output_tokens,
             is_active=False,
         )
         self.session.add(cred)

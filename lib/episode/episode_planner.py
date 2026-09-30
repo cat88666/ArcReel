@@ -22,6 +22,7 @@ import re
 import statistics
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -257,6 +258,21 @@ def _find_all_overlapping(haystack: str, needle: str) -> list[int]:
     return starts
 
 
+def _nearest_boundary_anchors(window: str, anchor: str, *, limit: int = 3) -> list[str]:
+    """为未命中的模型锚点挑出最接近、可逐字复制的唯一句末片段。"""
+    folded_anchor = _fold_for_match(normalize_source_text(anchor)).casefold()
+    ranked: list[tuple[float, int, str]] = []
+    for match in _SENTENCE_RE.finditer(window):
+        end = match.end()
+        candidate = window[max(0, end - 30) : end].strip()
+        if len(candidate) < 2 or len(_find_all_overlapping(window, candidate)) != 1:
+            continue
+        score = SequenceMatcher(None, folded_anchor, _fold_for_match(candidate).casefold()).ratio()
+        ranked.append((score, end, candidate))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [candidate for _, _, candidate in ranked[:limit]]
+
+
 def _resolve_boundaries(
     window: str,
     drafts: list[NarrationEpisodeDraft],
@@ -301,7 +317,15 @@ def _resolve_boundaries(
                 matched_by_fold = True
                 match_len = len(normalized_anchor)
         if not starts:
-            reasons.append(f"第 {idx} 条的 end_anchor 在原文窗口中不存在（必须逐字摘抄，含标点）: {anchor!r}")
+            candidates = _nearest_boundary_anchors(window, anchor)
+            suggestion = (
+                "；可直接复制的原文句末候选：" + "、".join(repr(candidate) for candidate in candidates)
+                if candidates
+                else ""
+            )
+            reasons.append(
+                f"第 {idx} 条的 end_anchor 在原文窗口中不存在（必须逐字摘抄，含标点）: {anchor!r}{suggestion}"
+            )
             ordering_valid = False
             continue
         if len(starts) > 1:

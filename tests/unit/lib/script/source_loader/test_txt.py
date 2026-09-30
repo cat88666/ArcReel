@@ -36,6 +36,40 @@ def test_decode_pure_utf8_no_bom():
     assert enc == "utf-8"
 
 
+def test_decode_rtf_disguised_as_txt():
+    raw = (
+        rb"{\rtf1\ansi\ansicpg936\cocoartf2870"
+        b"\n"
+        rb"{\fonttbl\f0\fnil HelveticaNeue;}"
+        b"\n"
+        rb"\pard\f0\uc0\u27494 \u26494 \u36824 \u20102 \u23234 \u23234 \par "
+        rb"\{\u32467 \u26463 \}}"
+    )
+
+    text, enc = decode_txt(raw)
+
+    assert text == "武松还了嫂嫂\n{结束}"
+    assert enc == "rtf"
+
+
+def test_decode_rtf_ansi_hex_uses_declared_codepage():
+    raw = rb"{\rtf1\ansi\ansicpg936 \'ce\'e4\'cb\'c9\par end}"
+
+    text, enc = decode_txt(raw)
+
+    assert text == "武松\nend"
+    assert enc == "rtf"
+
+
+def test_decode_rtf_unicode_fallback_does_not_consume_following_hex_text():
+    raw = rb"{\rtf1\ansi\ansicpg936\uc1 \u27494\'3f\'ba\'c3}"
+
+    text, enc = decode_txt(raw)
+
+    assert text == "武好"
+    assert enc == "rtf"
+
+
 def test_decode_gbk_via_charset_normalizer():
     raw = ("第一章 起点。" * 50).encode("gbk")
     text, enc = decode_txt(raw)

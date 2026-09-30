@@ -27,6 +27,7 @@ _ENDPOINT_BACKEND_CLASSES = (
     "DashScopeImageBackend",
     "DashScopeVideoBackend",
     "DeclarativeVideoBackend",
+    "ElysiumImageBackend",
     "GeminiImageBackend",
     "GeminiTextBackend",
     "KlingImageBackend",
@@ -104,6 +105,14 @@ class TestEndpointDispatch:
         assert built == {
             "backend": "OpenAIImageBackend",
             "kwargs": {"api_key": "sk-test", "base_url": "https://api.example.com/v1", "model": "dall-e-3"},
+        }
+
+    def test_elysium_images(self):
+        result, built = _built(_make_provider(), "elysium-image", "elysium-images")
+        assert isinstance(result, CustomImageBackend)
+        assert built == {
+            "backend": "ElysiumImageBackend",
+            "kwargs": {"api_key": "sk-test", "base_url": "https://api.example.com/v1", "model": "elysium-image"},
         }
 
     def test_gemini_image(self):

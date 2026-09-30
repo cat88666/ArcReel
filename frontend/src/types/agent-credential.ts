@@ -36,6 +36,9 @@ export interface AgentCredential {
   sonnet_model: string | null;
   opus_model: string | null;
   subagent_model: string | null;
+  context_window_tokens: number | null;
+  auto_compact_window_tokens: number | null;
+  max_output_tokens: number | null;
   is_active: boolean;
   created_at: string | null;
 }
@@ -53,6 +56,9 @@ export interface CreateAgentCredentialRequest {
   sonnet_model?: string | null;
   opus_model?: string | null;
   subagent_model?: string | null;
+  context_window_tokens?: number | null;
+  auto_compact_window_tokens?: number | null;
+  max_output_tokens?: number | null;
   activate?: boolean;
 }
 

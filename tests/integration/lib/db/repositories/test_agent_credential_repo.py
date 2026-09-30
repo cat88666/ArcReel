@@ -16,12 +16,18 @@ async def test_create_and_get(async_session) -> None:
         base_url="https://api.deepseek.com/anthropic",
         api_key="sk-test",
         model="deepseek-chat",
+        context_window_tokens=65536,
+        auto_compact_window_tokens=59000,
+        max_output_tokens=4096,
     )
     await async_session.flush()
     fetched = await repo.get(cred.id)
     assert fetched is not None
     assert fetched.preset_id == "deepseek"
     assert fetched.api_key == "sk-test"
+    assert fetched.context_window_tokens == 65536
+    assert fetched.auto_compact_window_tokens == 59000
+    assert fetched.max_output_tokens == 4096
     assert fetched.is_active is False
 
 

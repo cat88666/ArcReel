@@ -68,7 +68,7 @@ segments 表每个分镜已定稿（segment_id、逐字原文、时长、出场�
 - **video_prompt.action**：{{ partial("shared/action_writing_guide") }}
 - **video_prompt.camera_motion**：按画面内容自行选择。
 - **video_prompt.ambiance_audio**：{{ partial("shared/ambiance_audio_writing_guide") }}
-- **video_prompt.dialogue**：speaker 必须出现在该分镜的出场角色中。
+- **video_prompt.dialogue**：必须输出空数组 `[]`。本路线的 `novel_text` 已承载旁白，同一视频单元不得再混入角色对白。
 
 # 创作目标
 

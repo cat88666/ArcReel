@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from lib.workflow.workflow_plan import WorkflowPlanRequest
+from typing import Any
+
+from lib.workflow.workflow_plan import WorkflowPlan, WorkflowPlanRequest
 from server.agent_toolset.declaration import READ_CHECK, Exempt, ToolDeclaration
+from server.agent_toolset.envelope import json_value
 from server.tool_runtime import (
     NoArguments,
     PromptPreviewRequest,
@@ -11,6 +14,45 @@ from server.tool_runtime import (
     get_video_capabilities,
     get_workflow_plan,
 )
+
+
+def _workflow_plan_structured(plan: WorkflowPlan) -> dict[str, Any]:
+    """给 Agent 返回可执行计划，省去 REST 视图中的重复产物快照。"""
+
+    steps: list[dict[str, Any]] = []
+    for step in plan.steps:
+        projected: dict[str, Any] = {
+            "id": step.id,
+            "state": step.state.value,
+            "required": step.required,
+        }
+        if step.requested_ids:
+            projected["requested_ids"] = step.requested_ids
+        if step.problems:
+            projected["problems"] = json_value(step.problems)
+        if step.tasks:
+            projected["tasks"] = json_value(step.tasks)
+        steps.append(projected)
+
+    status = plan.status
+    return {
+        "workflow_plan": {
+            "schema_version": plan.schema_version,
+            "status": {
+                "project_revision": status.project_revision,
+                "source_revision": status.source_revision,
+                "project": json_value(status.project),
+                "target": json_value(status.target),
+                "state": status.state,
+            },
+            "narration_delivery": json_value(plan.narration_delivery),
+            "steps": steps,
+            "blockers": json_value(plan.blockers),
+            "problems": json_value(plan.problems),
+            "next_action": json_value(plan.next_action),
+        }
+    }
+
 
 GET_WORKFLOW_PLAN = ToolDeclaration(
     name="get_workflow_plan",
@@ -24,6 +66,7 @@ GET_WORKFLOW_PLAN = ToolDeclaration(
     migration=READ_CHECK,
     domain_key="workflow_plan",
     handler=get_workflow_plan,
+    projection=_workflow_plan_structured,
 )
 
 GET_VIDEO_CAPABILITIES = ToolDeclaration(

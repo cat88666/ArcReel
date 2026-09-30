@@ -27,6 +27,9 @@ GATEWAY_BASE_URL = "http://43.154.247.11"
 PROVIDER_DISPLAY_NAME = "Elysium Gateway"
 AGENT_CREDENTIAL_DISPLAY_NAME = "Elysium Agent (Qwen3.8)"
 AGENT_MODEL = "elysium-chat"
+AGENT_CONTEXT_WINDOW_TOKENS = 65_536
+AGENT_AUTO_COMPACT_WINDOW_TOKENS = 59_000
+AGENT_MAX_OUTPUT_TOKENS = 4_096
 
 MODEL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
@@ -39,7 +42,7 @@ MODEL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
         "model_id": "elysium-image",
         "display_name": "Elysium Image",
-        "endpoint": "openai-images",
+        "endpoint": "elysium-images",
         "is_default": True,
         "is_enabled": True,
     },
@@ -93,9 +96,9 @@ def validate_gateway(
 ) -> list[str]:
     """Verify the remote gateway contract without making a paid generation call."""
     try:
-        with urlopen(f"{GATEWAY_BASE_URL}/health", timeout=10) as response:
+        with urlopen(f"{GATEWAY_BASE_URL}/readyz", timeout=10) as response:
             if response.status != 200:
-                raise RuntimeError(f"gateway health returned HTTP {response.status}")
+                raise RuntimeError(f"gateway readiness returned HTTP {response.status}")
         models_request = request.Request(
             f"{GATEWAY_BASE_URL}/v1/models",
             headers={"Authorization": f"Bearer {api_key}"},
@@ -170,6 +173,9 @@ async def apply_configuration(api_key: str) -> tuple[int, bool, int]:
             "sonnet_model": AGENT_MODEL,
             "opus_model": AGENT_MODEL,
             "subagent_model": AGENT_MODEL,
+            "context_window_tokens": AGENT_CONTEXT_WINDOW_TOKENS,
+            "auto_compact_window_tokens": AGENT_AUTO_COMPACT_WINDOW_TOKENS,
+            "max_output_tokens": AGENT_MAX_OUTPUT_TOKENS,
         }
         if agent_matches:
             agent_credential = await agent_repo.update(agent_matches[0].id, **agent_values)

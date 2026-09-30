@@ -321,6 +321,52 @@ async def test_split_narration_segments_rejects_rewritten_novel_text(
     assert not (fake_ctx.project_path / "drafts" / "episode_1" / "script_plan_segments.json").exists()
 
 
+async def test_split_narration_segments_retries_coverage_failure_with_exact_episode_source(
+    fake_ctx: ToolHarness, monkeypatch, video_request_facts
+) -> None:
+    """模型从项目概述续写正文时自动重做，并在修正提示中钉住本集唯一源文。"""
+    from server import text_generation as mod
+
+    source_text = "碍于大哥一直没有表达,"
+    nr_project(fake_ctx)
+    source_dir = fake_ctx.project_path / "source"
+    source_dir.mkdir(parents=True)
+    (source_dir / "episode_1.txt").write_text(source_text, encoding="utf-8")
+    responses = [
+        [
+            nr_segment("E1S01", 4, source_text),
+            nr_segment("E1S02", 4, "意外看中潘金莲。"),
+        ],
+        [nr_segment("E1S01", 4, source_text)],
+    ]
+    prompts: list[str] = []
+
+    class _Generator:
+        async def generate(self, request, project_name=None):
+            prompts.append(request.prompt)
+
+            class _Result:
+                text = json.dumps({"episode": 1, "segments": responses.pop(0)}, ensure_ascii=False)
+
+            return _Result()
+
+    async def fake_create(*_args, **_kwargs):
+        return _Generator()
+
+    monkeypatch.setattr(mod.TextGenerator, "create", fake_create)
+
+    out = await run_declared_tool("generate_script_plan", fake_ctx, {"episode": 1})
+
+    assert out.problem is None, out
+    assert len(prompts) == 2
+    assert json.dumps(source_text, ensure_ascii=False) in prompts[1]
+    assert "项目概述仅供理解背景" in prompts[1]
+    saved = json.loads(
+        (fake_ctx.project_path / "drafts" / "episode_1" / "script_plan_segments.json").read_text(encoding="utf-8")
+    )
+    assert [segment["novel_text"] for segment in saved["segments"]] == [source_text]
+
+
 async def test_split_narration_segments_rejects_reordered_novel_text(
     fake_ctx: ToolHarness, monkeypatch, video_request_facts
 ) -> None:

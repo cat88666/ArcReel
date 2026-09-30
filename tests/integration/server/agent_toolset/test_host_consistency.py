@@ -190,7 +190,7 @@ def _answering[DeclarationT: AgentToolDeclaration](
         calls.append(request.value)
         return outcome
 
-    return replace(declaration, handler=handler)
+    return replace(declaration, handler=handler, projection=None)
 
 
 def _remote_arguments(declaration: AgentToolDeclaration, arguments: dict[str, Any]) -> dict[str, Any]:

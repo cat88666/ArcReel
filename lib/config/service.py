@@ -51,19 +51,12 @@ class ProviderConfigValueError(ValueError):
         self.params: dict[str, str] = {"field": key, "value": value}
 
 
-# DB setting key → environment variable name
-_ANTHROPIC_ENV_MAP: dict[str, str] = {
-    "anthropic_api_key": "ANTHROPIC_API_KEY",
-    "anthropic_base_url": "ANTHROPIC_BASE_URL",
-    "anthropic_model": "ANTHROPIC_MODEL",
-    "anthropic_default_haiku_model": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    "anthropic_default_opus_model": "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "anthropic_default_sonnet_model": "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "claude_code_subagent_model": "CLAUDE_CODE_SUBAGENT_MODEL",
-}
-# 一致性守护：env 名单与 ANTHROPIC_ENV_KEYS 必须对齐。
-assert set(_ANTHROPIC_ENV_MAP.values()) == set(ANTHROPIC_ENV_KEYS), (
-    "_ANTHROPIC_ENV_MAP 与 lib.config.env_keys.ANTHROPIC_ENV_KEYS 漂移"
+_AGENT_RUNTIME_ENV_KEYS = (
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
 )
 
 
@@ -73,7 +66,7 @@ async def build_anthropic_env_dict(session: AsyncSession) -> dict[str, str]:
     返回值由 OptionsAssembler 的凭证注入（load_provider_env_overrides）注入到
     ClaudeAgentOptions.env。
 
-    双轨期 fallback：active credential 字段为空时从 system_settings 兜底。
+    Agent 凭证是唯一真相源；没有生效凭证时返回空值围堵父进程环境。
     """
     # 局部 import 避免循环依赖（agent_credential_repo → agent_credential model → base）
     from lib.db.repositories.agent_credential_repo import AgentCredentialRepository
@@ -81,23 +74,28 @@ async def build_anthropic_env_dict(session: AsyncSession) -> dict[str, str]:
     repo = AgentCredentialRepository(session)
     cred = await repo.get_active()
 
-    if cred is not None:
-        settings = await SystemSettingRepository(session).get_all()
-        return {
+    result = dict.fromkeys((*ANTHROPIC_ENV_KEYS, *_AGENT_RUNTIME_ENV_KEYS), "")
+    if cred is None:
+        return result
+
+    result.update(
+        {
             "ANTHROPIC_API_KEY": cred.api_key or "",
             "ANTHROPIC_BASE_URL": cred.base_url or "",
-            "ANTHROPIC_MODEL": cred.model or settings.get("anthropic_model", "").strip(),
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": cred.haiku_model
-            or settings.get("anthropic_default_haiku_model", "").strip(),
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": cred.sonnet_model
-            or settings.get("anthropic_default_sonnet_model", "").strip(),
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": cred.opus_model or settings.get("anthropic_default_opus_model", "").strip(),
-            "CLAUDE_CODE_SUBAGENT_MODEL": cred.subagent_model or settings.get("claude_code_subagent_model", "").strip(),
+            "ANTHROPIC_MODEL": cred.model or "",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": cred.haiku_model or "",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": cred.sonnet_model or "",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": cred.opus_model or "",
+            "CLAUDE_CODE_SUBAGENT_MODEL": cred.subagent_model or "",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(cred.context_window_tokens or ""),
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(cred.auto_compact_window_tokens or ""),
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(cred.max_output_tokens or ""),
+            "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1"
+            if cred.context_window_tokens is not None
+            else "",
         }
-
-    # 无 active credential — 回退 system_settings（双轨期兼容）
-    settings = await SystemSettingRepository(session).get_all()
-    return {env_key: settings.get(db_key, "").strip() for db_key, env_key in _ANTHROPIC_ENV_MAP.items()}
+    )
+    return result
 
 
 @dataclass

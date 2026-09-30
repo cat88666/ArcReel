@@ -166,7 +166,7 @@ docker compose up -d
 ./scripts/setup_elysium_gateway.sh
 ```
 
-向导会隐藏读取服务器签发的 API Key，并只把密钥写入本机 ArcReel 数据库；密钥不会进入命令行参数、环境变量或 Git。换电脑后，在新检出的仓库中重新运行一次向导即可。本网关当前不提供 Anthropic Messages 与文字转语音接口，因此 ArcReel 内嵌 Agent 和 TTS 仍需单独配置兼容供应商。
+向导会隐藏读取服务器签发的 API Key，并只把密钥写入本机 ArcReel 数据库；密钥不会进入命令行参数、环境变量或 Git。它会同时创建并激活使用 `elysium-chat` 的 Agent 凭证，写入网关声明的上下文能力。换电脑后，在新检出的仓库中重新运行一次向导即可。本网关当前不提供文字转语音接口，因此 TTS 仍需单独配置兼容供应商。
 
 ## 文档
 

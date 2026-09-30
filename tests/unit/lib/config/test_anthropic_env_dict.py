@@ -25,6 +25,9 @@ async def test_active_credential_returns_full_dict(monkeypatch: pytest.MonkeyPat
             "sonnet_model": "claude-sonnet-4-6",
             "opus_model": "claude-opus-4-7",
             "subagent_model": "claude-haiku-4-5",
+            "context_window_tokens": 200000,
+            "auto_compact_window_tokens": 180000,
+            "max_output_tokens": 8192,
         },
     )()
     repo_mock.get_active = AsyncMock(return_value=cred)
@@ -42,6 +45,10 @@ async def test_active_credential_returns_full_dict(monkeypatch: pytest.MonkeyPat
     assert result["ANTHROPIC_API_KEY"] == "sk-test"
     assert result["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
     assert result["ANTHROPIC_MODEL"] == "claude-opus-4-7"
+    assert result["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "200000"
+    assert result["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "180000"
+    assert result["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "8192"
+    assert result["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] == "1"
 
 
 @pytest.mark.asyncio
@@ -65,8 +72,7 @@ async def test_no_active_credential_returns_empty_strings(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_no_active_credential_falls_back_to_system_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """双轨期兼容：无 active credential 时从 system_settings legacy key 读取。"""
+async def test_no_active_credential_does_not_fall_back_to_system_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     session = AsyncMock()
     repo_mock = AsyncMock()
     repo_mock.get_active = AsyncMock(return_value=None)
@@ -86,11 +92,11 @@ async def test_no_active_credential_falls_back_to_system_settings(monkeypatch: p
     monkeypatch.setattr("lib.config.service.SystemSettingRepository", lambda _s: setting_repo)
 
     result = await build_anthropic_env_dict(session)
-    assert result["ANTHROPIC_API_KEY"] == "legacy-sk"
-    assert result["ANTHROPIC_BASE_URL"] == "https://legacy.anthropic.com"
-    assert result["ANTHROPIC_MODEL"] == "claude-legacy-model"
-    # 未在 settings 中的 key 仍返回空串
+    assert result["ANTHROPIC_API_KEY"] == ""
+    assert result["ANTHROPIC_BASE_URL"] == ""
+    assert result["ANTHROPIC_MODEL"] == ""
     assert result["CLAUDE_CODE_SUBAGENT_MODEL"] == ""
+    setting_repo.get_all.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -112,6 +118,9 @@ async def test_function_does_not_touch_environ(monkeypatch: pytest.MonkeyPatch) 
             "sonnet_model": None,
             "opus_model": None,
             "subagent_model": None,
+            "context_window_tokens": None,
+            "auto_compact_window_tokens": None,
+            "max_output_tokens": None,
         },
     )()
     repo_mock.get_active = AsyncMock(return_value=cred)

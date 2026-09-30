@@ -436,6 +436,23 @@ class TestPlan:
         project = _load_project(project_dir)
         assert len(project["episodes"]) == 1
 
+    async def test_plan_retry_suggests_exact_source_anchor_for_paraphrased_boundary(self, tmp_path: Path):
+        """模型改写句末时，重试提示给出可直接复制的精确原文候选。"""
+        project_dir = _write_project(tmp_path)
+        paraphrased_anchor = "古玉里面藏着一套剑法。"
+        fake = _FakeTextGenerator(
+            [
+                _plan_response([{"title": "坏", "hook": "坏", "end_anchor": paraphrased_anchor}]),
+                _plan_response([{"title": "古玉藏诀", "hook": "玉中剑诀来历成谜", "end_anchor": ANCHOR_EP1}]),
+            ]
+        )
+
+        await EpisodePlanner(project_dir, generator=fake).plan()
+
+        retry_prompt = fake.requests[1].prompt
+        assert "可直接复制的原文句末候选" in retry_prompt
+        assert ANCHOR_EP1 in retry_prompt
+
     async def test_plan_retries_on_ambiguous_and_non_monotonic_anchors(self, tmp_path: Path):
         """锚点不唯一 / 范围不连续同样触发重试，失败原因可区分。"""
         repeated = "李恒抬头看了看天。"

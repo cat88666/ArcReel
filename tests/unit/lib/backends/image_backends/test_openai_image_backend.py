@@ -544,3 +544,64 @@ class TestModeGating:
             assert excinfo.value.code == "image_endpoint_mismatch_no_i2i"
             assert excinfo.value.params.get("model") == "m"
             assert excinfo.value.params.get("detail") == "all reference images failed to open"
+
+
+class TestElysiumImageBackend:
+    async def test_generation_uses_exact_gateway_fields(self, tmp_path: Path) -> None:
+        client = AsyncMock()
+        client.images.generate = AsyncMock(return_value=_make_mock_image_response())
+
+        with captured_openai_clients(client):
+            from lib.backends.image_backends.elysium import ElysiumImageBackend
+
+            backend = ElysiumImageBackend(api_key="test-key", model="elysium-image")
+            result = await backend.generate(
+                ImageGenerationRequest(
+                    prompt="rainy street",
+                    output_path=tmp_path / "out.png",
+                    aspect_ratio="9:16",
+                    image_size="1K",
+                    seed=42,
+                )
+            )
+
+        assert client.images.generate.call_args.kwargs == {
+            "model": "elysium-image",
+            "prompt": "rainy street",
+            "n": 1,
+            "size": "1008x1792",
+            "seed": 42,
+        }
+        assert result.quality is None
+
+    async def test_edit_uses_exact_gateway_fields_and_reference_limit(self, tmp_path: Path) -> None:
+        client = AsyncMock()
+        client.images.edit = AsyncMock(return_value=_make_mock_image_response())
+        references: list[ReferenceImage] = []
+        for index in range(11):
+            path = tmp_path / f"ref-{index}.png"
+            path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            references.append(ReferenceImage(path=str(path)))
+
+        with captured_openai_clients(client):
+            from lib.backends.image_backends.elysium import ElysiumImageBackend
+
+            backend = ElysiumImageBackend(api_key="test-key", model="elysium-image")
+            result = await backend.generate(
+                ImageGenerationRequest(
+                    prompt="make it dusk",
+                    output_path=tmp_path / "edited.png",
+                    aspect_ratio="9:16",
+                    image_size="1K",
+                    reference_images=references,
+                    seed=42,
+                )
+            )
+
+        kwargs = client.images.edit.call_args.kwargs
+        assert set(kwargs) == {"model", "image", "prompt", "size"}
+        assert kwargs["model"] == "elysium-image"
+        assert kwargs["prompt"] == "make it dusk"
+        assert kwargs["size"] == "1008x1792"
+        assert len(kwargs["image"]) == backend.max_reference_images == 10
+        assert result.quality is None

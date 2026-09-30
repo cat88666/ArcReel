@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +117,21 @@ async def test_rest_and_mcp_serialize_the_same_workflow_plan(tmp_path: Path, mon
         ("demo", WorkflowPlanRequest.model_validate(payload), "default"),
         ("demo", WorkflowPlanRequest.model_validate(payload), "u1"),
     ]
+
+
+def test_workflow_plan_agent_projection_keeps_route_and_omits_duplicate_snapshots() -> None:
+    plan = build_workflow_plan(_status(), narration_delivery=POST_PRODUCTION)
+
+    assert GET_WORKFLOW_PLAN.projection is not None
+    projected = GET_WORKFLOW_PLAN.projection(plan)["workflow_plan"]
+
+    assert projected["next_action"] == plan.next_action.model_dump(mode="json")
+    assert projected["status"]["state"] == "VIDEO"
+    assert [step["id"] for step in projected["steps"]] == [step.id for step in plan.steps]
+    assert "gates" not in projected["status"]
+    assert "artifacts" not in projected["status"]
+    assert all("artifacts" not in step and "admission" not in step for step in projected["steps"])
+    assert len(json.dumps(projected)) < len(json.dumps(plan.model_dump(mode="json")))
 
 
 async def test_workflow_plan_mcp_rejects_invalid_transient_choice_before_service(

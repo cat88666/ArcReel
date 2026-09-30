@@ -190,6 +190,7 @@ class TestEndpointCatalog:
             "openai-chat",
             "gemini-generate",
             "openai-images",
+            "elysium-images",
             "openai-images-generations",
             "openai-images-edits",
             "gemini-image",

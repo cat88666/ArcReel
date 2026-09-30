@@ -6,7 +6,7 @@ ProviderCredential 同模式)。
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Index, String, Text, text
+from sqlalchemy import Boolean, Index, Integer, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from lib.db.base import DEFAULT_USER_ID, Base, TimestampMixin
@@ -39,4 +39,7 @@ class AgentAnthropicCredential(TimestampMixin, Base):
     sonnet_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     opus_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     subagent_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    context_window_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    auto_compact_window_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

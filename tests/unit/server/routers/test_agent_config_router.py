@@ -128,6 +128,40 @@ async def test_create_custom_with_base_url(agent_config_client) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_custom_with_explicit_runtime_capacity(agent_config_client) -> None:
+    body = {
+        "preset_id": "__custom__",
+        "base_url": "https://proxy.example.com/anthropic",
+        "api_key": "sk",
+        "context_window_tokens": 65536,
+        "auto_compact_window_tokens": 59000,
+        "max_output_tokens": 4096,
+    }
+
+    resp = await agent_config_client.post("/api/v1/agent/credentials", json=body)
+
+    assert resp.status_code == 201
+    assert resp.json()["context_window_tokens"] == 65536
+    assert resp.json()["auto_compact_window_tokens"] == 59000
+    assert resp.json()["max_output_tokens"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_non_positive_runtime_capacity(agent_config_client) -> None:
+    resp = await agent_config_client.post(
+        "/api/v1/agent/credentials",
+        json={
+            "preset_id": "__custom__",
+            "base_url": "https://proxy.example.com/anthropic",
+            "api_key": "sk",
+            "context_window_tokens": 0,
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_create_normalizes_full_messages_endpoint(agent_config_client) -> None:
     """预设凭证覆盖 base_url 时，整条 messages 端点归一为调用根后入库。"""
     body = {

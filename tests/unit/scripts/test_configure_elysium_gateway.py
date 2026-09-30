@@ -32,6 +32,9 @@ class _AgentCredential:
     sonnet_model: str | None
     opus_model: str | None
     subagent_model: str | None
+    context_window_tokens: int | None
+    auto_compact_window_tokens: int | None
+    max_output_tokens: int | None
     is_active: bool = False
 
 
@@ -146,7 +149,7 @@ def test_validate_gateway_requires_all_shipped_models() -> None:
     def urlopen(target: str | request.Request, **_kwargs: Any) -> _Response:
         url = target.full_url if isinstance(target, request.Request) else target
         calls.append(url)
-        if url.endswith("/health"):
+        if url.endswith("/readyz"):
             return _Response({"status": "ok"})
         return _Response({"data": [{"id": model["model_id"]} for model in gateway_config.MODEL_DEFINITIONS]})
 
@@ -156,7 +159,7 @@ def test_validate_gateway_requires_all_shipped_models() -> None:
         "elysium-video",
     ]
     assert calls == [
-        "http://43.154.247.11/health",
+        "http://43.154.247.11/readyz",
         "http://43.154.247.11/v1/models",
     ]
 
@@ -164,7 +167,7 @@ def test_validate_gateway_requires_all_shipped_models() -> None:
 def test_validate_gateway_rejects_incomplete_catalog() -> None:
     def urlopen(target: str | request.Request, **_kwargs: Any) -> _Response:
         url = target.full_url if isinstance(target, request.Request) else target
-        if url.endswith("/health"):
+        if url.endswith("/readyz"):
             return _Response({"status": "ok"})
         return _Response({"data": [{"id": "elysium-chat"}]})
 
@@ -177,6 +180,7 @@ def test_model_definitions_are_independent() -> None:
     first[0]["display_name"] = "changed"
 
     assert gateway_config.model_definitions()[0]["display_name"] == "Elysium Chat"
+    assert gateway_config.model_definitions()[1]["endpoint"] == "elysium-images"
     assert json.loads(gateway_config.model_definitions()[2]["supported_durations"]) == list(range(1, 16))
 
 
@@ -228,4 +232,7 @@ async def test_apply_configuration_is_idempotent(monkeypatch: pytest.MonkeyPatch
         agent_credential.opus_model,
         agent_credential.subagent_model,
     } == {"elysium-chat"}
+    assert agent_credential.context_window_tokens == 65536
+    assert agent_credential.auto_compact_window_tokens == 59000
+    assert agent_credential.max_output_tokens == 4096
     assert state.commits == 2

@@ -9,7 +9,7 @@ import logging
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, PositiveInt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lib.agent.agent_provider_catalog import CUSTOM_SENTINEL_ID, get_preset, list_presets
@@ -95,6 +95,9 @@ class CredentialResponse(BaseModel):
     sonnet_model: str | None
     opus_model: str | None
     subagent_model: str | None
+    context_window_tokens: int | None
+    auto_compact_window_tokens: int | None
+    max_output_tokens: int | None
     is_active: bool
     created_at: str | None
 
@@ -115,6 +118,9 @@ class CreateCredentialRequest(BaseModel):
     sonnet_model: str | None = None
     opus_model: str | None = None
     subagent_model: str | None = None
+    context_window_tokens: PositiveInt | None = None
+    auto_compact_window_tokens: PositiveInt | None = None
+    max_output_tokens: PositiveInt | None = None
     activate: bool = False
 
 
@@ -127,6 +133,9 @@ class UpdateCredentialRequest(BaseModel):
     sonnet_model: str | None = None
     opus_model: str | None = None
     subagent_model: str | None = None
+    context_window_tokens: PositiveInt | None = None
+    auto_compact_window_tokens: PositiveInt | None = None
+    max_output_tokens: PositiveInt | None = None
 
 
 def _cred_to_response(cred) -> CredentialResponse:
@@ -143,6 +152,9 @@ def _cred_to_response(cred) -> CredentialResponse:
         sonnet_model=cred.sonnet_model,
         opus_model=cred.opus_model,
         subagent_model=cred.subagent_model,
+        context_window_tokens=cred.context_window_tokens,
+        auto_compact_window_tokens=cred.auto_compact_window_tokens,
+        max_output_tokens=cred.max_output_tokens,
         is_active=cred.is_active,
         created_at=dt_to_iso(cred.created_at),
     )
@@ -235,6 +247,9 @@ async def create_credential(
         sonnet_model=body.sonnet_model,
         opus_model=body.opus_model,
         subagent_model=body.subagent_model,
+        context_window_tokens=body.context_window_tokens,
+        auto_compact_window_tokens=body.auto_compact_window_tokens,
+        max_output_tokens=body.max_output_tokens,
     )
     if body.activate:
         await repo.set_active(cred.id)

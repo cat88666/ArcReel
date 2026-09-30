@@ -99,6 +99,11 @@ logger = logging.getLogger(__name__)
 # 上限对附加指令文本足够宽松，仅挡病态输入；文本生成与分集规划共用。
 MAX_INSTRUCTIONS_LEN = 4000
 
+# 旁白脚本规划最常见的可恢复失败是模型从项目概述补写了不属于本集源文的内容。
+# 首次失败后把唯一允许拆分的原文再次作为 JSON 字符串钉进修正提示，让文本模型自行重做；
+# 仍失败才进入既有草稿修复通道。
+_NARRATION_COVERAGE_GENERATION_ATTEMPTS = 3
+
 #: 提示词编写工具收到已取消的 ``scope`` 参数时的拒绝说明，由其请求模型给出。
 SCOPE_REMOVED_MESSAGE = (
     "scope 参数已取消：generate_episode_script 默认只编写正式脚本中全部待编写的条目；"
@@ -1105,6 +1110,21 @@ def _covers_source_verbatim(parts: list[str], source: str) -> bool:
     return cursor == len(source)
 
 
+def _narration_coverage_retry_prompt(base_prompt: str, novel_text: str) -> str:
+    """为覆盖校验失败构造重试提示，明确排除项目概述中的非本集文本。"""
+
+    exact_source = json.dumps(novel_text, ensure_ascii=False)
+    return (
+        f"{base_prompt}\n\n"
+        "# 覆盖校验失败，重新生成\n"
+        "上一轮输出的 segments[].novel_text 未按序逐字覆盖本集原文。"
+        "项目概述仅供理解背景，禁止从中补写、续写或搬运任何正文。\n"
+        f"本集唯一允许拆分的原文 JSON 字符串是：{exact_source}\n"
+        "请重新输出完整结构；按顺序拼接所有 segments[].novel_text 后，"
+        "必须与该 JSON 字符串解码后的文本逐字相等。"
+    )
+
+
 def _collect_narration_violations(
     segments: list[dict[str, Any]],
     *,
@@ -1444,32 +1464,44 @@ async def generate_narration_script_plan(
         generator = await TextGenerator.create(
             TextTaskType.SCRIPT, project_name=project_name, purpose=CallPurpose.SCRIPT_GENERATION
         )
-        result = await generator.generate(
-            BackendTextGenerationRequest(
-                prompt=prompt,
-                response_schema=NarrationScriptPlanDraft,
-                max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-            ),
-            project_name=project_name,
-        )
-        content = _parse_script_plan_json(
-            result.text,
-            NarrationScriptPlanDraft,
-            label="script_plan 拆分内容",
-            top_shape="{segments}",
-        )
-        raw_segments = content.get("segments")
-        if not isinstance(raw_segments, list) or not raw_segments:
-            raise ValueError("script_plan 拆分内容结构异常：segments 必须是非空的分镜对象数组")
+        catalog = build_reference_catalog(project)
+        generation_prompt = prompt
+        content: dict[str, Any] = {}
+        raw_segments: list[Any] = []
+        violations: list[DraftViolation] = []
+        for attempt in range(_NARRATION_COVERAGE_GENERATION_ATTEMPTS):
+            result = await generator.generate(
+                BackendTextGenerationRequest(
+                    prompt=generation_prompt,
+                    response_schema=NarrationScriptPlanDraft,
+                    max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                ),
+                project_name=project_name,
+            )
+            content = _parse_script_plan_json(
+                result.text,
+                NarrationScriptPlanDraft,
+                label="script_plan 拆分内容",
+                top_shape="{segments}",
+            )
+            candidate_segments = content.get("segments")
+            if not isinstance(candidate_segments, list) or not candidate_segments:
+                raise ValueError("script_plan 拆分内容结构异常：segments 必须是非空的分镜对象数组")
+            raw_segments = candidate_segments
 
-        violations = _collect_narration_violations(
-            raw_segments,
-            episode=episode,
-            supported_durations=supported_durations,
-            catalog=build_reference_catalog(project),
-            novel_text=novel_text,
-            source_scope=_coverage_source_scope(request.source, episode=episode),
-        )
+            violations = _collect_narration_violations(
+                raw_segments,
+                episode=episode,
+                supported_durations=supported_durations,
+                catalog=catalog,
+                novel_text=novel_text,
+                source_scope=_coverage_source_scope(request.source, episode=episode),
+            )
+            coverage_failed = any(violation.code == "novel_text_coverage" for violation in violations)
+            if not coverage_failed or attempt + 1 == _NARRATION_COVERAGE_GENERATION_ATTEMPTS:
+                break
+            generation_prompt = _narration_coverage_retry_prompt(prompt, novel_text)
+
         if violations:
             async with ProjectManager.for_project_dir(project_path).async_file_lock(draft_path):
                 _assert_draft_revision(draft_path, draft_baseline)

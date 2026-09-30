@@ -197,6 +197,19 @@ class _FakeTextGenerator:
         return await self.backend.generate(request)
 
 
+class _SequenceTextGenerator:
+    def __init__(self, response_texts: list[str]):
+        self.response_texts = list(response_texts)
+        self.requests = []
+        self.model = "fake-model"
+
+    async def generate(self, request, project_name=None):
+        from lib.backends.text_backends.base import TextGenerationResult
+
+        self.requests.append(request)
+        return TextGenerationResult(text=self.response_texts.pop(0), provider="fake", model=self.model)
+
+
 class TestScriptGenerator:
     @pytest.fixture(autouse=True)
     def _fixed_tier_facts(self, video_request_facts) -> None:
@@ -226,6 +239,7 @@ class TestScriptGenerator:
         assert "E1S01" in prompt
         assert "第一段原文，逐字保留。" in prompt  # novel_text 作只读上下文渲染
         assert "姜月茴" in prompt
+        assert "video_prompt.dialogue**：必须输出空数组 `[]`" in prompt
 
     async def test_build_prompt_appends_user_instructions(self, tmp_path):
         """instructions 以中性「附加指令」分节追加到 prompt 末尾；未传时无该分节。"""
@@ -607,6 +621,37 @@ class TestScriptGenerator:
         assert "pending_authoring" not in seg
         assert payload["metadata"]["generator"] == "fake-model"
         assert payload["metadata"]["created_at"] == converted["metadata"]["created_at"]
+
+    async def test_narration_prompt_authoring_retries_mixed_speech_before_saving(self, tmp_path):
+        project_path = tmp_path / "projects" / "demo"
+        _write_project_json(
+            project_path,
+            {
+                "title": "项目",
+                "content_mode": "narration",
+                "overview": {},
+                "characters": {"武松": {}},
+                "style": "古风",
+                "style_description": "cinematic",
+            },
+        )
+        _write_script_plan_json(
+            project_path,
+            1,
+            [{**_script_plan_seg("E1S01", "碍于大哥一直没有表达,", characters=["武松"])}],
+        )
+        await _materialized_script(project_path)
+        invalid = _narration_visual_response(["E1S01"])
+        invalid["segments"][0]["video_prompt"]["dialogue"] = [{"speaker": "武松", "line": "我不能说。"}]
+        valid = _narration_visual_response(["E1S01"])
+        fake = _SequenceTextGenerator([json.dumps(invalid, ensure_ascii=False), json.dumps(valid, ensure_ascii=False)])
+
+        output = await ScriptGenerator(project_path, generator=fake, config_resolver=_resolver()).generate(1)
+
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        assert payload["segments"][0]["video_prompt"]["dialogue"] == []
+        assert len(fake.requests) == 2
+        assert "所有 video_prompt.dialogue 必须是空数组 []" in fake.requests[1].prompt
 
     @pytest.mark.parametrize("content_mode", ["narration", "drama"])
     async def test_generate_reads_formal_baseline_without_blocking_event_loop(
