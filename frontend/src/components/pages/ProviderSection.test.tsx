@@ -7,11 +7,10 @@ import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
 import { useConfigStatusStore } from "@/stores/config-status-store";
 import { useEndpointCatalogStore } from "@/stores/endpoint-catalog-store";
-import { createDeferred } from "@/test/deferred";
 import { ProviderSection } from "./ProviderSection";
-import type { ProviderConfigDetail, ProviderInfo, CustomProviderInfo, EndpointDescriptor } from "@/types";
+import type { ProviderInfo, CustomProviderInfo, EndpointDescriptor } from "@/types";
 
-function renderAt(path = "/app/settings?provider=gemini-aistudio") {
+function renderAt(path = "/app/settings?custom=1") {
   const location = memoryLocation({ path, record: true });
   return {
     ...render(
@@ -61,40 +60,6 @@ function customFor(lang: string): { providers: CustomProviderInfo[] } {
       },
     ],
   };
-}
-
-function providerDetailFor(lang: string): ProviderConfigDetail {
-  return {
-    id: "gemini-aistudio",
-    display_name: lang === "en" ? "Gemini AI Studio (EN)" : "Gemini AI Studio（中文）",
-    description: "",
-    status: "ready",
-    media_types: ["video"],
-    fields: [
-      {
-        key: "max_workers",
-        label: "Max Workers",
-        type: "number",
-        required: false,
-        is_set: true,
-        value: "2",
-      },
-    ],
-    supports_base_url: false,
-    secret_fields: [],
-    secret_field_groups: [],
-  };
-}
-
-async function savePresetProvider() {
-  renderAt();
-  await screen.findByText("Gemini AI Studio（中文）", { selector: "h3" });
-  fireEvent.click(screen.getByRole("button", { name: "高级配置" }));
-  fireEvent.change(screen.getByRole("spinbutton", { name: "Max Workers" }), {
-    target: { value: "7" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "保存" }));
-  await waitFor(() => expect(API.patchProviderConfig).toHaveBeenCalledWith("gemini-aistudio", { max_workers: "7" }));
 }
 
 const CHAT_ENDPOINT: EndpointDescriptor = {
@@ -152,6 +117,7 @@ describe("ProviderSection", () => {
     vi.spyOn(API, "listCustomProviders").mockImplementation(() =>
       Promise.resolve(customFor(i18n.language)),
     );
+    vi.spyOn(API, "getCustomProvider").mockResolvedValue(customProvider(1, "我的端点（中文）"));
     vi.spyOn(API, "getProviderConfig").mockRejectedValue(new Error("detail not under test"));
     vi.spyOn(API, "listCredentials").mockResolvedValue({ credentials: [] });
     vi.spyOn(API, "patchProviderConfig").mockResolvedValue();
@@ -169,8 +135,8 @@ describe("ProviderSection", () => {
 
     const nav = () => screen.getByRole("navigation");
     await screen.findByRole("navigation");
-    expect(within(nav()).getByText("Gemini AI Studio（中文）")).toBeInTheDocument();
     expect(within(nav()).getByText("我的端点（中文）")).toBeInTheDocument();
+    expect(within(nav()).queryByText("Gemini AI Studio（中文）")).not.toBeInTheDocument();
 
     await act(async () => {
       await i18n.changeLanguage("en");
@@ -178,10 +144,9 @@ describe("ProviderSection", () => {
 
     // 切换语言后目录须按新语言重取，否则停留在切换前的译名
     await waitFor(() =>
-      expect(within(nav()).getByText("Gemini AI Studio (EN)")).toBeInTheDocument(),
+      expect(within(nav()).getByText("My Endpoint (EN)")).toBeInTheDocument(),
     );
-    expect(within(nav()).getByText("My Endpoint (EN)")).toBeInTheDocument();
-    expect(within(nav()).queryByText("Gemini AI Studio（中文）")).not.toBeInTheDocument();
+    expect(within(nav()).queryByText("我的端点（中文）")).not.toBeInTheDocument();
   });
 
   it("keeps the catalog rendered while the language-triggered refetch is in flight", async () => {
@@ -204,7 +169,7 @@ describe("ProviderSection", () => {
     // 语言切换是静默刷新：不回到 loading 面板，详情面板不被卸载
     expect(screen.queryByText(/加载供应商列表|Loading providers/)).not.toBeInTheDocument();
     expect(
-      within(screen.getByRole("navigation")).getByText("Gemini AI Studio（中文）"),
+      within(screen.getByRole("navigation")).getByText("我的端点（中文）"),
     ).toBeInTheDocument();
 
     await act(async () => {
@@ -213,7 +178,7 @@ describe("ProviderSection", () => {
     });
     await waitFor(() =>
       expect(
-        within(screen.getByRole("navigation")).getByText("Gemini AI Studio (EN)"),
+        within(screen.getByRole("navigation")).getByText("My Endpoint (EN)"),
       ).toBeInTheDocument(),
     );
   });
@@ -235,7 +200,7 @@ describe("ProviderSection", () => {
     // 静默刷新失败不得把整个小节换成错误面板：那会卸载详情面板、丢掉未保存的表单输入
     await waitFor(() =>
       expect(
-        within(screen.getByRole("navigation")).getByText("Gemini AI Studio（中文）"),
+        within(screen.getByRole("navigation")).getByText("我的端点（中文）"),
       ).toBeInTheDocument(),
     );
     expect(screen.queryByText("network down")).not.toBeInTheDocument();
@@ -259,53 +224,16 @@ describe("ProviderSection", () => {
     expect(screen.getByRole("alert")).toBeInTheDocument();
   });
 
-  it("selects the first preset provider when the URL names no selection", async () => {
+  it("shows only custom providers and selects the first one when the URL names no selection", async () => {
     const { location } = renderAt("/app/settings");
     const nav = await screen.findByRole("navigation");
 
-    // 兜底选中以 replace 写回 URL，并在目录里点亮首个 preset
+    expect(within(nav).queryByText("Gemini AI Studio（中文）")).not.toBeInTheDocument();
     await waitFor(() =>
-      expect(within(nav).getByText("Gemini AI Studio（中文）").closest('[aria-current="page"]')).not.toBeNull(),
+      expect(within(nav).getByText("我的端点（中文）").closest('[aria-current="page"]')).not.toBeNull(),
     );
     // replace 写回：历史里只剩替换后的一条，不追加
-    expect(location.history).toEqual(["/app/settings?provider=gemini-aistudio"]);
-  });
-
-  it("warns when a successful save is followed by a failed catalog refresh", async () => {
-    vi.mocked(API.getProviders)
-      .mockReset()
-      .mockResolvedValueOnce(providersFor("zh"))
-      .mockRejectedValueOnce(new Error("network down"));
-    vi.mocked(API.getProviderConfig).mockImplementation(() => Promise.resolve(providerDetailFor(i18n.language)));
-
-    await savePresetProvider();
-
-    await waitFor(() =>
-      expect(useAppStore.getState().toast).toMatchObject({
-        text: "已保存，但供应商列表刷新失败，请重新加载页面",
-        tone: "warning",
-      }),
-    );
-  });
-
-  it("does not warn when a successful save refresh is superseded", async () => {
-    const superseded = createDeferred<{ providers: ProviderInfo[] }>();
-    vi.mocked(API.getProviders)
-      .mockReset()
-      .mockResolvedValueOnce(providersFor("zh"))
-      .mockReturnValueOnce(superseded.promise)
-      .mockImplementation(() => Promise.resolve(providersFor(i18n.language)));
-    vi.mocked(API.getProviderConfig).mockImplementation(() => Promise.resolve(providerDetailFor(i18n.language)));
-
-    await savePresetProvider();
-    await waitFor(() => expect(API.getProviders).toHaveBeenCalledTimes(2));
-
-    await act(async () => i18n.changeLanguage("en"));
-    superseded.resolve(providersFor("zh"));
-    await waitFor(() => expect(API.getProviders).toHaveBeenCalledTimes(3));
-    await act(async () => Promise.resolve());
-
-    expect(useAppStore.getState().toast).toBeNull();
+    expect(location.history).toEqual(["/app/settings?custom=1"]);
   });
   it("selects the newly created custom provider after the form saves", async () => {
     useEndpointCatalogStore.setState(useEndpointCatalogStore.getInitialState(), true);

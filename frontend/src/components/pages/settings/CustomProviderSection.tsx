@@ -28,39 +28,46 @@ interface CustomProviderSectionProps {
 export function CustomProviderSection({ providers, selectedId, onSelect, onAdd }: CustomProviderSectionProps) {
   const { t } = useTranslation("dashboard");
   return (
-    <div className="mt-3 border-t border-hairline pt-3">
-      <div className="px-4 pb-2 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4">
-        {t("custom_providers")}
-      </div>
-      {providers.map((p) => (
+    <div>
+      <div className="mb-3 flex items-center justify-between gap-3 px-2">
+        <div className="text-[12.5px] font-semibold text-text-2">{t("custom_providers")}</div>
         <button
-          key={p.id}
           type="button"
-          onClick={() => onSelect(p.id)}
-          className={`flex w-full items-center gap-2.5 px-4 py-2.5 text-left text-sm transition-colors ${
-            selectedId === p.id
-              ? "border-l-2 border-accent bg-accent-dim text-text shadow-[inset_0_1px_0_oklch(1_0_0_/_0.05)]"
-              : "border-l-2 border-transparent text-text-3 hover:bg-bg-grad-a/40 hover:text-text"
-          }`}
+          onClick={onAdd}
+          className="inline-flex h-7 items-center gap-1.5 rounded-[7px] border border-accent/30 bg-accent-dim px-2.5 text-[11.5px] font-medium text-accent-2 transition-colors hover:border-accent/50 hover:bg-accent-dim/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         >
-          {/* 自定义 provider 恒用字母徽章，不按 display_name 猜品牌：中转站协议无关，
-              打某品牌图标会名不副实，且自由文本名匹配对中文名割裂。将来若要品牌化，
-              走用户显式选图标，而非名字猜测。 */}
-          <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded border border-hairline-soft bg-bg-grad-b/70 font-mono text-[10px] font-bold uppercase text-text-2">
-            {Array.from(p.display_name)[0] ?? "?"}
-          </span>
-          <span className="min-w-0 flex-1 truncate">{p.display_name}</span>
-          <CustomStatusDot provider={p} />
+          <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+          <span>{t("add_custom_provider")}</span>
         </button>
-      ))}
-      <button
-        type="button"
-        onClick={onAdd}
-        className="flex w-full items-center gap-2.5 px-4 py-2.5 text-left text-sm text-text-4 transition-colors hover:bg-bg-grad-a/40 hover:text-text-2"
-      >
-        <Plus className="h-4 w-4 shrink-0" aria-hidden="true" />
-        <span>{t("add_custom_provider")}</span>
-      </button>
+      </div>
+      <div className="space-y-1">
+        {providers.map((p) => {
+          const isActive = selectedId === p.id;
+          return (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() => onSelect(p.id)}
+              aria-current={isActive ? "page" : undefined}
+              aria-pressed={isActive}
+              className={`group flex w-full items-center gap-2.5 rounded-[8px] border px-3 py-2.5 text-left text-[12.5px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                isActive
+                  ? "border-accent/35 bg-accent-dim text-text shadow-[inset_0_1px_0_oklch(1_0_0_/_0.04)]"
+                  : "border-transparent text-text-3 hover:border-hairline-soft hover:bg-bg-grad-a/55 hover:text-text"
+              }`}
+            >
+              {/* 自定义 provider 恒用字母徽章，不按 display_name 猜品牌：中转站协议无关，
+                  打某品牌图标会名不副实，且自由文本名匹配对中文名割裂。将来若要品牌化，
+                  走用户显式选图标，而非名字猜测。 */}
+              <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] border border-hairline-soft bg-bg-grad-b/70 font-mono text-[10px] font-bold uppercase text-text-2">
+                {Array.from(p.display_name)[0] ?? "?"}
+              </span>
+              <span className="min-w-0 flex-1 truncate">{p.display_name}</span>
+              <CustomStatusDot provider={p} />
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }

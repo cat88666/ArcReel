@@ -119,5 +119,8 @@ docs/verification-reports/
 .impeccable/live/*.png
 # impeccable-ignore-end
 
+# Local ArcReel MCP credentials
+.arcreel/settings.json
+
 # mutmut 变异测试的工作副本（`mutmut run` 生成的整仓复制品）
 mutants/
