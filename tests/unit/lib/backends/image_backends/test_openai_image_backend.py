@@ -65,6 +65,70 @@ def _make_mock_image_response(
 
 
 class TestOpenAIImageBackend:
+    async def test_transient_image_download_failure_can_still_recover(self, tmp_path: Path):
+        from lib.backends.image_backends.openai import OpenAIImageBackend
+
+        backend = OpenAIImageBackend(api_key="test-key", base_url="https://gateway.test/v1")
+        with capture_http() as router:
+            router.post("https://gateway.test/v1/images/generations").mock(
+                return_value=httpx.Response(200, json={"data": [{"url": "https://gateway.test/image.png"}]}),
+            )
+            download = router.get("https://gateway.test/image.png").mock(
+                side_effect=[httpx.Response(503), httpx.Response(200, content=b"image")]
+            )
+            result = await backend.generate(
+                ImageGenerationRequest(prompt="A plain blue square", output_path=tmp_path / "output.png")
+            )
+            assert download.call_count == 2
+        assert result.image_path.read_bytes() == b"image"
+
+    @pytest.mark.parametrize("status", [429, 503])
+    async def test_transient_provider_failure_can_still_recover(self, tmp_path: Path, status: int):
+        from lib.backends.image_backends.openai import OpenAIImageBackend
+
+        backend = OpenAIImageBackend(api_key="test-key", base_url="https://gateway.test/v1")
+        with capture_http() as router:
+            submit = router.post("https://gateway.test/v1/images/generations").mock(
+                side_effect=[
+                    httpx.Response(status, json={"error": {"message": "temporarily unavailable"}}),
+                    httpx.Response(200, json={"data": [{"b64_json": "aW1hZ2U="}]}),
+                ]
+            )
+            result = await backend.generate(
+                ImageGenerationRequest(prompt="A plain blue square", output_path=tmp_path / "output.png")
+            )
+            assert submit.call_count == 2
+        assert result.image_path.read_bytes() == b"image"
+
+    @pytest.mark.parametrize("with_reference", [False, True])
+    async def test_provider_bad_request_is_not_reported_as_retryable(self, tmp_path: Path, with_reference: bool):
+        from lib.backends.http_status_errors import ProviderRejectedError
+        from lib.backends.image_backends.openai import OpenAIImageBackend
+        from lib.generation.generation_result import GenerationAction, problem_from_task_failure
+        from lib.generation.task_failure_encoding import encode_task_failure_message
+
+        reference = tmp_path / "reference.png"
+        reference.write_bytes(b"image")
+        # URL 含 503 也不能把明确的 400 拒绝重新判成可重试。
+        backend = OpenAIImageBackend(api_key="test-key", base_url="https://gateway503.test/v1")
+        endpoint = "edits" if with_reference else "generations"
+        with capture_http() as router:
+            submit = router.post(f"https://gateway503.test/v1/images/{endpoint}").mock(
+                return_value=httpx.Response(400, json={"error": {"message": "unsupported image edit field quality"}})
+            )
+            with pytest.raises(ProviderRejectedError) as caught:
+                await backend.generate(
+                    ImageGenerationRequest(
+                        prompt="A plain blue square",
+                        output_path=tmp_path / "output.png",
+                        reference_images=[ReferenceImage(path=str(reference))] if with_reference else [],
+                    )
+                )
+            assert submit.call_count == 1
+        problem = problem_from_task_failure(encode_task_failure_message(caught.value))
+        assert problem.action is GenerationAction.FIX_INPUT
+        assert problem.params == {"status": 400, "provider_reason": "unsupported image edit field quality"}
+
     def test_name_and_model(self):
         with captured_openai_clients():
             from lib.backends.image_backends.openai import OpenAIImageBackend
