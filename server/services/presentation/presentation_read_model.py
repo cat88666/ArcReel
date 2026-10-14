@@ -349,8 +349,7 @@ class PresentationReadModelService:
     ) -> MaterializedEpisode:
         items, id_field, kind = resolve_items(snapshot.script)
         resource_type = "reference_videos" if kind == "video_units" else "videos"
-        project_path = await asyncio.to_thread(self._project_manager.get_project_path, project_name)
-        versions = VersionManager(project_path)
+        versions = await asyncio.to_thread(lambda: VersionManager(self._project_manager.get_project_path(project_name)))
         results: list[MaterializedPresentation] = []
         for item in items:
             if not isinstance(item, dict):
@@ -719,7 +718,11 @@ class PresentationReadModelService:
             if type(episode) is not int or episode <= 0 or not isinstance(raw_script_file, str):
                 continue
             script_file = ProjectManager.normalize_script_filename(raw_script_file)
-            script = await asyncio.to_thread(self._project_manager.load_script, project_name, script_file)
+            try:
+                script = await asyncio.to_thread(self._project_manager.load_script, project_name, script_file)
+            except FileNotFoundError:
+                # 分集规划阶段已写入 script_file 但剧本尚未生成，属于正常状态，跳过该集。
+                continue
             items, id_field, kind = resolve_items(script)
             expected_type = "reference_videos" if kind == "video_units" else "videos"
             if expected_type != resource_type:

@@ -46,6 +46,7 @@ from lib.infra.logging_config import (
     setup_logging,
     warn_if_log_dir_env_set,
 )
+from lib.infra.loop_stall_probe import start_loop_stall_probe, stop_loop_stall_probe
 from lib.infra.path_safety import try_safe_join
 from lib.project.project_migrations import cleanup_stale_backups, run_project_migrations
 from lib.script.source_loader.migration import migrate_project_source_encoding
@@ -498,8 +499,14 @@ async def lifespan(app: FastAPI):
         project_event_service.publish_assistant_session_resumed
     )
 
-    async with remote_mcp_host.run():
-        yield
+    # 卡顿探针放在启动步骤之后：迁移等启动期同步工作不算线上卡顿，避免误报。
+    stall_probe = start_loop_stall_probe()
+    try:
+        async with remote_mcp_host.run():
+            yield
+    finally:
+        # 运行期异常或关停被取消时同样撤销延时转储，免得收尾阶段误写调用栈。
+        await stop_loop_stall_probe(stall_probe)
 
     # Shutdown
     assistant.assistant_service.session_manager.set_autonomous_turn_listener(None)
@@ -914,18 +921,22 @@ frontend_dist_dir = PROJECT_ROOT / "frontend" / "dist"
 
 if (frontend_dist_dir / "index.html").is_file():
 
-    @app.get("/app/{_rest:path}", include_in_schema=False)
-    async def spa_deep_link(_rest: str) -> FileResponse:
+    def _spa_deep_link_response(rest: str) -> FileResponse:
         # SPA 深链末段可能带扩展名（如 /app/projects/x/source/chapter1.txt），
         # app.frontend 的 fallback 会将其判为静态资源请求返回 404，此处显式兜底回 SPA 外壳。
         # 本路由注册在 app.frontend 之前，/app/ 下任何请求都会先到这里——若构建产物中
         # 恰好存在 dist/app/... 下的真实静态文件（URL 路径与 app.frontend 的映射规则一致，
         # 即相对 dist 根目录同路径），须优先返回该文件，避免被无条件遮蔽。
-        # _rest 是用户可控的 URL 段：越界一律降级回 SPA 外壳，不暴露 dist 之外的文件
-        candidate = try_safe_join(frontend_dist_dir / "app", _rest, require_file=True)
+        # rest 是用户可控的 URL 段：越界一律降级回 SPA 外壳，不暴露 dist 之外的文件
+        candidate = try_safe_join(frontend_dist_dir / "app", rest, require_file=True)
         if candidate is not None:
             return FileResponse(candidate)
         return FileResponse(frontend_dist_dir / "index.html")
+
+    @app.get("/app/{_rest:path}", include_in_schema=False)
+    async def spa_deep_link(_rest: str) -> FileResponse:
+        # 探测静态文件与 FileResponse 构造（首次 guess_type 会加载系统 mime 表）都触盘，整体卸到线程。
+        return await asyncio.to_thread(_spa_deep_link_response, _rest)
 
     app.frontend("/", directory=frontend_dist_dir, fallback="index.html")
 else:
