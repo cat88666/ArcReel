@@ -218,15 +218,18 @@ def _apply_draft_edits(content: dict[str, Any], edits: list[DraftFieldEdit]) -> 
     for index, edit in enumerate(edits):
         node: Any = candidate
         for position, key in enumerate(edit.path):
-            valid = (isinstance(node, dict) and isinstance(key, str) and key in node) or (
-                isinstance(node, list) and isinstance(key, int) and 0 <= key < len(node)
-            )
-            if not valid:
-                raise DraftWorkflowError("invalid_request", f"edits[{index}].path does not exist: {edit.path!r}")
-            if position == len(edit.path) - 1:
-                node[key] = copy.deepcopy(edit.value)
+            if isinstance(node, dict) and isinstance(key, str) and key in node:  # noqa: SIM114 - 保留 dict/list 键类型收窄
+                if position == len(edit.path) - 1:
+                    node[key] = copy.deepcopy(edit.value)
+                else:
+                    node = node[key]
+            elif isinstance(node, list) and isinstance(key, int) and 0 <= key < len(node):
+                if position == len(edit.path) - 1:
+                    node[key] = copy.deepcopy(edit.value)
+                else:
+                    node = node[key]
             else:
-                node = node[key]
+                raise DraftWorkflowError("invalid_request", f"edits[{index}].path does not exist: {edit.path!r}")
     return candidate
 
 

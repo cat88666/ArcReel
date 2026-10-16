@@ -64,7 +64,9 @@ class TestPromptUtils:
 
     def test_image_prompt_to_yaml_places_reference_images_between_style_and_scene(self):
         data = {"scene": "x", "composition": {"shot_type": "Medium Shot", "lighting": "", "ambiance": ""}}
-        text = image_prompt_to_yaml(data, "Anime", reference_images="图1为角色参考图，每张只取最左侧那一个人像的长相与服装。")
+        text = image_prompt_to_yaml(
+            data, "Anime", reference_images="图1为角色参考图，每张只取最左侧那一个人像的长相与服装。"
+        )
         assert list(yaml.safe_load(text)) == ["Style", "Reference_Images", "Scene", "Composition", "Avoid"]
         assert "Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装。\n" in text
 

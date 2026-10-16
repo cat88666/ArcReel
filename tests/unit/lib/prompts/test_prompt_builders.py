@@ -68,7 +68,8 @@ class TestFigureExclusion:
 class TestStoryboardImageAvoidLine:
     def test_text_form_ends_with_one_image_avoid_line(self):
         assert (
-            render_storyboard_image_prompt("林清坐在窗边木桌前") == "林清坐在窗边木桌前\n\nAvoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
+            render_storyboard_image_prompt("林清坐在窗边木桌前")
+            == "林清坐在窗边木桌前\n\nAvoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
         )
 
     def test_idempotent(self):
@@ -152,7 +153,10 @@ class TestRenderStoryboardImagePrompt:
             style="Anime",
             references=references,
         )
-        assert "Reference_Images: 图1、图2为商品参考图，画面中的商品须与之完全一致；图3为角色参考图，每张只取最左侧那一个人像的长相与服装。\n" in rendered
+        assert (
+            "Reference_Images: 图1、图2为商品参考图，画面中的商品须与之完全一致；图3为角色参考图，每张只取最左侧那一个人像的长相与服装。\n"
+            in rendered
+        )
         assert "Scene: 图3手持图1特写\n" in rendered
         assert "商品高保真还原" not in rendered
 
