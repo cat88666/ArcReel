@@ -182,7 +182,7 @@ from lib.speech.narration_config import (
     NarrationDelivery,
     validate_project_narration_config,
 )
-from lib.speech.speech_composition import SpeechProblemCode
+from lib.speech.speech_composition import SpeechAdmissionError, SpeechProblemCode
 from lib.workflow.operation_admission import admit_plan_episodes, whole_source_present
 from lib.workflow.workflow_plan import (
     EPISODE_PLANNING_NEXT_SLOT,
@@ -208,7 +208,7 @@ from server.draft_workflow import (
     PromoteDraftRequest,
 )
 from server.services.admission.prompt_preview import ItemPromptPreview, ScriptItemNotFound, preview_item_prompts
-from server.services.admission.video_batch_admission import generation_action_for
+from server.services.admission.video_batch_admission import generation_action_for, speech_admission_problems
 from server.services.project.episode_id_records import recorded_episode_ids_on
 from server.services.project.narration_settings import NarrationSettingsInput, new_project_narration_fields
 from server.services.project.workflow_planner import WorkflowPlanner
@@ -669,6 +669,9 @@ async def _run_text_generation(
         return ToolOutcome(problem=truncation_problem(exc))
     except VideoRequestFactsUnavailableError as exc:
         return ToolOutcome(problem=video_facts_problem(exc.failure, str(exc)))
+    except SpeechAdmissionError as exc:
+        problem = speech_admission_problems(exc.admission)[0]
+        return ToolOutcome(problem=ToolProblem(**problem.model_dump(mode="json")))
     except TextGenerationError as exc:
         return ToolOutcome(problem=ToolProblem("generation_refused", str(exc)))
     except Exception as exc:
@@ -1493,6 +1496,7 @@ async def patch_draft(
             accepts_formal_revision="accept_formal_revision" in patch.model_fields_set,
             source=patch.source,
             updates_source="source" in patch.model_fields_set,
+            edits=patch.edits,
         )
     )
 

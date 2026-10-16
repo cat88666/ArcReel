@@ -38,7 +38,7 @@ class TestPromptUtils:
         assert parsed["Style"] == "Anime"
         assert parsed["Scene"] == "夜雨中的街道"
         assert parsed["Composition"]["shot_type"] == "Medium Shot"
-        assert parsed["Avoid"] == "水印、多余文字、Logo"
+        assert parsed["Avoid"] == "分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
 
     def test_long_values_with_ascii_spaces_stay_on_one_line(self):
         scene = "A rain-soaked neon street at night, " * 6 + "a lone figure walks under a red umbrella."
@@ -64,9 +64,9 @@ class TestPromptUtils:
 
     def test_image_prompt_to_yaml_places_reference_images_between_style_and_scene(self):
         data = {"scene": "x", "composition": {"shot_type": "Medium Shot", "lighting": "", "ambiance": ""}}
-        text = image_prompt_to_yaml(data, "Anime", reference_images="图1为角色参考图。")
+        text = image_prompt_to_yaml(data, "Anime", reference_images="图1为角色参考图，每张只取最左侧那一个人像的长相与服装。")
         assert list(yaml.safe_load(text)) == ["Style", "Reference_Images", "Scene", "Composition", "Avoid"]
-        assert "Reference_Images: 图1为角色参考图。\n" in text
+        assert "Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装。\n" in text
 
     def test_video_prompt_to_yaml_includes_dialogue_conditionally(self):
         with_dialogue = {

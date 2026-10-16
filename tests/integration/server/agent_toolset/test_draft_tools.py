@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from lib.project.project_activity import ACTIVITY_FILENAME, recorded_project_activity
 from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
@@ -28,7 +29,7 @@ from lib.script.draft_quarantine import (
     quarantine_path,
     write_quarantine,
 )
-from server.draft_workflow import DraftContext, DraftWorkflow, DraftWorkflowError
+from server.draft_workflow import DraftContext, DraftWorkflow, DraftWorkflowError, PatchDraftRequest
 from server.tool_runtime import ToolOutcome
 from tests.integration.server.agent_tool_support import (
     _RV_NOVEL,
@@ -639,6 +640,97 @@ async def test_discard_draft_moves_project_activity_forward(fake_ctx: ToolHarnes
     recorded = recorded_project_activity(fake_ctx.project_path)
     assert recorded is not None
     assert recorded > stale
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"content": None},
+        {"edits": None},
+        {"edits": []},
+        {"content": {}, "edits": [{"path": ["title"], "value": "x"}]},
+        {"edits": [{"path": [], "value": "x"}]},
+        {"edits": [{"path": ["units", -1], "value": "x"}]},
+        {"edits": [{"path": ["units", True], "value": "x"}]},
+    ],
+)
+def test_patch_draft_rejects_ambiguous_or_invalid_edit_requests(payload: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        PatchDraftRequest.model_validate(
+            {"episode_id": 1, "doc_type": "reference_script_plan", "base_revision": "r", **payload}
+        )
+
+
+async def test_patch_draft_field_edits_preserve_other_content_and_revision_guard(fake_ctx: ToolHarness) -> None:
+    rv_source(fake_ctx)
+    write_rv_script_plan(fake_ctx, [rv_saved_unit("@[张三] 起身")])
+    opened = draft_of(await open_for_edit(fake_ctx, source="source/episode_1.txt"))
+    original = copy.deepcopy(opened["content"])
+    args = {
+        "episode_id": 1,
+        "doc_type": "reference_script_plan",
+        "base_revision": opened["revision"],
+        "edits": [{"path": ["units", 0, "text"], "value": "@[张三] 走向 @[村口]"}],
+    }
+    patched = draft_of(await run_declared_tool("patch_draft", fake_ctx, args))
+    original["units"][0]["text"] = "@[张三] 走向 @[村口]"
+    assert patched["content"] == original
+    assert patched["revision"] != opened["revision"]
+    before = rv_quarantine_path(fake_ctx).read_bytes()
+    stale = await run_declared_tool("patch_draft", fake_ctx, args)
+    assert problem_of(stale).code == "revision_conflict"
+    assert rv_quarantine_path(fake_ctx).read_bytes() == before
+
+
+@pytest.mark.parametrize("path", [["missing"], ["units", 99, "text"], ["units", "0", "text"], ["units", 0, "text", 0]])
+async def test_patch_draft_invalid_edit_rejects_the_whole_batch(fake_ctx: ToolHarness, path: list) -> None:
+    rv_source(fake_ctx)
+    write_rv_script_plan(fake_ctx, [rv_saved_unit("@[张三] 起身")])
+    opened = draft_of(await open_for_edit(fake_ctx))
+    before = rv_quarantine_path(fake_ctx).read_bytes()
+    patched = await run_declared_tool(
+        "patch_draft",
+        fake_ctx,
+        {
+            "episode_id": 1,
+            "doc_type": "reference_script_plan",
+            "base_revision": opened["revision"],
+            "edits": [
+                {"path": ["units", 0, "text"], "value": "@[张三] 走向 @[村口]"},
+                {"path": path, "value": "invalid"},
+            ],
+        },
+    )
+    assert problem_of(patched).code == "invalid_request"
+    assert rv_quarantine_path(fake_ctx).read_bytes() == before
+
+
+async def test_patch_draft_field_edits_still_require_promotion_validation(fake_ctx: ToolHarness) -> None:
+    rv_source(fake_ctx)
+    write_rv_script_plan(fake_ctx, [rv_saved_unit("@[张三] 起身")])
+    opened = draft_of(await open_for_edit(fake_ctx))
+    formal_before = rv_script_plan_path(fake_ctx).read_bytes()
+    patched = draft_of(
+        await run_declared_tool(
+            "patch_draft",
+            fake_ctx,
+            {
+                "episode_id": 1,
+                "doc_type": "reference_script_plan",
+                "base_revision": opened["revision"],
+                "edits": [{"path": ["units", 0, "duration_seconds"], "value": -1}],
+            },
+        )
+    )
+    promoted = await run_declared_tool(
+        "promote_draft",
+        fake_ctx,
+        {"episode_id": 1, "doc_type": "reference_script_plan", "base_revision": patched["revision"]},
+    )
+    assert promoted.problem is not None
+    assert rv_script_plan_path(fake_ctx).read_bytes() == formal_before
+    assert rv_quarantine_path(fake_ctx).exists()
 
 
 async def test_patch_draft_supports_multiple_rounds_and_rejects_stale_revision(fake_ctx: ToolHarness) -> None:

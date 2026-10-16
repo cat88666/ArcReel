@@ -162,7 +162,7 @@ class TestBuildGridPrompt:
         prompt = build_grid_prompt(
             scenes=scenes, id_field="scene_id", rows=2, cols=2, style="x", style_description="", references=references
         )
-        assert prompt.startswith("Reference_Images: 图1为角色参考图；图2为场景参考图。\n\n你是一位专业的分镜画师。")
+        assert prompt.startswith("Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装；图2为场景参考图。\n\n你是一位专业的分镜画师。")
         assert "图1在s1" in prompt
         assert "图1与路人对视" in prompt
         assert "@[" not in prompt

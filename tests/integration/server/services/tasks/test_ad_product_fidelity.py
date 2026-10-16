@@ -46,7 +46,7 @@ class TestAdProductFidelityStoryboard:
         prompt = generator.image_calls[0]["prompt"]
         assert prompt.startswith(
             "Style: Anime\nVisual style: cinematic\n"
-            "Reference_Images: 图1、图2为商品参考图，画面中的商品须与之完全一致；图3为角色参考图；图4为场景参考图。\n"
+            "Reference_Images: 图1、图2为商品参考图，画面中的商品须与之完全一致；图3为角色参考图，每张只取最左侧那一个人像的长相与服装；图4为场景参考图。\n"
         )
         assert "\n\n商品特写\n\n" in prompt
         assert "保温杯" not in prompt
@@ -89,7 +89,7 @@ class TestAdProductFidelityStoryboard:
 
         prompt = generator.image_calls[0]["prompt"]
         assert (
-            "Reference_Images: 图1为商品参考图，画面中的商品须与之完全一致；图2为角色参考图；图3为场景参考图。\n"
+            "Reference_Images: 图1为商品参考图，画面中的商品须与之完全一致；图2为角色参考图，每张只取最左侧那一个人像的长相与服装；图3为场景参考图。\n"
             in prompt
         )
         assert len(generator.image_calls[0]["reference_images"]) == 3
@@ -111,7 +111,7 @@ class TestAdProductFidelityStoryboard:
         assert generator.image_reference_bytes[0] == [b"png", b"png"]
         prompt = generator.image_calls[0]["prompt"]
         assert prompt.startswith(
-            "Style: Anime\nVisual style: cinematic\nReference_Images: 图1为角色参考图；图2为场景参考图。\n"
+            "Style: Anime\nVisual style: cinematic\nReference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装；图2为场景参考图。\n"
         )
         assert "\n\n氛围开场\n\n" in prompt
         assert "商品参考图" not in prompt

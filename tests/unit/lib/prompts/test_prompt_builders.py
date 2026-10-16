@@ -68,7 +68,7 @@ class TestFigureExclusion:
 class TestStoryboardImageAvoidLine:
     def test_text_form_ends_with_one_image_avoid_line(self):
         assert (
-            render_storyboard_image_prompt("林清坐在窗边木桌前") == "林清坐在窗边木桌前\n\nAvoid: 水印、多余文字、Logo"
+            render_storyboard_image_prompt("林清坐在窗边木桌前") == "林清坐在窗边木桌前\n\nAvoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
         )
 
     def test_idempotent(self):
@@ -125,13 +125,13 @@ class TestRenderStoryboardImagePrompt:
         rendered = render_storyboard_image_prompt(_STRUCTURED, style="电影感写实，冷色调", references=references)
         assert rendered == (
             "Style: 电影感写实，冷色调\n"
-            "Reference_Images: 图1、图2为角色参考图；图3为场景参考图；图4为上一分镜图，只参考构图与色调。\n"
+            "Reference_Images: 图1、图2为角色参考图，每张只取最左侧那一个人像的长相与服装；图3为场景参考图；图4为上一分镜图，只参考构图与色调。\n"
             "Scene: 图1坐在窗边木桌前，目光落在信纸上；图2立在门口的阴影里。桌面摊着一只褪色的怀表，图3的木格窗棂外雨丝密集。\n"
             "Composition:\n"
             "  shot_type: Medium Shot\n"
             "  lighting: 右侧落地窗逆光，蓝灰色调\n"
             "  ambiance: 雨天，室内昏暗\n"
-            "Avoid: 水印、多余文字、Logo"
+            "Avoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
         )
 
     def test_product_images_lead_the_numbering_and_replace_the_fidelity_tail(self):
@@ -152,13 +152,13 @@ class TestRenderStoryboardImagePrompt:
             style="Anime",
             references=references,
         )
-        assert "Reference_Images: 图1、图2为商品参考图，画面中的商品须与之完全一致；图3为角色参考图。\n" in rendered
+        assert "Reference_Images: 图1、图2为商品参考图，画面中的商品须与之完全一致；图3为角色参考图，每张只取最左侧那一个人像的长相与服装。\n" in rendered
         assert "Scene: 图3手持图1特写\n" in rendered
         assert "商品高保真还原" not in rendered
 
     def test_mentions_without_a_reference_image_render_as_bare_names(self):
         rendered = render_storyboard_image_prompt(_STRUCTURED, style="Anime", references=[_sheet("character", "林清")])
-        assert "Reference_Images: 图1为角色参考图。\n" in rendered
+        assert "Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装。\n" in rendered
         assert (
             "Scene: 图1坐在窗边木桌前，目光落在信纸上；沈茹/黑化立在门口的阴影里。桌面摊着一只褪色的怀表，林家老宅·书房的"
             in rendered
@@ -177,9 +177,9 @@ class TestRenderStoryboardImagePrompt:
         assert rendered == (
             "Style: Anime\n"
             "Visual style: cinematic\n"
-            "Reference_Images: 图1为角色参考图；图2为上一分镜图，只参考构图与色调。\n\n"
+            "Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装；图2为上一分镜图，只参考构图与色调。\n\n"
             "图1坐在窗边木桌前\n\n"
-            "Avoid: 水印、多余文字、Logo"
+            "Avoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
         )
 
     def test_rendering_a_rendered_text_again_is_idempotent(self):
@@ -210,11 +210,11 @@ class TestTextFormRerenderAfterStyleFieldsChange:
         lines = again.split("\n")
         assert lines.count("Style: 水墨") == 1
         assert lines.count("Visual style: 留白写意") == 1
-        assert lines.count("Avoid: 水印、多余文字、Logo") == 1
+        assert lines.count("Avoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo") == 1
         assert render_storyboard_image_prompt(again, **then) == again
 
     def test_legacy_text_with_description_first_is_not_stacked(self):
-        legacy = "Visual style: 留白写意\n\nStyle: 水墨\n\n林清坐在窗边木桌前\n\nAvoid: 水印、多余文字、Logo"
+        legacy = "Visual style: 留白写意\n\nStyle: 水墨\n\n林清坐在窗边木桌前\n\nAvoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
         rendered = render_storyboard_image_prompt(legacy, style="水墨", style_description="留白写意")
         assert rendered == legacy
 

@@ -103,7 +103,7 @@ from lib.script.script_models import (
     build_reference_units_script_plan_model,
 )
 from lib.script.storyboard_mentions import render_storyboard_mention_warnings, storyboard_mention_warnings
-from lib.speech.speech_composition import admit_script_unit
+from lib.speech.speech_composition import SpeechAdmissionError, admit_script_unit
 from lib.speech.speech_rate import project_speech_rate_override
 from lib.workflow.operation_admission import (
     AdmissionReason,
@@ -815,6 +815,8 @@ async def confirm_script_review(
             ) from exc
         if exc.problem is not None:
             raise VideoRequestFactsUnavailableError(exc.problem) from exc
+        if exc.admission is not None:
+            raise SpeechAdmissionError(exc.admission) from exc
         raise TextGenerationError(f"❌ 无法完成 script_plan 内容确认（{exc.code}）：{exc.message or exc.code}") from exc
     return TextGenerationResult(
         f"✅ {await _describe(projects, project_name, episode)} 的 script_plan 已确认并整份转为正式脚本，全部分镜待编写，"
@@ -1378,7 +1380,14 @@ def _drama_script_plan_result_text(script_plan_path: Path, scenes: list[dict], *
     """drama script_plan 的落盘回执。``action`` 是「生成」/「晋升」——两条路的统计段同一出口，
     只在动作词上分叉，Agent 因此按同一种格式读产出与晋升两次结果。
     """
-    return f"✅ 规范化剧本{action}（结构化内容）已保存: {script_plan_path}\n📊 生成统计: {len(scenes)} 个分镜"
+    text = f"✅ 规范化剧本{action}（结构化内容）已保存: {script_plan_path}\n📊 生成统计: {len(scenes)} 个分镜"
+    needs_replan = [str(scene["scene_id"]) for scene in scenes if scene.get("needs_replan") is True]
+    if needs_replan:
+        text += (
+            f"\n⚠️ 发声内容待重新规划：{', '.join(needs_replan)}；当前不能确认。"
+            "请先用 open_draft 打开 script_plan，经 patch_draft 修复、promote_draft 晋升后，再确认。"
+        )
+    return text
 
 
 def _narration_script_plan_result_text(script_plan_path: Path, segments: list[dict], *, action: str) -> str:

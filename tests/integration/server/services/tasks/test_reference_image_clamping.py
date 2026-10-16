@@ -36,10 +36,10 @@ FAKE_BACKEND_MODEL = "gpt-image-2"
 CLAMPED_PROMPT = (
     "Style: Anime\n"
     "Visual style: cinematic\n"
-    "Reference_Images: 图1、图2、图3、图4、图5、图6为角色参考图；图7为场景参考图。\n"
+    "Reference_Images: 图1、图2、图3、图4、图5、图6为角色参考图，每张只取最左侧那一个人像的长相与服装；图7为场景参考图。\n"
     "Scene: 图1握着玉佩立在图7门口\n"
     "Composition:\n  shot_type: Medium Shot\n  lighting: 暖光\n  ambiance: 薄雾\n"
-    "Avoid: 水印、多余文字、Logo"
+    "Avoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
 )
 
 
@@ -287,7 +287,7 @@ class TestGrokLaneClampsToFive:
 
         sent = grok_lane.image.sample.call_args.kwargs
         assert len(sent["image_urls"]) == 5
-        assert "图1、图2、图3、图4、图5为角色参考图" in sent["prompt"]
+        assert "图1、图2、图3、图4、图5为角色参考图，每张只取最左侧那一个人像的长相与服装" in sent["prompt"]
         assert "图6" not in sent["prompt"]
         assert result["warnings"] == [
             {"key": "ref_too_many_images", "params": {"count": 8, "model": "grok-imagine-image", "max_count": 5}}

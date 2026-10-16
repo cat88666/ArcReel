@@ -170,7 +170,7 @@ class TestPreviewMatchesExecution:
         assert text is not None
         assert preview.storyboard_image.is_text_form
         assert text.startswith("Style: Anime\nVisual style: cinematic\nReference_Images: 图1")
-        assert f"\n\n{body}\n\nAvoid: 水印、多余文字、Logo" in text
+        assert f"\n\n{body}\n\nAvoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo" in text
         assert text == generator.image_calls[0]["prompt"]
 
     async def test_reference_numbering_covers_the_previous_storyboard_and_mentions(self, tmp_path, monkeypatch):
@@ -193,7 +193,7 @@ class TestPreviewMatchesExecution:
         text = preview.storyboard_image.text
         assert text is not None
         assert (
-            "Reference_Images: 图1为角色参考图；图2为场景参考图；图3为道具参考图；图4为上一分镜图，只参考构图与色调。\n"
+            "Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装；图2为场景参考图；图3为道具参考图；图4为上一分镜图，只参考构图与色调。\n"
             "Scene: 图1站在图2门口，手里握着图3，身后是无名路人\n"
         ) in text
         assert text == generator.image_calls[0]["prompt"]

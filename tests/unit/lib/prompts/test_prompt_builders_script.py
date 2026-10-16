@@ -227,7 +227,7 @@ class TestPromptBuildersScript:
 
 
 class TestScreenplaySourceKind:
-    """source_kind 分支在 script_plan（normalize）：novel 改编 + 画外音语境放开、screenplay 提取 + 逐字保留。
+    """source_kind 分支在 script_plan（normalize）：novel 改编 + 必要画外音、screenplay 提取 + 逐字保留。
 
     prompt_authoring（drama）视觉层不按 source_kind 分支——口播抽取归 script_plan，故 build_drama_prompt 无 source_kind 入参。
     只断言语义关键词在场 / 缺席，不锁逐字措辞、不测 LLM 提取质量。
@@ -264,10 +264,11 @@ class TestScreenplaySourceKind:
         assert "source_text" in prompt
 
     def test_normalize_novel_releases_voiceover_by_context(self):
-        # novel 源画外音克制放开——由语境判断产出，不一律禁用、不预设规则白名单、不作兜底
+        # novel 只为画面无法交代的必要信息选用原文画外音，不默认朗读叙述。
         prompt = self._normalize_prompt("novel")
         assert "画外音" in prompt
-        assert "语境" in prompt
+        assert "只有对理解不可缺、画面无法清楚交代的信息才选为画外音" in prompt
+        assert "不得默认把叙述、心理和菜名清单全部转成旁白" in prompt
         # 旧的「不产出 voiceover」禁令必须移除
         assert "不产出 voiceover" not in prompt
 
@@ -447,8 +448,9 @@ class TestScreenplaySourceKind:
             assert plain == self._normalize_prompt(source_kind, instructions="")
 
     def test_normalize_injects_pacing(self):
-        # script_plan 无条件提供开篇节奏建议。
-        assert "开篇~4秒承担钩子职能" in self._squash(self._normalize_prompt("novel"))
+        # 小说按原文因果安排节奏；成品剧本仍保留短剧体裁建议。
+        assert "不强制4秒危机、15秒转折" in self._squash(self._normalize_prompt("novel"))
+        assert "开篇~4秒承担钩子职能" in self._squash(self._normalize_prompt("screenplay"))
 
 
 class TestOverviewPrompt:
@@ -596,7 +598,7 @@ class TestDramaDurationSpeechLowerBound:
 
 
 class TestPromptAuthoringPromptGuards:
-    """prompt_authoring（视觉层）prompt 骨架守卫：节奏建议始终注入、schema 枚举不重复列举、
+    """prompt_authoring（视觉层）prompt 骨架守卫：视觉节奏服从定稿分镜、schema 枚举不重复列举、
     无字数硬限制、episode 约束在场且 scene_id 对齐要求不施加固定格式。"""
 
     @staticmethod
@@ -630,7 +632,8 @@ class TestPromptAuthoringPromptGuards:
 
     def test_drama_prompt_injects_pacing(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ARCREEL_PROFILE_DIR", str(tmp_path / "missing-profile"))
-        assert "开篇~4秒承担钩子职能" in self._squash(self._drama_prompt())
+        assert "视觉节奏服从下方已经定稿的分镜内容" in self._squash(self._drama_prompt())
+        assert "不因固定秒数要求改变人物动作与选择" in self._squash(self._drama_prompt())
 
     @pytest.mark.parametrize("instructions", [None, "", "末镜保留雨声。"])
     def test_narration_instructions_are_an_optional_section(self, instructions):

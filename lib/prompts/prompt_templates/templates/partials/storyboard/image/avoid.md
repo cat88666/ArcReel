@@ -1,1 +1,1 @@
-Avoid: {{ partial("shared/image_avoid") }}
+Avoid: 分屏、拼图、同一人物出现多次、{{ partial("shared/image_avoid") }}
