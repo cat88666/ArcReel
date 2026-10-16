@@ -140,6 +140,9 @@ class PromptTemplates:
         if not directory.is_dir():
             raise TemplateError(f"模版目录不存在: {directory}")
         for path in sorted(directory.rglob("*.md")):
+            # AppleDouble sidecars contain filesystem metadata, not templates.
+            if path.name.startswith("._"):
+                continue
             try:
                 self._load(path, directory)
             except (JinjaError, ValidationError, yaml.YAMLError) as exc:

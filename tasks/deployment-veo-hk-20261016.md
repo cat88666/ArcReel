@@ -1,5 +1,12 @@
 # ArcReel 服务器部署记录（2026-10-16）
 
+## 后续发布的 AppleDouble 故障与修复边界
+
+- 后续发布 `20261016-bc55b115` 的模板扫描遇到 `._*.md`，UTF-8 解码在字节 `0xa3` 失败；远端已确认文件头 `00051607`，属于 AppleDouble 元数据。主代理将该单个文件移到 release 内 `metadata-quarantine` 后，服务恢复 active。以下早先发布记录保留，不代表该后续版本的状态。
+- 本地 `lib/prompts/prompt_templates/engine.py` 仅在模板扫描时忽略文件名以 `._` 开头的 sidecar；普通模板仍严格按 UTF-8 解码，不能用忽略编码错误掩盖真实内容损坏。此代码修复尚未部署到并发发布目录。
+- macOS 打包时设置 `COPYFILE_DISABLE=1`，并显式排除已有 `._*` 与 `__MACOSX`；例如 BSD tar 使用 `COPYFILE_DISABLE=1 tar --no-mac-metadata --exclude='._*' --exclude='__MACOSX' -czf <归档> <发布文件>`。环境变量防止生成新元数据，排除规则处理磁盘已有 sidecar，两者不能相互替代。
+- 上传前检查归档成员，解包后检查模板目录的额外文件；只比对 Git 跟踪文件哈希不能发现多出来的元数据。切换服务前仍需以运行账户加载模板并完成启动检查，服务 active 不等于完整媒体制作验收。
+
 ## 发布结果
 
 - 目标：`ai-hk`（上次记录中的 veo-hk，`43.154.247.11`）。`arcreel.service` 于北京时间 18:43:19 启动，`/opt/arcreel/current` 指向 `/opt/arcreel/releases/20261016-1367bf6b`。
