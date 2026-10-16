@@ -150,6 +150,8 @@ flowchart TD
 
 这类操作不应反复交给语言模型自由生成。
 
+草稿修改通过 `open_draft`、`patch_draft`、`promote_draft` 完成。`patch_draft` 接受完整 `content` 或局部 `edits`，两者必须且只能提供一个。局部修改示例：`{"edits":[{"path":["scenes",3,"utterances"],"value":[]}]}`，其中 `path` 的字符串表示对象键，整数表示从 0 开始的数组索引，仅可替换已存在的字段或元素。服务端持锁核对 `base_revision` 后按顺序应用整批修改；修订冲突、路径不存在或索引越界时不写入。修改只保存草稿，`promote_draft` 仍执行全量校验，通过后才更新正式文档。
+
 ## 6. 应用服务层 {#service-layer}
 
 应用服务协调：
