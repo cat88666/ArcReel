@@ -61,7 +61,7 @@ async def test_generated_storyboard_with_derivative_product_and_previous_is_curr
     )
 
     sent = [reference["image"].name for reference in generator.image_calls[0]["reference_images"]]
-    assert sent == ["0000-保温杯.png", "0001-保温杯_1.jpg", "0002-劲装.png", "0003-祠堂.png", "0004-scene_E1S01.png"]
+    assert sent == ["0000-保温杯.png", "0001-保温杯_1.jpg", "0002-劲装.png", "0003-祠堂.png"]
     resolver = active_artifact_currency_resolver(project_path, pm.load_project("demo"))
     comparison = resolver.compare(
         ArtifactKey.episode_storyboard(1, ITEM_ID), artifact_path=f"storyboards/scene_{ITEM_ID}.png"

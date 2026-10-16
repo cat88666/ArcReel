@@ -392,12 +392,6 @@ class TestGenerationTasks:
                     logical_id="Alice",
                     kind="sheet",
                 ),
-                VisualReference(
-                    path=previous_path,
-                    role="previous_storyboard",
-                    logical_type="storyboard",
-                    logical_id="E1S01",
-                ),
             ),
         )
         captured_basis: list[ArtifactBasis] = []
@@ -435,7 +429,8 @@ class TestGenerationTasks:
             {"script_file": "episode_1.json", "prompt": "direct prompt"},
         )
 
-        assert fake_generator.reference_bytes == [b"selected-character", b"selected-previous"]
+        # 上一分镜图虽已生成且可用，也不随请求发出。
+        assert fake_generator.reference_bytes == [b"selected-character"]
         assert captured_basis == [expected_basis]
 
     async def test_formal_image_commit_requires_the_exact_selected_version_record(self, tmp_path, monkeypatch):

@@ -56,7 +56,7 @@ from lib.prompts.prompt_builders import (
     build_scene_prompt,
     render_storyboard_image_prompt,
 )
-from lib.prompts.reference_image_numbering import PREVIOUS_STORYBOARD_ROLE, clamp_reference_images
+from lib.prompts.reference_image_numbering import clamp_reference_images
 from lib.references.reference_admission import SHEET_MISSING_CODE, UNREGISTERED_REFERENCE_CODE
 from lib.references.reference_catalog import ReferenceCatalog, build_reference_catalog
 from lib.script.storyboard_sequence import find_storyboard_item, get_storyboard_items
@@ -339,12 +339,12 @@ def storyboard_image_input(
     """按项目现状为一张分镜图备齐生成输入。
 
     装配序：商品（每件先资产图、再原图；没有资产图的商品只用原图）→ 角色、场景、道具资产图
-    （按字段序）→ 上一分镜图（序号大于 0 且不是 ``segment_break`` 时），整条按路径去重、保留
-    首次出现。
+    （按字段序），整条按路径去重、保留首次出现。不带上一分镜图：多参考图编辑模型会把整张上一分镜
+    当作底图照抄（人物姿态、构图乃至上一张画错的分身一并沿袭），「只参考构图与色调」的声明压不住；
+    镜间一致由同一组资产图保证。
 
     缺口：引用未登记；角色、场景、道具没有资产图或资产图不可用；商品声明了资产图但不可用；
-    声明了原图但读不到；提示词待生成。略去：上一分镜图不可用。商品既没有资产图也没有原图时
-    只用文字，不算缺口。
+    声明了原图但读不到；提示词待生成。商品既没有资产图也没有原图时只用文字，不算缺口。
 
     条目不存在或字段结构损坏抛 ``ValueError``。
     """
@@ -353,7 +353,7 @@ def storyboard_image_input(
     resolved = find_storyboard_item(items, id_field, resource_id)
     if resolved is None:
         raise ValueError(f"scene/segment not found: {resource_id}")
-    item, index = resolved
+    item, _index = resolved
 
     style = project.get("style", "")
     style_description = project.get("style_description", "")
@@ -372,9 +372,6 @@ def storyboard_image_input(
     for asset_type, field in (("character", char_field), ("scene", scene_field), ("prop", prop_field)):
         for name in _reference_names(item, field):
             assembly.add_sheet(catalog, asset_type, name)
-
-    if index > 0 and not item.get("segment_break"):
-        assembly.add_previous_storyboard(items[index - 1], id_field=id_field, episode=episode)
 
     return StoryboardImageInput(
         semantics=StoryboardImageSemantics(
@@ -678,32 +675,6 @@ class _Assembly:
                     logical_type=spec.asset_type,
                     logical_id=owner,
                     kind=DERIVATIVE_SOURCE_KIND,
-                ),
-                artifact_path=observed.artifact_path,
-                claim=claim,
-            )
-        )
-
-    def add_previous_storyboard(self, previous_item: object, *, id_field: str, episode: int) -> None:
-        """上一分镜图是系统推导的可选输入：不可用只是略去，不产生缺口。"""
-
-        if not isinstance(previous_item, Mapping):
-            return
-        previous_id = str(previous_item.get(id_field) or "").strip()
-        assets = previous_item.get("generated_assets")
-        if not previous_id or not isinstance(assets, Mapping):
-            return
-        declared = _declared_path(assets, "storyboard_image")
-        if declared is None:
-            return
-        available = self._available(ArtifactKey.episode_storyboard(episode, previous_id), declared)
-        if available is None:
-            return
-        observed, claim = available
-        self._append(
-            AssembledReference(
-                visual=_visual(
-                    observed, role=PREVIOUS_STORYBOARD_ROLE, logical_type="storyboard", logical_id=previous_id
                 ),
                 artifact_path=observed.artifact_path,
                 claim=claim,

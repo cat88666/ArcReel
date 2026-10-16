@@ -56,14 +56,13 @@ class TestGenerationTasks:
         storyboard_refs = fake_generator.image_calls[0]["reference_images"]
         # 参考图只按数组序位传输、不带任何标签；身份由 prompt 内的 Reference_Images 声明行按「图N」指认。
         # provider 收到的是任务私有快照。
-        assert [sorted(ref) for ref in storyboard_refs] == [["image"]] * 4
+        assert [sorted(ref) for ref in storyboard_refs] == [["image"]] * 3
         assert all(not ref["image"].is_relative_to(project_path) for ref in storyboard_refs)
-        assert fake_generator.image_reference_bytes[0] == [b"png"] * 4
+        assert fake_generator.image_reference_bytes[0] == [b"png"] * 3
         assert fake_generator.image_calls[0]["prompt"] == (
             "Style: Anime\n"
             "Visual style: cinematic\n"
-            "Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装；图2为场景参考图；图3为道具参考图；"
-            "图4为上一分镜图，只参考构图与色调。\n"
+            "Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装；图2为场景参考图；图3为道具参考图。\n"
             "Scene: 在雨夜街道\n"
             "Composition:\n  shot_type: Medium Shot\n  lighting: 暖光\n  ambiance: 薄雾\n"
             "Avoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo"

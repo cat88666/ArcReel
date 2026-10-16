@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 #: 类型声明行的 YAML 键，插在 ``Style`` 与 ``Scene`` 之间。
 REFERENCE_IMAGES_KEY = "Reference_Images"
 
-#: 上一分镜图在参考图证据里的角色名。
+#: 上一分镜图在参考图证据里的角色名。分镜图装配已不再带上一分镜图（见 ``storyboard_image_input``），
+#: 保留它只为按原样渲染存量冻结输入。
 PREVIOUS_STORYBOARD_ROLE = "previous_storyboard"
 
 #: 上一分镜图的约束句，随类型声明行发给模型。

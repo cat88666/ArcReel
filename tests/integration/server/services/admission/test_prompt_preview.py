@@ -173,8 +173,8 @@ class TestPreviewMatchesExecution:
         assert f"\n\n{body}\n\nAvoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo" in text
         assert text == generator.image_calls[0]["prompt"]
 
-    async def test_reference_numbering_covers_the_previous_storyboard_and_mentions(self, tmp_path, monkeypatch):
-        """预览与执行读同一份参考图装配：上一分镜图占最后一个序位，正文里的 @[登记名] 换成对应的图N。"""
+    async def test_reference_numbering_skips_the_previous_storyboard_and_covers_mentions(self, tmp_path, monkeypatch):
+        """预览与执行读同一份参考图装配：上一分镜图不入列，正文里的 @[登记名] 换成对应的图N。"""
         project_path = prepare_files(tmp_path)
         pm = _pm_for("narration", project_path)
         seed_current_storyboard(pm, "E1S01")
@@ -193,7 +193,7 @@ class TestPreviewMatchesExecution:
         text = preview.storyboard_image.text
         assert text is not None
         assert (
-            "Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装；图2为场景参考图；图3为道具参考图；图4为上一分镜图，只参考构图与色调。\n"
+            "Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装；图2为场景参考图；图3为道具参考图。\n"
             "Scene: 图1站在图2门口，手里握着图3，身后是无名路人\n"
         ) in text
         assert text == generator.image_calls[0]["prompt"]

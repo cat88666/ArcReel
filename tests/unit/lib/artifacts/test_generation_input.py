@@ -190,7 +190,7 @@ class TestAssemblyOrder:
         assert _admitted(fixture).expected_basis() == basis
         assert _grid(fixture, [TARGET]) == grid
 
-    def test_products_then_sheets_by_field_then_previous_storyboard(self, tmp_path):
+    def test_products_then_sheets_by_field(self, tmp_path):
         fixture = _Fixture(tmp_path)
         fixture.target()["products_in_shot"] = ["保温杯", "杯刷", "杯垫"]
 
@@ -203,7 +203,6 @@ class TestAssemblyOrder:
             ("asset_sheet", "character", "张三/劲装", "sheet"),
             ("asset_sheet", "scene", "祠堂", "sheet"),
             ("asset_sheet", "prop", "玉佩", "sheet"),
-            ("previous_storyboard", "storyboard", "E1S01", None),
         ]
 
     def test_a_derivative_reference_resolves_to_its_own_sheet_and_manifest_key(self, tmp_path):
@@ -245,34 +244,11 @@ class TestAssemblyOrder:
             ("张三", "characters/张三.png"),
             ("祠堂", "scenes/祠堂.png"),
             ("玉佩", "props/玉佩.png"),
-            ("E1S01", "storyboards/scene_E1S01.png"),
         ]
 
-    @pytest.mark.parametrize(
-        ("resource_id", "mutate"),
-        [
-            pytest.param("E1S01", lambda fixture: None, id="first-shot"),
-            pytest.param("E1S03", lambda fixture: None, id="segment-break"),
-            pytest.param(
-                TARGET,
-                lambda fixture: fixture.registered.pop(ArtifactKey.episode_storyboard(1, "E1S01")),
-                id="previous-unregistered",
-            ),
-            pytest.param(
-                TARGET, lambda fixture: fixture.remove_file("storyboards/scene_E1S01.png"), id="previous-file-missing"
-            ),
-            pytest.param(
-                TARGET,
-                lambda fixture: fixture.script["shots"][0].update(generated_assets={}),
-                id="previous-never-generated",
-            ),
-        ],
-    )
-    def test_an_unavailable_previous_storyboard_is_omitted_without_a_gap(self, tmp_path, resource_id, mutate):
-        fixture = _Fixture(tmp_path)
-        mutate(fixture)
-
-        generation_input = _admitted(fixture, resource_id)
+    def test_the_previous_storyboard_is_never_a_reference(self, tmp_path):
+        # 多参考图编辑模型会照抄整张上一分镜；即使上一分镜可用且不是 segment_break，也不带它。
+        generation_input = _admitted(_Fixture(tmp_path))
 
         assert all(ref.visual.role != "previous_storyboard" for ref in generation_input.references)
 
@@ -471,7 +447,7 @@ class TestFreeze:
             assert frozen.basis == expected
             assert len(frozen.references.visual_references) == 2
             assert frozen.warnings == (
-                {"key": "ref_too_many_images", "params": {"count": 6, "model": "m", "max_count": 2}},
+                {"key": "ref_too_many_images", "params": {"count": 5, "model": "m", "max_count": 2}},
             )
             assert "图1、图2为商品参考图" in frozen.prompt
             assert "图3" not in frozen.prompt
