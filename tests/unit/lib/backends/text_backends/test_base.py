@@ -49,7 +49,7 @@ class TestTextTaskTiers:
 
     def test_tier_assignments(self):
         assert TEXT_TASK_TIERS[TextTaskType.SCRIPT] is TextTaskTier.COMPLEX
-        assert TEXT_TASK_TIERS[TextTaskType.OVERVIEW] is TextTaskTier.SIMPLE
+        assert TEXT_TASK_TIERS[TextTaskType.OVERVIEW] is TextTaskTier.COMPLEX
         assert TEXT_TASK_TIERS[TextTaskType.STYLE_ANALYSIS] is TextTaskTier.SIMPLE
 
     def test_vision_required_tasks_are_valid_members(self):

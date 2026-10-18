@@ -20,10 +20,13 @@ export interface WizardBasicsValue {
   gridStoryboard: boolean;
 }
 
-/** 选择卡的呈现顺序：剧情演绎在前。 */
+/**
+ * 选择卡的呈现顺序：剧情演绎在前。
+ * 暂只支持角色对白：「旁白/解说」（mode "narration"、labelKey "narration_visuals"、
+ * descKey "content_mode_narration_desc"）先不在新建向导里提供，恢复时放回第二位。
+ */
 const CONTENT_MODES: readonly { mode: ContentMode; labelKey: string; descKey: string }[] = [
   { mode: "drama", labelKey: "drama_animation", descKey: "content_mode_drama_desc" },
-  { mode: "narration", labelKey: "narration_visuals", descKey: "content_mode_narration_desc" },
   { mode: "ad", labelKey: "ad_short_video", descKey: "content_mode_ad_desc" },
 ];
 
@@ -76,7 +79,7 @@ export function WizardStepBasics({ value, onChange, titleRef }: WizardStepBasics
       </div>
 
       <WizardSection title={<span id={contentModeId}>{t("content_mode")}</span>} description={t("wizard_content_mode_hint")}>
-        <div role="radiogroup" aria-labelledby={contentModeId} aria-required="true" className="grid grid-cols-3 gap-2.5">
+        <div role="radiogroup" aria-labelledby={contentModeId} aria-required="true" className="grid grid-cols-2 gap-2.5">
           {CONTENT_MODES.map(({ mode, labelKey, descKey }) => (
             <label key={mode} className={cn(choiceClass(value.contentMode === mode), "flex-col gap-1 px-3 py-2.5")}>
               <input

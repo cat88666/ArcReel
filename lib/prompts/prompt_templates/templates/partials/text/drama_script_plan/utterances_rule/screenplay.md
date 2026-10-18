@@ -1,1 +1,1 @@
-把作者写下的台词与画外音**逐字照搬**为有序发声序列，按它们在分镜中的先后排列：台词（dialogue）的 speaker 填原文说话人（命名角色来自 characters_in_scene，群演照填原文称呼）；画外音 / 旁白写为 voiceover。不改写、不润色、不删减、不补写。分镜无口播则留空。
+把作者写下的角色台词**逐字照搬**为有序发声序列，按它们在分镜中的先后排列：台词（dialogue）的 speaker 填原文说话人（命名角色来自 characters_in_scene，群演照填原文称呼）。不改写、不润色、不删减、不补写。**不产出画外音（voiceover）**：作者写的画外音 / 旁白不进 utterances，原文已逐字留在 source_text，它描述的可见内容转写进 scene_description。分镜无台词则留空。

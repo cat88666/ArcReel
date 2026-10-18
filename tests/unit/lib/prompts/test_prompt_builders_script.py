@@ -227,7 +227,7 @@ class TestPromptBuildersScript:
 
 
 class TestScreenplaySourceKind:
-    """source_kind 分支在 script_plan（normalize）：novel 改编 + 画外音语境放开、screenplay 提取 + 逐字保留。
+    """source_kind 分支在 script_plan（normalize）：novel 改编、screenplay 提取 + 逐字保留；两者都不产出画外音。
 
     prompt_authoring（drama）视觉层不按 source_kind 分支——口播抽取归 script_plan，故 build_drama_prompt 无 source_kind 入参。
     只断言语义关键词在场 / 缺席，不锁逐字措辞、不测 LLM 提取质量。
@@ -263,13 +263,11 @@ class TestScreenplaySourceKind:
         assert "utterances" in prompt
         assert "source_text" in prompt
 
-    def test_normalize_novel_releases_voiceover_by_context(self):
-        # novel 源画外音克制放开——由语境判断产出，不一律禁用、不预设规则白名单、不作兜底
-        prompt = self._normalize_prompt("novel")
-        assert "画外音" in prompt
-        assert "语境" in prompt
-        # 旧的「不产出 voiceover」禁令必须移除
-        assert "不产出 voiceover" not in prompt
+    def test_normalize_novel_and_screenplay_forbid_voiceover(self):
+        # 暂只支持角色对白：两种源都不产出画外音，叙述交给画面或角色内心独白
+        for source_kind in ("novel", "screenplay"):
+            prompt = self._squash(self._normalize_prompt(source_kind))
+            assert "不产出画外音（voiceover）" in prompt
 
     def test_normalize_screenplay_flips_to_extract_first(self):
         prompt = self._normalize_prompt("screenplay")

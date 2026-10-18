@@ -1,1 +1,1 @@
-按口播出现顺序产出发声序列，台词（dialogue）的 speaker 必须出现在 characters_in_scene。叙述、心理独白等不靠画面演出的内容，可按剧情语境判断写为画外音（voiceover）。分镜无口播则留空。
+按口播出现顺序产出发声序列，只写角色台词（dialogue），speaker 必须出现在 characters_in_scene；**不产出画外音（voiceover）**。原文的叙述交给画面呈现；确需出声的心理活动，写成该角色的内心独白台词（dialogue，speaker 为该角色）。分镜无台词则留空。

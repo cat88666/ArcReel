@@ -15,7 +15,7 @@ import "./index.css";
 // driver 默认皮肤之后加载，覆盖生效
 import "./css/onboarding.css";
 
-// 启动时按 BRAND 设置文档标题与 meta description（index.html 中的
+// 启动时设置文档标题与 BRAND 的 meta description（index.html 中的
 // <title> 与 <meta name="description"> 仅作为加载阶段的占位）。
 document.title = BRAND_DOCUMENT_TITLE;
 const metaDescription = document.querySelector<HTMLMetaElement>('meta[name="description"]');

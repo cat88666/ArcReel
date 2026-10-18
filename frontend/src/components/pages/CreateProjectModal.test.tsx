@@ -127,7 +127,7 @@ const nextButton = () => screen.getByRole("button", { name: /^(下一步|Next)$/
 const clickNext = () => fireEvent.click(nextButton());
 
 /** 填好第一步的必填项：标题、创作类型、生成方式。 */
-function fillBasics({ mode = "旁白/解说", route = "分镜图生视频" }: { mode?: string; route?: string } = {}) {
+function fillBasics({ mode = "剧情演绎", route = "分镜图生视频" }: { mode?: string; route?: string } = {}) {
   fireEvent.change(screen.getByRole("textbox", { name: "项目标题" }), { target: { value: "demo" } });
   fireEvent.click(screen.getByRole("radio", { name: new RegExp(mode) }));
   fireEvent.click(screen.getByRole("radio", { name: new RegExp(route) }));
@@ -185,7 +185,7 @@ describe("CreateProjectModal", () => {
     expect(payload).toEqual(
       expect.objectContaining({
         title: "demo",
-        content_mode: "narration",
+        content_mode: "drama",
         aspect_ratio: "9:16",
         generation_mode: "storyboard",
         grid_storyboard: false,
@@ -228,41 +228,14 @@ describe("CreateProjectModal", () => {
     expect(navigateMock).toHaveBeenCalledWith("/app/projects/demo-proj");
   });
 
-  it("prefills TTS narration with the global defaults and submits that snapshot", async () => {
+  it("offers neither the narration mode nor narration delivery while only character dialogue is supported", async () => {
     render(<CreateProjectModal />);
+    expect(screen.queryByRole("radio", { name: /旁白\/解说/ })).not.toBeInTheDocument();
     fillBasics();
     clickNext();
-    fireEvent.click(await screen.findByRole("radio", { name: "TTS 配音" }));
-
-    expect(screen.getByLabelText("旁白音色 ID")).toHaveValue("Cherry");
-    expect(screen.getByLabelText("配音语速（可选）")).toHaveValue(1.1);
-    clickNext();
-    fireEvent.click(await screen.findByRole("button", { name: "创建项目" }));
-
-    await waitFor(() =>
-      expect(API.createProject).toHaveBeenCalledWith(
-        expect.objectContaining({
-          narration_delivery: "use_tts",
-          audio_backend: "dashscope/qwen3-tts-flash",
-          narration_voice: "Cherry",
-          narration_speed: 1.1,
-        }),
-      ),
-    );
-  });
-
-  it("requires a TTS model before leaving step 2 with TTS narration", async () => {
-    vi.spyOn(API, "getNarrationDefaults").mockRejectedValue(new Error("boom"));
-    render(<CreateProjectModal />);
-    fillBasics();
-    clickNext();
-    fireEvent.click(await screen.findByRole("radio", { name: "TTS 配音" }));
-
-    expect(nextButton()).toBeDisabled();
-    expect(nextButton()).toHaveAccessibleDescription("还需要：TTS 模型");
-
-    fireEvent.click(screen.getByRole("radio", { name: "后期配音" }));
-    expect(nextButton()).toBeEnabled();
+    await waitFor(() => expect(nextButton()).toBeEnabled());
+    expect(screen.queryByRole("radio", { name: "TTS 配音" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("radio", { name: "后期配音" })).not.toBeInTheDocument();
   });
 
   it("lets step 2 continue with global defaults when the model catalog cannot be read", async () => {
@@ -330,7 +303,7 @@ describe("CreateProjectModal", () => {
     fireEvent.click(screen.getByRole("switch", { name: "多宫格分镜" }));
     fireEvent.click(screen.getByRole("radio", { name: /广告\/短片/ }));
     expect(screen.queryByRole("switch", { name: "多宫格分镜" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("radio", { name: /旁白\/解说/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /剧情演绎/ }));
     expect(screen.getByRole("switch", { name: "多宫格分镜" })).not.toBeChecked();
   });
 
@@ -366,7 +339,7 @@ describe("CreateProjectModal", () => {
     clickNext();
     fireEvent.click(await screen.findByRole("button", { name: "上一步" }));
     expect(screen.getByRole("textbox", { name: "项目标题" })).toHaveValue("demo");
-    expect(screen.getByRole("radio", { name: /旁白\/解说/ })).toBeChecked();
+    expect(screen.getByRole("radio", { name: /剧情演绎/ })).toBeChecked();
     expect(nextButton()).toBeEnabled();
   });
 

@@ -10,6 +10,9 @@ import type { ProviderInfo } from "@/types";
 import type { CustomProviderInfo } from "@/types/custom-provider";
 import { WizardSection } from "./WizardSection";
 
+/** 暂只支持角色对白：旁白交付方式不在新建向导里提供，保持默认后期配音；恢复时改回 true。 */
+const SHOW_NARRATION_DELIVERY = false;
+
 export interface WizardGenerationData {
   options: {
     video: string[];
@@ -132,7 +135,7 @@ export function WizardStepGeneration({
         )}
       </WizardSection>
 
-      {data && (
+      {SHOW_NARRATION_DELIVERY && data && (
         <WizardSection title={t("project_narration_delivery_title")}>
           <NarrationDeliveryFields
             value={narration}

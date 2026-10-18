@@ -239,7 +239,7 @@ class TextTaskTier(StrEnum):
 # 缺档在模块导入时即失败（另有穷举测试兜底）。
 TEXT_TASK_TIERS: dict[TextTaskType, TextTaskTier] = {
     TextTaskType.SCRIPT: TextTaskTier.COMPLEX,
-    TextTaskType.OVERVIEW: TextTaskTier.SIMPLE,
+    TextTaskType.OVERVIEW: TextTaskTier.COMPLEX,
     TextTaskType.STYLE_ANALYSIS: TextTaskTier.SIMPLE,
 }
 

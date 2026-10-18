@@ -57,7 +57,7 @@ async function openWizard(page: Page) {
   await waitForEntrance(wizard(page));
 }
 
-async function fillBasics(page: Page, { mode = "旁白/解说", route = "分镜图生视频" } = {}) {
+async function fillBasics(page: Page, { mode = "剧情演绎", route = "分镜图生视频" } = {}) {
   const dialog = wizard(page);
   await dialog.getByRole("textbox", { name: "项目标题" }).fill(LONG_TITLE);
   await dialog.getByRole("radio", { name: new RegExp(mode) }).check({ force: true });
@@ -144,7 +144,7 @@ defineRegionScenarios("新建项目向导", [
     },
   },
   {
-    name: "第二步选择 TTS 配音且模型很多时，正文可滚到底",
+    name: "第二步模型很多时，正文可滚到底",
     path: LOBBY,
     api: manyModels(),
     ready: lobbyReady,
@@ -152,9 +152,7 @@ defineRegionScenarios("新建项目向导", [
       await openWizard(page);
       await fillBasics(page, { route: "参考生视频" });
       await goNext(page);
-      const dialog = wizard(page);
-      await dialog.getByRole("radio", { name: "TTS 配音" }).check({ force: true });
-      await expectBodyScrollsToEnd(page, dialog.getByLabel("配音语速（可选）"));
+      await expectBodyScrollsToEnd(page, wizard(page).getByRole("combobox").last());
     },
     screenshot: { name: "create-project-generation", target: wizard },
   },

@@ -1546,27 +1546,27 @@ class TestTextBackendTierResolution:
         result = await resolver._resolve_text_backend(fake_svc, MagicMock(), TextTaskType.SCRIPT, None)
         assert result == ("g-tier", "m")
 
-    async def test_simple_tier_tasks_read_simple_key(self):
-        """OVERVIEW / STYLE_ANALYSIS 归简单档，读 text_backend_simple 而非复杂档键。"""
+    async def test_style_analysis_reads_simple_key(self):
+        """风格图分析归简单档，读取 text_backend_simple。"""
         from unittest.mock import MagicMock
 
         from lib.backends.text_backends.base import TextTaskType
 
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(settings={"text_backend_simple": "simple/m", "text_backend_complex": "complex/m"})
-        for task in (TextTaskType.OVERVIEW, TextTaskType.STYLE_ANALYSIS):
+        result = await resolver._resolve_text_backend(fake_svc, MagicMock(), TextTaskType.STYLE_ANALYSIS, None)
+        assert result == ("simple", "m")
+
+    async def test_complex_tier_tasks_read_complex_key(self):
+        from unittest.mock import MagicMock
+
+        from lib.backends.text_backends.base import TextTaskType
+
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"text_backend_simple": "simple/m", "text_backend_complex": "complex/m"})
+        for task in (TextTaskType.SCRIPT, TextTaskType.OVERVIEW):
             result = await resolver._resolve_text_backend(fake_svc, MagicMock(), task, None)
-            assert result == ("simple", "m")
-
-    async def test_script_task_reads_complex_key(self):
-        from unittest.mock import MagicMock
-
-        from lib.backends.text_backends.base import TextTaskType
-
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={"text_backend_simple": "simple/m", "text_backend_complex": "complex/m"})
-        result = await resolver._resolve_text_backend(fake_svc, MagicMock(), TextTaskType.SCRIPT, None)
-        assert result == ("complex", "m")
+            assert result == ("complex", "m")
 
     async def test_malformed_value_without_slash_falls_through(self):
         """无 "/" 的脏值视为未设置，落到下一级。"""
