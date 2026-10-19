@@ -125,8 +125,77 @@ OpenClaw 本机接口以 `openclaw/arcreel` 调用 `xai/grok-4.7-build-fast` 返
 ## elysium-grok 接入与 Agent 切换（用户已同意复用现有网关）
 
 - [x] 盘点两个生产服务、运行中会话、网关配置和密钥边界。
-- [ ] 网关增加 `elysium-grok`，保留现有三个公开模型并隔离 OpenClaw 管理员令牌。
-- [ ] 运行网关相关测试，发布网关并实测普通文本、工具回合和流式响应。
-- [ ] 在 ArcReel 设置里将现有 Agent 供应商的模型切换到 `elysium-grok`，验证新会话。
-- [ ] 核对原有三个模型和服务状态，记录回顾与验收边界。
+- [x] 网关增加 `elysium-grok`，保留现有三个公开模型并隔离 OpenClaw 管理员令牌。
+- [x] 运行网关相关测试，发布网关并实测普通文本、工具回合和流式响应。
+- [x] 在 ArcReel 设置里将现有 Agent 供应商的模型切换到 `elysium-grok`，验证新会话。
+- [x] 核对原有三个模型和服务状态，记录回顾与验收边界。
 
+### 回顾
+
+网关新增 `openclaw` 渠道，公开模型 `elysium-grok` 指向本机 `openclaw/arcreel`（实际底层模型 `xai/grok-4.7-build-fast`）。OpenClaw 令牌在 HK 的 `openclaw.key` 中，由 gateway 用户以 0600 权限读取；没有写入仓库或 ArcReel 代码。为避开 OpenClaw 保留工具名，仅此渠道对 ArcReel 客户端工具名做双向映射，并将上游流式错误转换为 Anthropic 错误事件。
+
+`go test ./...`、临时假上游完整工具回合探针和 `git diff --check` 通过；网关按 `--binary-only` 发布，备份在 `/opt/llm-modes-gateway/backups/20261018-161923`。生产设置页当前仅 `elysium` 为生效 Agent 供应商，默认及四个高级档位均为 `elysium-grok`。真实新会话输出 `ARCREEL_GROK_OK`，随后 `Bash(pwd)` 工具调用、结果回传和最终回答成功；网关日志对应流式 `stop → tool_calls → stop` 均为 200。现有 `elysium-chat`、`elysium-image`、`elysium-video` 路由仍在；未运行新的图片或视频生成。已有视频任务 `video_16b25cbe6883200cf4100a29c4a1d254` 持续查询上游得到 502，保持原状，未作为此次接入验收成功项。
+
+# OpenClaw 网页登录 AI 服务失败
+
+- [x] 在用户指定的 OpenClaw 会话复现错误，记录时间及页面请求/响应。
+- [x] 只读核对 HK OpenClaw 的模型认证状态、服务日志与相关调用链，确定根因。
+- [x] 确认无需重登或改动 ArcReel 路由；记录可行的会话处理方式和验证边界。
+
+## 回顾
+
+2026-10-18 16:35:41，`arcreel-director` 的 `xai/grok-4.7` 请求收到上游 HTTP 403，响应为内容拒绝；OpenClaw 2026.10.4 将该 403 归类为 `auth`，显示“Couldn't sign in to the AI service”并使认证配置进入冷却。此前同一模型在 16:33:17 与 16:34:42 返回 HTTP 200；`models status --agent arcreel-director --check` 显示 xAI OAuth 凭据存在、无缺失路由或不可用配置，凭据状态为即将到期（约 21:01），因此这次报错不能证明登录失效。当前会话包含被上游拒绝的内容，建议另开会话并使用合规素材；不更换模型、不重登、不重发原请求。日志另有多次 HTTP 426 Grok CLI 版本提示，属于独立现象，未作为这次 403 的原因。未改线上配置、进程或 ArcReel 代码；独立 CLI 模型探针未成功，故没有声称修复后真实推理通过。
+
+# 修复 OpenClaw 将内容拒绝误判为认证失败
+
+- [x] 找到 xAI 403 响应到 OpenClaw 错误分类、认证冷却和 UI 文案的实际代码路径。
+- [x] 用安装包真实分类函数先复现误判，再实施严格匹配的最小补丁并验证边界。
+- [x] 在 HK 发布补丁，验证分类、服务和页面；记录独立模型调用的验收限制。
+
+## 回顾
+
+OpenClaw 2026.10.4 的通用分类把未识别的 403 归为 `auth`。已在 HK 安装包 `dist/extensions/xai/index.js` 的 xAI 专用 hook 中，仅对状态 403 且错误正文精确等于本次上游内容拒绝文案的情况返回 `format`。生产文件的原版备份位于 `/var/lib/openclaw/hotfixes/20261018-xai-refusal/index.js.before`；原版 SHA-256 为 `b3def85c2a7ce097db076a24b817eeed00af718b9799967aacee245dffe05008`，补丁版为 `8edab5979a56ed6d5b0f3763379991c18aa79204fa516a9203bce1b950921f4e`。补丁为安装产物热修，后续 npm 更新可能覆盖。
+
+发布前 `node --check` 通过；用实际 xAI hook 加核心分类器验证：该 403 为 `format`，普通 `403 Forbidden` 和 `401 Unauthorized` 仍为 `auth`。`format` 按 OpenClaw 现有策略不写认证配置冷却。重启后 `openclaw-hk.service` 为 active，公开 `/openclaw/` 返回 200，Orca 页面恢复“已连接”。未重发原会话内容。独立无害模型调用在 30 秒内超时，日志见独立的上游 HTTP 426；因此仅确认了错误分类和服务恢复，未确认 Grok 推理链路恢复。
+
+# 2026-10-19 修复 HK 服务器 IP 根路径 404
+
+- [x] 复现 `https://43.154.247.11/` 返回 404，并确认 `/openclaw` 仍有独立路由。
+- [x] 核对线上 Nginx 路由、ArcReel 服务与预期入口，确定最小修复：HTTPS `location /` 显式返回 404，HTTP 同路径代理到 ArcReel。
+- [x] 备份受影响配置，修复 HTTPS 根路径和 `/login`，`nginx -t` 通过并热重载。
+- [x] 从本机验证公网根路径、登录页、静态资源、`/openclaw/` 与 `/healthz`，均返回 200。
+
+## 回顾
+
+根因是 ai-hk 的 `/etc/nginx/snippets/openclaw-https.conf` 显式让 HTTPS 根路径返回 404，而 HTTP 根路径代理 ArcReel。已将 HTTPS 根路径及 `/login` 与 HTTP 的 ArcReel 规则对齐；原始配置备份为 `/etc/nginx/snippets/openclaw-https.conf.bak-20261019-root-404`。公网 TLS 校验、首页、登录页、两项静态资源、OpenClaw 和健康检查均通过；Nginx 与 ArcReel 服务为 active。IP 证书当前有效，2026-10-24 到期，需确保续期正常。
+# 2026-10-19 从本机一键部署 ArcReel 到 ai-hk
+
+- [x] 核对 ai-hk 的发布目录、systemd 服务、构建依赖及持久数据边界。
+- [x] 编写单命令部署脚本：本机构建、上传、远端准备、立即中断任务、切换、健康检查。
+- [x] 验证脚本语法、打包清单、Node 24 前端构建及服务器临时目录中的 `uv sync`；不执行真实切换。
+
+## 回顾
+
+新增 `scripts/deploy_ai_hk.sh`，从本机工作树发布到 ai-hk。上传清单为 1181 个文件、约 35 MB，不含 `.env` 或项目数据；Node 24 前端类型检查和构建通过，服务器临时目录上传与生产依赖安装通过。两段 Bash 语法及 `git diff --check` 通过，临时目录已清理；线上服务仍 active，`current` 未切换，公网 HTTPS 首页仍为 200。脚本切换时强制中断任务，仅备份 SQLite 数据库和旧版本指针；项目文件保留在独立数据目录，失败自动恢复旧代码指针并重启服务，不自动回滚数据迁移。
+# 2026-10-19 E1S01 旁白与 E1S02 双画面只读定位
+
+- [x] 核对页面中 S01/S02 的分镜、视频提示词与发声序列。
+- [x] 对照实际生成请求、参考输入、原始图像和视频，定位异常首次出现的位置。
+- [x] 沿 ArcReel → 网关 → 模型调用链判断责任边界，记录证据与无法确认之处。
+
+## 回顾
+
+S01 的脚本 `utterances=[]`，ArcReel 实际视频提示词无台词。所用 `openai-video` 通道不下发 `generate_audio` 开关，H3 视频本身有声；线上 MP4 原文件已带 AAC 音轨，与版本文件哈希一致，排除 ArcReel 后期加旁白。网关 H3 编译代码对无对白输入应加入 `No dialogue, no narration...`，但未保留该任务提交给 ComfyUI 的最终 graph，因此不能做字节级确认；旁白更可能是模型未遵守约束。
+
+S02 的 720×1280 原始分镜 PNG 已有上下两块独立画面，视频仅以它为首帧，MP4 首帧延续相同边界。上一分镜参考图是单幅；S02 图像请求向 Qwen Image 2.1 提供五张独立参考图，提示词分别要求鞋在画面上沿、清洁者的手在下方，未要求分屏。网关工作流只返回单张模型产物，没有图像拼接逻辑。诱因是空间描述和多参考图，错误构图在图像模型产出时形成；单次样本无法量化提示词与模型各自的贡献。本轮未修改代码、生产配置和素材，也未重生成。
+# 2026-10-19 S01/S02 网关日志补充定位
+
+- [x] 通过生成时间、ArcReel task ID 与网关 TID 关联视频和图像请求。
+- [x] 核对 H3 提示词编译代码路径、Qwen 参考图上传和 GPU 工作流提交日志；记录未保存最终 graph 的限制。
+- [x] 用日志证据修正 S01/S02 的归因与剩余不确定性；不修复、不重生成。
+
+## 回顾
+
+S01 成功任务 `video_de6ab466ffd3e73e67f38b2f48be4213`、TID `tid_67a4993eb42a2fd196a195d7a418a6c8`：15:45:41 提交、1 张参考图，15:47:45 上游完成。提交前 6 次 503 未产出该成片。ArcReel 原始 prompt 以 `Action:` 开头且无 Dialogue；按线上网关 H3 编译路径，必追加 `No dialogue, no narration, no intelligible speech...`。网关 journal/DB 没有最终 graph，无法做字节级核对；旁白更符合 H3 违背语音约束。
+
+S02 图片 TID `tid_c1b410416928b49ba24d49a8b66d7d3e`：15:36:40 `/v1/images/edits` 成功、5 张参考图；Nginx access 对应该 TID 的 5 次 `/image1/upload/image`、1 次 `/image1/prompt`，轮询单个 GPU history ID `652d140c-9b4c-4cd8-9f93-1c58d1967011`。S02 视频任务 `video_a1c7155e54059c3d5bcd5054ba5212b8` 15:47:49 提交、1 张参考图，15:49:45 完成。GPU `/history` 和 `/view` 当前返回 502，无法取最终 graph 或原图哈希；已有日志和产物表明双画面源于单次 Qwen 图像生成，而非网关多次拼接。本轮未修改生产配置、代码或素材，也未重生成。
