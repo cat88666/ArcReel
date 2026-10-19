@@ -83,6 +83,7 @@ updates:
           - "numpy"
           - "pyjianyingdraft"
           - "imageio-ffmpeg"
+          - "scenedetect-headless"
         update-types:
           - "minor"
           - "patch"

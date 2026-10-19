@@ -199,3 +199,18 @@ S02 的 720×1280 原始分镜 PNG 已有上下两块独立画面，视频仅以
 S01 成功任务 `video_de6ab466ffd3e73e67f38b2f48be4213`、TID `tid_67a4993eb42a2fd196a195d7a418a6c8`：15:45:41 提交、1 张参考图，15:47:45 上游完成。提交前 6 次 503 未产出该成片。ArcReel 原始 prompt 以 `Action:` 开头且无 Dialogue；按线上网关 H3 编译路径，必追加 `No dialogue, no narration, no intelligible speech...`。网关 journal/DB 没有最终 graph，无法做字节级核对；旁白更符合 H3 违背语音约束。
 
 S02 图片 TID `tid_c1b410416928b49ba24d49a8b66d7d3e`：15:36:40 `/v1/images/edits` 成功、5 张参考图；Nginx access 对应该 TID 的 5 次 `/image1/upload/image`、1 次 `/image1/prompt`，轮询单个 GPU history ID `652d140c-9b4c-4cd8-9f93-1c58d1967011`。S02 视频任务 `video_a1c7155e54059c3d5bcd5054ba5212b8` 15:47:49 提交、1 张参考图，15:49:45 完成。GPU `/history` 和 `/view` 当前返回 502，无法取最终 graph 或原图哈希；已有日志和产物表明双画面源于单次 Qwen 图像生成，而非网关多次拼接。本轮未修改生产配置、代码或素材，也未重生成。
+# 2026-10-19 DramaOS X Stage 01：视频结构化拆解实验
+
+- [x] 同步两个仓库，保留 ArcReel 本地分叉历史和网关既有未提交改动。
+- [x] 只读审计两仓库现有能力、依赖、模型与授权样本，记录可核查证据。
+- [x] 写 Stage 01 研究结论、最小方案和验收边界；请 Claude Code 审核。
+- [x] 按审核意见修改方案并实现独立 CLI、版本化 JSON 与静态报告。
+- [x] 做有限的合成切点与现有样本快速验证，记录结果、成本及未验证项。
+- [x] Codex 与 Claude Code 继续审核实现，最多三轮；修复确认的问题。
+- [x] 交付 Stage 01 文档、代码、运行说明与人工验收清单。
+
+## 回顾
+
+网关同步到 `6ab0db8`，保留原有工作树改动和备份 stash；ArcReel 同步到 `7ff8001b`，旧本地分叉历史保存在 `codex/pre-sync-20261019`，Stage 01 在 `codex/dramaos-stage01` 实现。方案经 Claude Code 首轮审核后实施；Claude 第二、三轮及 Codex 复审指出的 CI 可选依赖、素材误提交、Schema 错误记录、末帧时长、VFR 切点错位等问题均已修正。最终 Codex 复审未发现阻断项；三轮 Claude 审核上限已用完。
+
+快速验证：5 个定向用例通过；ruff、basedpyright、依赖审计、约定审计、语法编译与 `git diff --check` 通过。最终代码重跑 3 秒合成硬切样本（3 镜，边界 0/30/60/90）和 60.47 秒本地既有产物（8 镜），两份结果通过 JSON Schema。真实样本的抽帧与音轨仅留本机并由 `.gitignore` 排除；未进行完整测试矩阵、真实内容质量或 ASR/视觉模型验收，交由用户按 `docs/dramaos/stage-01/acceptance.md` 手动完成。未部署生产。

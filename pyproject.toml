@@ -71,6 +71,9 @@ dev = [
     "pytest-testmon>=2.2.0",
     "blockbuster>=1.5.29",
 ]
+dramaos = [
+    "scenedetect-headless==0.7.2",
+]
 # 变异测试工具，不进 dev：只在按批次跑 mutmut 时 `uv sync --group mutation` 装入。
 # 独立成组是为了让版本 pin 进 uv.lock、被 dependabot 看到；流程见 docs/testing/mutmut-runbook.md。
 mutation = [
@@ -307,6 +310,9 @@ forbidden_modules = ["claude_agent_sdk", "mcp"]
 exclude = ["venv", "\\.venv", "\\.direnv", "\\.git", "setup\\.py", "\\.worktrees", "\\.claude/worktrees"]
 known_first_party = ["lib", "server", "alembic", "scripts", "tests"]
 
+[tool.deptry.package_module_name_map]
+scenedetect-headless = "scenedetect"
+
 [tool.deptry.per_rule_ignores]
 # DEP002（声明了但无 import）——全部是靠 entry point / 后端注册被运行时加载的插件，
 # 源码里不会出现 import。
@@ -327,6 +333,7 @@ DEP004 = [
     "pytest_asyncio", # pytest 的 asyncio 插件，测试内直接用 @pytest_asyncio.fixture（本规则按模块名匹配）
     "respx",          # httpx 的测试替身
     "blockbuster",    # 事件循环阻塞检测，tests/blocking_guard 护栏的拦截点来源
+    "scenedetect",    # 独立 Stage 01 CLI 从 dramaos 可选依赖组延迟加载，不属于生产依赖
 ]
 
 [tool.ruff]

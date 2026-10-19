@@ -99,3 +99,6 @@ docs/verification-reports/
 
 # mutmut 变异测试的工作副本（`mutmut run` 生成的整仓复制品）
 mutants/
+
+# Stage 01 本地授权样本的抽帧和音轨，不进入仓库分发
+tasks/artifacts/dramaos-stage01/real-sample/

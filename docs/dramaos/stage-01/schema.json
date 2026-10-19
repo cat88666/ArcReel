@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arcreel.local/dramaos/stage-01/schema-1.0.json",
+  "title": "DramaOS Stage 01 analysis",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "detector", "shots", "audio", "dialogue", "report", "run"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256", "size_bytes", "duration_seconds", "container_formats", "streams"],
+      "properties": {
+        "filename": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "size_bytes": {"type": "integer", "minimum": 1},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 120},
+        "container_formats": {"type": "array", "items": {"type": "string"}, "contains": {"const": "mp4"}},
+        "streams": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "codec", "duration_seconds", "packet_count"],
+            "properties": {
+              "kind": {"enum": ["video", "audio"]},
+              "codec": {"type": ["string", "null"]},
+              "duration_seconds": {"type": ["number", "null"], "minimum": 0},
+              "packet_count": {"type": "integer", "minimum": 0}
+            }
+          }
+        }
+      }
+    },
+    "detector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "threshold", "version", "ffmpeg_version"],
+      "properties": {
+        "name": {"const": "pyscenedetect_content"},
+        "threshold": {"type": "number", "exclusiveMinimum": 0},
+        "version": {"type": "string", "minLength": 1},
+        "ffmpeg_version": {"type": "string", "minLength": 1}
+      }
+    },
+    "shots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "start_frame", "end_frame", "start_seconds", "end_seconds", "keyframe", "visual", "narrative"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^shot_[0-9]{4,}$"},
+          "start_frame": {"type": "integer", "minimum": 0},
+          "end_frame": {"type": "integer", "minimum": 1},
+          "start_seconds": {"type": "number", "minimum": 0},
+          "end_seconds": {"type": "number", "exclusiveMinimum": 0},
+          "keyframe": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "frame_index", "time_seconds"],
+            "properties": {
+              "path": {"type": "string", "pattern": "^frames/shot_[0-9]{4,}\\.jpg$"},
+              "frame_index": {"type": "integer", "minimum": 0},
+              "time_seconds": {"type": "number", "minimum": 0}
+            }
+          },
+          "visual": {"$ref": "#/$defs/unavailable"},
+          "narrative": {"$ref": "#/$defs/unavailable"}
+        }
+      }
+    },
+    "audio": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {"status": {"const": "unavailable"}, "reason": {"type": "string", "minLength": 1}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "path", "sample_rate", "timeline", "video_offset_seconds"],
+          "properties": {
+            "status": {"const": "available"},
+            "path": {"const": "audio.wav"},
+            "sample_rate": {"const": 16000},
+            "timeline": {"const": "audio_zero"},
+            "video_offset_seconds": {"type": ["number", "null"]}
+          }
+        }
+      ]
+    },
+    "dialogue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {"status": {"const": "unavailable"}, "reason": {"type": "string", "minLength": 1}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "engine", "model", "timeline", "segments"],
+          "properties": {
+            "status": {"const": "available"},
+            "engine": {"const": "mlx_whisper"},
+            "model": {"type": "string", "minLength": 1},
+            "timeline": {"const": "audio_zero"},
+            "segments": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["start_seconds", "end_seconds", "text", "evidence", "confidence"],
+                "properties": {
+                  "start_seconds": {"type": "number", "minimum": 0},
+                  "end_seconds": {"type": "number", "minimum": 0},
+                  "text": {"type": "string"},
+                  "evidence": {"const": "audio.wav"},
+                  "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "report": {"const": "report.html"},
+    "run": {"const": "run.json"}
+  },
+  "$defs": {
+    "unavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {"status": {"const": "unavailable"}}
+    }
+  }
+}

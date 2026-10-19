@@ -1,0 +1,8 @@
+{
+  "status": "completed",
+  "error": null,
+  "elapsed_seconds": 0.289,
+  "peak_child_rss_bytes": 37634048,
+  "peak_child_rss_scope": "maximum_single_child_process",
+  "platform": "macOS-15.5-arm64-arm-64bit"
+}
