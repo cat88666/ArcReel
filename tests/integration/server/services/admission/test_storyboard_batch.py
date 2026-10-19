@@ -121,7 +121,8 @@ class TestStoryboardImagePrompt:
 
         assert out.count("Style:") == 1
         assert "\n\n村口黄昏的长镜头\n\n" in out
-        assert out.endswith("\n\nAvoid: 水印、多余文字、Logo")
+        assert "\nFrame: " in out
+        assert out.endswith("\nAvoid: 水印、多余文字、Logo")
 
     def test_missing_prompt_is_refused(self) -> None:
         with pytest.raises(ValueError, match="E1S03"):

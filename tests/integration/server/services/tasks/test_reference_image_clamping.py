@@ -43,6 +43,12 @@ CLAMPED_PROMPT = (
 )
 
 
+def assert_clamped_prompt(prompt: str) -> None:
+    assert prompt.count("\nFrame: ") == 1
+    assert "没有横向接缝" in prompt
+    assert "\n".join(line for line in prompt.split("\n") if not line.startswith("Frame: ")) == CLAMPED_PROMPT
+
+
 def _expected_basis(project_path: Path, pm: _FakePM):
     """完整装配集对应的 basis：6 张角色 sheet + 场景 sheet + 道具 sheet，与目标态规划器按脚本条目重建的一致。"""
     references = [
@@ -114,7 +120,7 @@ class TestStoryboardReferenceClamping:
         entry = ProjectArtifactManifestAdapter(project_path).get_entry(ArtifactKey.episode_storyboard(1, ITEM_ID))
         assert entry is not None
         assert entry.basis_digest == _expected_basis(project_path, pm).digest
-        assert call["prompt"] == CLAMPED_PROMPT
+        assert_clamped_prompt(call["prompt"])
         # 丢弃了输入的参考图必须让用户与 Agent 感知：任务结果带与参考生视频路线同形的 warning
         assert result["warnings"] == [
             {"key": "ref_too_many_images", "params": {"count": 8, "model": FAKE_BACKEND_MODEL, "max_count": 7}}
@@ -241,7 +247,7 @@ class TestLimitComesFromTheResolvedBackend:
 
         body = json.loads(route.calls.last.request.content)
         assert len(body["images"]) == 7
-        assert body["prompt"] == CLAMPED_PROMPT
+        assert_clamped_prompt(body["prompt"])
         # 裁剪发生在编排层，Vidu 自己的兜底截断在正常路径下不再触发
         assert "超过 model=viduq2 上限 7" in caplog.text
         assert "Vidu 参考图数量" not in caplog.text

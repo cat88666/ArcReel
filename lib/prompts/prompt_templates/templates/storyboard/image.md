@@ -28,4 +28,5 @@ idempotent: true
 {% else %}
 {{ structured_body }}
 {% endif %}
+{{ partial("storyboard/image/single_frame") }}
 {{ partial("storyboard/image/avoid") }}

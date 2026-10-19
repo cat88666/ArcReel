@@ -13,6 +13,13 @@ from lib.prompts.prompt_builders import (
 )
 from lib.prompts.reference_image_numbering import PREVIOUS_STORYBOARD_ROLE
 
+_SINGLE_FRAME = (
+    "Frame: 把 Scene 拍成同一摄影机的一次曝光，而不是画面版式。“画面上沿”“画面下方”只表示同一空间内的相对位置；"
+    "所有主体共享连续背景、同一透视和光照，用距离、遮挡和接触关系组成一个镜头。若 Scene 只要求鞋、手、袖口等局部入画，"
+    "只呈现这些局部，不补出参考图中的脸、躯干或独立背景。上一分镜图只用于人物外观、场景色调和机位的延续，"
+    "不沿用其人物姿势、完整布局或画面区域。最终只输出一张没有横向接缝的连续照片，不出现分屏、拼贴、画中画或漫画格。"
+)
+
 
 class TestCharacterPrompt:
     def test_includes_supplied_character_details(self):
@@ -68,7 +75,8 @@ class TestFigureExclusion:
 class TestStoryboardImageAvoidLine:
     def test_text_form_ends_with_one_image_avoid_line(self):
         assert (
-            render_storyboard_image_prompt("林清坐在窗边木桌前") == "林清坐在窗边木桌前\n\nAvoid: 水印、多余文字、Logo"
+            render_storyboard_image_prompt("林清坐在窗边木桌前")
+            == f"林清坐在窗边木桌前\n\n{_SINGLE_FRAME}\nAvoid: 水印、多余文字、Logo"
         )
 
     def test_idempotent(self):
@@ -112,7 +120,7 @@ class TestRenderStoryboardImagePrompt:
             )
             == rendered
         )
-        for label in ("Style:", "Visual style:", "Reference_Images:", "Avoid:"):
+        for label in ("Style:", "Visual style:", "Reference_Images:", "Frame:", "Avoid:"):
             assert rendered.count(label) == 1
 
     def test_structured_prompt_declares_types_between_style_and_scene_and_numbers_mentions(self):
@@ -131,6 +139,7 @@ class TestRenderStoryboardImagePrompt:
             "  shot_type: Medium Shot\n"
             "  lighting: 右侧落地窗逆光，蓝灰色调\n"
             "  ambiance: 雨天，室内昏暗\n"
+            f"{_SINGLE_FRAME}\n"
             "Avoid: 水印、多余文字、Logo"
         )
 
@@ -179,6 +188,7 @@ class TestRenderStoryboardImagePrompt:
             "Visual style: cinematic\n"
             "Reference_Images: 图1为角色参考图；图2为上一分镜图，只参考构图与色调。\n\n"
             "图1坐在窗边木桌前\n\n"
+            f"{_SINGLE_FRAME}\n"
             "Avoid: 水印、多余文字、Logo"
         )
 
@@ -191,6 +201,23 @@ class TestRenderStoryboardImagePrompt:
             render_storyboard_image_prompt(once, style="Anime", style_description="cinematic", references=references)
             == once
         )
+
+    def test_saved_upper_lower_scene_is_wrapped_without_rewriting_it(self):
+        scene = "图1的皮鞋从画面上沿踩进图3的地面。画面下方，图2的手握着图4的抹布。"
+        references = [
+            _sheet("character", "甲"),
+            _sheet("character", "乙"),
+            _sheet("scene", "大堂"),
+            _sheet("prop", "抹布"),
+            _PREVIOUS,
+        ]
+        rendered = render_storyboard_image_prompt(
+            {"scene": scene, "composition": {"shot_type": "Close-up", "lighting": "", "ambiance": ""}},
+            references=references,
+        )
+        assert f"Scene: {scene}" in rendered
+        assert "图5为上一分镜图" in rendered
+        assert rendered.index(f"Scene: {scene}") < rendered.index(_SINGLE_FRAME) < rendered.index("Avoid:")
 
 
 class TestTextFormRerenderAfterStyleFieldsChange:
@@ -216,7 +243,7 @@ class TestTextFormRerenderAfterStyleFieldsChange:
     def test_legacy_text_with_description_first_is_not_stacked(self):
         legacy = "Visual style: 留白写意\n\nStyle: 水墨\n\n林清坐在窗边木桌前\n\nAvoid: 水印、多余文字、Logo"
         rendered = render_storyboard_image_prompt(legacy, style="水墨", style_description="留白写意")
-        assert rendered == legacy
+        assert rendered == f"{legacy}\n\n{_SINGLE_FRAME}"
 
 
 def test_product_sheet_preserves_product_and_ignores_project_style():

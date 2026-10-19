@@ -34,7 +34,7 @@ class TestPromptUtils:
 
         text = image_prompt_to_yaml(data, "Anime")
         parsed = yaml.safe_load(text)
-        assert list(parsed) == ["Style", "Scene", "Composition", "Avoid"]
+        assert list(parsed) == ["Style", "Scene", "Composition", "Frame", "Avoid"]
         assert parsed["Style"] == "Anime"
         assert parsed["Scene"] == "夜雨中的街道"
         assert parsed["Composition"]["shot_type"] == "Medium Shot"
@@ -65,7 +65,7 @@ class TestPromptUtils:
     def test_image_prompt_to_yaml_places_reference_images_between_style_and_scene(self):
         data = {"scene": "x", "composition": {"shot_type": "Medium Shot", "lighting": "", "ambiance": ""}}
         text = image_prompt_to_yaml(data, "Anime", reference_images="图1为角色参考图。")
-        assert list(yaml.safe_load(text)) == ["Style", "Reference_Images", "Scene", "Composition", "Avoid"]
+        assert list(yaml.safe_load(text)) == ["Style", "Reference_Images", "Scene", "Composition", "Frame", "Avoid"]
         assert "Reference_Images: 图1为角色参考图。\n" in text
 
     def test_video_prompt_to_yaml_includes_dialogue_conditionally(self):

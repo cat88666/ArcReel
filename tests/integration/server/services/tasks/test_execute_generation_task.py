@@ -59,7 +59,10 @@ class TestGenerationTasks:
         assert [sorted(ref) for ref in storyboard_refs] == [["image"]] * 4
         assert all(not ref["image"].is_relative_to(project_path) for ref in storyboard_refs)
         assert fake_generator.image_reference_bytes[0] == [b"png"] * 4
-        assert fake_generator.image_calls[0]["prompt"] == (
+        prompt = fake_generator.image_calls[0]["prompt"]
+        assert prompt.count("\nFrame: ") == 1
+        assert "没有横向接缝" in prompt
+        assert "\n".join(line for line in prompt.split("\n") if not line.startswith("Frame: ")) == (
             "Style: Anime\n"
             "Visual style: cinematic\n"
             "Reference_Images: 图1为角色参考图；图2为场景参考图；图3为道具参考图；"
