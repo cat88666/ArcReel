@@ -1,0 +1,112 @@
+{
+  "kind": "declarative",
+  "schema_version": "1.0.0",
+  "meta": {
+    "name": "Elysium H3 (首帧 + 参考图/音频)",
+    "author": "junk",
+    "version": "1.0.0",
+    "hints": {
+      "suggested_models": [
+        {
+          "id": "elysium-video"
+        }
+      ]
+    }
+  },
+  "auth": {
+    "headers": {
+      "Authorization": "Bearer {{ api_key }}"
+    }
+  },
+  "inputs": {
+    "first_frame": {
+      "source": "start_image",
+      "encoding": "data_uri"
+    },
+    "refs": {
+      "source": "reference_images",
+      "encoding": "data_uri"
+    },
+    "ref_audio": {
+      "source": "reference_audio_files",
+      "encoding": "data_uri"
+    }
+  },
+  "enum_maps": {
+    "aspect_ratio": {
+      "9:16": "720x1280",
+      "16:9": "1280x720",
+      "1:1": "960x960"
+    }
+  },
+  "submit": {
+    "method": "POST",
+    "url": "{{ base_url }}/videos",
+    "body": {
+      "model": "{{ model }}",
+      "prompt": "{{ prompt }}",
+      "seconds": "{{ duration }}",
+      "size": "{{ aspect_ratio }}",
+      "input_reference": "{{ inputs.first_frame }}",
+      "reference_images": [
+        {
+          "$each": {
+            "in": "inputs.refs",
+            "as": "ref",
+            "item": "{{ ref }}"
+          }
+        }
+      ],
+      "reference_audios": [
+        {
+          "$each": {
+            "in": "inputs.ref_audio",
+            "as": "audio",
+            "item": "{{ audio }}"
+          }
+        }
+      ]
+    },
+    "extract": {
+      "task_id": [
+        "$.id"
+      ],
+      "error": [
+        "$.error.message",
+        "$.error"
+      ]
+    }
+  },
+  "poll": {
+    "method": "GET",
+    "url": "{{ base_url }}/videos/{{ task_id }}",
+    "extract": {
+      "status": [
+        "$.status"
+      ],
+      "video_url": [
+        "$.url"
+      ],
+      "error": [
+        "$.error.message",
+        "$.error"
+      ]
+    }
+  },
+  "status_map": {
+    "submitting": "queued",
+    "queued": "queued",
+    "in_progress": "running",
+    "completed": "succeeded",
+    "failed": "failed",
+    "cancelled": "failed"
+  },
+  "capabilities": {
+    "first_frame": true,
+    "max_reference_images": 9,
+    "reference_audio_mode": "direct",
+    "max_reference_audio_count": 3,
+    "max_reference_audio_total_seconds": 15,
+    "audio_track": "always_on"
+  }
+}
