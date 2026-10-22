@@ -290,3 +290,13 @@ S02 图片 TID `tid_c1b410416928b49ba24d49a8b66d7d3e`：15:36:40 `/v1/images/edi
 ## 回顾
 
 首次完整闸门发现 7 条集成测试仍断言旧的分镜图提示词格式；更新断言后，相关 67 项通过。重跑 `uv run python scripts/gate.py --changed`：backend、tests、conventions 域全部通过，后端 16848 passed、2 skipped。`bash -n scripts/deploy_ai_hk.sh` 和 `git diff --check` 通过。提交范围不含本地 `tasks/artifacts/elysium-ref2v/` 的媒体测试产物。
+# 2026-10-22 部署当前 ArcReel 到 ai-hk
+
+- [x] 核对本地提交、工作区、线上版本、任务状态和发布脚本边界。
+- [x] 运行关键发布前验证，检查打包与差异。
+- [x] 使用 `scripts/deploy_ai_hk.sh` 发布，记录旧版、备份和新版路径。
+- [x] 验证服务、数据库、静态页面与公网入口，记录回顾及剩余验收边界。
+
+## 回顾
+
+本地 `ce2edcf7` 已发布到 `/opt/arcreel/releases/20261022T140514Z-ce2edcf7-51951`，旧版为 `/opt/arcreel/releases/20261021T160145Z-30224a62-34642`。数据库备份在 `/opt/arcreel/backups/20261022T140514Z-ce2edcf7-51951/arcreel.db`，数据目录快照在 `/opt/arcreel/backups/predeploy-20261022-ce2edcf7/data-root`。切换前活动任务为 0。后端、市场子包、约定与工作流闸门通过；Node 24 前端类型检查及生产构建通过。全量前端 Vitest 在 Node 22 下出现多项失败，Node 24 复跑按用户要求优先部署而停止，故前端全量单测未通过验收。发布后服务 active，SQLite quick_check 为 ok，Alembic 为 `b5d1e8f3a627`；本机回环健康接口、公网首页、健康接口及主脚本均正常，TLS 校验通过，启动后错误级日志为空。未运行真实生成业务请求。
