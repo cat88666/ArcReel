@@ -125,20 +125,21 @@ def compress_single_at_step(
 ) -> bytes:
     """按角色 + 档位压缩单张参考图，返回 JPEG（或原样透传的）字节。
 
-    - FRAME：永不缩尺寸；**仅当超单图预算才**重编码为 JPEG q92/4:4:4，否则原样透传——
-      不因格式（PNG 等）强转，以最大限度保留首/尾帧像素（ADR：保证不使 Sora 像素匹配恶化）。
+    - FRAME：永不缩尺寸；首发仅超单图预算才重编码，收到请求体超限后按档位重编码；
+      其余情况原样透传，以最大限度保留首/尾帧像素。
     - ARRAY：按 ``step`` 取梯子档 (edge, q) 重编码为 JPEG/4:4:4；step==0 且原图已 JPEG +
       小于透传阈值 + 尺寸合规则原样透传。
     """
     if role is RefRole.FRAME:
-        if len(raw) <= single_max_bytes:
+        if step == 0 and len(raw) <= single_max_bytes:
             return raw
-        return compress_image_bytes(
+        encoded = compress_image_bytes(
             raw,
             max_long_edge=_FRAME_NO_RESIZE_EDGE,
-            quality=_BASELINE_QUALITY,
+            quality=_BASELINE_QUALITY if step == 0 else _ladder_params(step)[1],
             subsampling=_SUBSAMPLING_444,
         )
+        return encoded if len(encoded) < len(raw) or len(raw) > single_max_bytes else raw
 
     edge, quality = _ladder_params(step)
     if step == 0 and len(raw) <= _PASSTHROUGH_MAX_BYTES:

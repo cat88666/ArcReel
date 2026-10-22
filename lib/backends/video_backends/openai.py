@@ -255,6 +255,9 @@ class OpenAIVideoBackend(ProviderJobIdPersistenceMixin):
         logger.info("调用 %s 视频 SDK kwargs=%s", self.name, format_kwargs_for_log(kwargs))
 
         video = await self._create_video(**kwargs)
+        # 已拿到视频任务 ID；后续持久化、轮询或下载失败都不能再把本次生成当作未收单重提。
+        if request.on_provider_resubmit_unsafe is not None:
+            request.on_provider_resubmit_unsafe()
         # submit 成功立即持久化 job_id；持久化失败抛 → finally mark_failed。
         # 非 worker 路径（grid / 直生 / 测试）request.task_id 为 None，统一点内跳过持久化。
         # 一并写回本次实际请求的域名：续跑据此回放，否则在途改了 base_url 会按新域名去查旧任务。

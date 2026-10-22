@@ -124,7 +124,7 @@ async def _remove_staged_output_on_error(path: Path | None):
 
 
 def _is_413(exc: BaseException) -> bool:
-    """识别请求体超限（HTTP 413）。
+    """识别请求体超限（HTTP 413，以及 xAI 返回的精确 400 文案）。
 
     先从异常通用属性提取状态码：``status_code``（OpenAI/xai SDK + 规整后的 vidu/dashscope）/
     ``response.status_code``（httpx.HTTPStatusError）/ ``code``（google-genai APIError）——
@@ -140,8 +140,12 @@ def _is_413(exc: BaseException) -> bool:
     # 防御性 int 转换：个别 SDK / mock 可能把状态码给成字符串 "413"，
     # 直接 ``== 413`` 会恒 False；非数字状态码落回下方短语匹配。
     try:
-        if status is not None and int(status) == 413:
-            return True
+        if status is not None:
+            parsed_status = int(status)
+            if parsed_status == 413:
+                return True
+            if parsed_status == 400:
+                return "failed to read request body: length limit exceeded" in str(exc).lower()
     except (ValueError, TypeError):
         pass
     msg = str(exc).lower()
