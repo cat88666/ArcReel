@@ -17,7 +17,7 @@ from lib.backends.image_backends.base import (
     ReferenceImage,
 )
 from lib.backends.providers import PROVIDER_OPENAI
-from tests.fakes import captured_openai_clients
+from tests.fakes import bounded_poll_clock, captured_openai_clients
 from tests.http_capture import capture_http, only_request, request_json
 
 
@@ -66,20 +66,26 @@ def _make_mock_image_response(
 
 
 class TestOpenAIImageBackend:
-    async def test_transient_image_download_failure_can_still_recover(self, tmp_path: Path):
+    @pytest.mark.parametrize(
+        "failure", [httpx.Response(503), httpx.ReadError("interrupted"), httpx.ReadTimeout("slow")]
+    )
+    async def test_transient_image_download_failure_can_still_recover(
+        self, tmp_path: Path, failure: httpx.Response | httpx.TransportError
+    ):
         from lib.backends.image_backends.openai import OpenAIImageBackend
 
         backend = OpenAIImageBackend(api_key="test-key", base_url="https://gateway.test/v1")
-        with capture_http() as router:
-            router.post("https://gateway.test/v1/images/generations").mock(
+        with capture_http() as router, bounded_poll_clock(step=0.01):
+            submit = router.post("https://gateway.test/v1/images/generations").mock(
                 return_value=httpx.Response(200, json={"data": [{"url": "https://gateway.test/image.png"}]}),
             )
             download = router.get("https://gateway.test/image.png").mock(
-                side_effect=[httpx.Response(503), httpx.Response(200, content=b"image")]
+                side_effect=[failure, httpx.Response(200, content=b"image")]
             )
             result = await backend.generate(
                 ImageGenerationRequest(prompt="A plain blue square", output_path=tmp_path / "output.png")
             )
+            assert submit.call_count == 1
             assert download.call_count == 2
         assert result.image_path.read_bytes() == b"image"
 

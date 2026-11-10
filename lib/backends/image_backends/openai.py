@@ -16,7 +16,12 @@ from openai import APIStatusError
 from arcreel_catalog_core import ImageFacts, ScaledOutputTokenBase
 from arcreel_market_core.aspect_size import IMAGE_TIER_SHORT_EDGE, aspect_size, resolution_to_short_edge
 from arcreel_market_core.video_backend_contract import IMAGE_MIME_TYPES
-from lib.backends.backend_runtime import is_provider_rejection, provider_reason_summary, should_retry_signed_download
+from lib.backends.backend_runtime import (
+    is_provider_rejection,
+    provider_reason_summary,
+    should_retry_signed_download,
+    with_artifact_retry,
+)
 from lib.backends.http_status_errors import provider_rejected_error
 from lib.backends.image_backends.base import (
     BOTH_IMAGE_CAPABILITIES,
@@ -241,10 +246,8 @@ class OpenAIImageBackend:
             dimensions=usage.dimensions,
         )
 
-    # SDK 异常类型与下载 HTTP 状态决定重试，错误文案和 URL 不参与判定。
-    @with_retry_async(
-        retry_if=lambda exc: isinstance(exc, OPENAI_RETRYABLE_ERRORS) or should_retry_signed_download(exc)
-    )
+    # 生成阶段只重试 SDK 错误，产物取件的失败不能重新发起生成。
+    @with_retry_async(retry_if=lambda exc: isinstance(exc, OPENAI_RETRYABLE_ERRORS))
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         has_refs = bool(request.reference_images)
         if has_refs and ImageCapability.IMAGE_TO_IMAGE not in self._capabilities:
@@ -327,7 +330,14 @@ class OpenAIImageBackend:
             raise RuntimeError(
                 f"OpenAI 图片生成响应 data 为空 (model={self._model})，可能触发内容安全过滤或上游服务异常"
             )
-        await save_image_from_response_item(data[0], request.output_path)
+        if getattr(data[0], "url", None) and not getattr(data[0], "b64_json", None):
+            await with_artifact_retry(
+                lambda: save_image_from_response_item(data[0], request.output_path),
+                label="OpenAI image artifact",
+                retry_if=should_retry_signed_download,
+            )
+        else:
+            await save_image_from_response_item(data[0], request.output_path)
         logger.info("OpenAI 图片生成完成: %s", request.output_path)
 
         img_in = img_out = txt_in = txt_out = None
