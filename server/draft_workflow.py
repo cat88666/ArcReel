@@ -230,7 +230,7 @@ def _apply_draft_edits(content: dict[str, Any], edits: list[DraftFieldEdit]) -> 
     for index, edit in enumerate(edits):
         node: Any = candidate
         for position, key in enumerate(edit.path):
-            if isinstance(node, dict) and isinstance(key, str) and key in node:  # noqa: SIM114 - 保留 dict/list 键类型收窄
+            if isinstance(node, dict) and isinstance(key, str) and key in node:  # noqa: SIM114 -- 保留 dict/list 键类型收窄
                 if position == len(edit.path) - 1:
                     node[key] = copy.deepcopy(edit.value)
                 else:
