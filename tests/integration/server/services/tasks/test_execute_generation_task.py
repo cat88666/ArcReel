@@ -68,7 +68,7 @@ class TestGenerationTasks:
             "Reference_Images: 图1为角色参考图，每张只取最左侧那一个人像的长相与服装；图2为场景参考图；图3为道具参考图。\n"
             "Scene: 在雨夜街道\n"
             "Composition:\n  shot_type: Medium Shot\n  lighting: 暖光\n  ambiance: 薄雾\n"
-            "Avoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
+            "Avoid: 水印、多余文字、Logo"
         )
 
         await generation_tasks.execute_storyboard_task(

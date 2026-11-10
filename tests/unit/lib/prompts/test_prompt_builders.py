@@ -240,11 +240,11 @@ class TestTextFormRerenderAfterStyleFieldsChange:
         lines = again.split("\n")
         assert lines.count("Style: 水墨") == 1
         assert lines.count("Visual style: 留白写意") == 1
-        assert lines.count("Avoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo") == 1
+        assert lines.count("Avoid: 水印、多余文字、Logo") == 1
         assert render_storyboard_image_prompt(again, **then) == again
 
     def test_legacy_text_with_description_first_is_not_stacked(self):
-        legacy = "Visual style: 留白写意\n\nStyle: 水墨\n\n林清坐在窗边木桌前\n\nAvoid: 分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
+        legacy = "Visual style: 留白写意\n\nStyle: 水墨\n\n林清坐在窗边木桌前\n\nAvoid: 水印、多余文字、Logo"
         rendered = render_storyboard_image_prompt(legacy, style="水墨", style_description="留白写意")
         assert rendered == f"{legacy}\n\n{_SINGLE_FRAME}"
 

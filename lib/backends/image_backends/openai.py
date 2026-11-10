@@ -257,7 +257,7 @@ class OpenAIImageBackend:
         try:
             return await (self._generate_edit(request) if has_refs else self._generate_create(request))
         except APIStatusError as exc:
-            if not is_provider_rejection(exc.status_code):
+            if exc.status_code == 404 or not is_provider_rejection(exc.status_code):
                 raise
             # SDK 异常不继承 HTTPStatusError；转换后沿用任务失败的结构化落库与 FIX_INPUT。
             status_error = httpx.HTTPStatusError("", request=exc.request, response=exc.response)
