@@ -9,11 +9,15 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal
 
+import httpx
 import openai
+from openai import APIStatusError
 
 from arcreel_catalog_core import ImageFacts, ScaledOutputTokenBase
 from arcreel_market_core.aspect_size import IMAGE_TIER_SHORT_EDGE, aspect_size, resolution_to_short_edge
 from arcreel_market_core.video_backend_contract import IMAGE_MIME_TYPES
+from lib.backends.backend_runtime import is_provider_rejection, provider_reason_summary, should_retry_signed_download
+from lib.backends.http_status_errors import provider_rejected_error
 from lib.backends.image_backends.base import (
     BOTH_IMAGE_CAPABILITIES,
     ImageCapability,
@@ -237,14 +241,24 @@ class OpenAIImageBackend:
             dimensions=usage.dimensions,
         )
 
-    @with_retry_async(retryable_errors=OPENAI_RETRYABLE_ERRORS)
+    # SDK 异常类型与下载 HTTP 状态决定重试，错误文案和 URL 不参与判定。
+    @with_retry_async(
+        retry_if=lambda exc: isinstance(exc, OPENAI_RETRYABLE_ERRORS) or should_retry_signed_download(exc)
+    )
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         has_refs = bool(request.reference_images)
         if has_refs and ImageCapability.IMAGE_TO_IMAGE not in self._capabilities:
             raise ImageCapabilityError("image_endpoint_mismatch_no_i2i", model=self._model)
         if not has_refs and ImageCapability.TEXT_TO_IMAGE not in self._capabilities:
             raise ImageCapabilityError("image_endpoint_mismatch_no_t2i", model=self._model)
-        return await (self._generate_edit(request) if has_refs else self._generate_create(request))
+        try:
+            return await (self._generate_edit(request) if has_refs else self._generate_create(request))
+        except APIStatusError as exc:
+            if not is_provider_rejection(exc.status_code):
+                raise
+            # SDK 异常不继承 HTTPStatusError；转换后沿用任务失败的结构化落库与 FIX_INPUT。
+            status_error = httpx.HTTPStatusError("", request=exc.request, response=exc.response)
+            raise provider_rejected_error(status_error, provider_reason=provider_reason_summary(exc.response)) from None
 
     async def _generate_create(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         kwargs = {

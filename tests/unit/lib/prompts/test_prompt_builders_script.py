@@ -445,8 +445,9 @@ class TestScreenplaySourceKind:
             assert plain == self._normalize_prompt(source_kind, instructions="")
 
     def test_normalize_injects_pacing(self):
-        # script_plan 无条件提供开篇节奏建议。
-        assert "开篇~4秒承担钩子职能" in self._squash(self._normalize_prompt("novel"))
+        # 小说按原文因果安排节奏；成品剧本仍保留短剧体裁建议。
+        assert "不强制4秒危机、15秒转折" in self._squash(self._normalize_prompt("novel"))
+        assert "开篇~4秒承担钩子职能" in self._squash(self._normalize_prompt("screenplay"))
 
 
 class TestOverviewPrompt:
@@ -594,7 +595,7 @@ class TestDramaDurationSpeechLowerBound:
 
 
 class TestPromptAuthoringPromptGuards:
-    """prompt_authoring（视觉层）prompt 骨架守卫：节奏建议始终注入、schema 枚举不重复列举、
+    """prompt_authoring（视觉层）prompt 骨架守卫：视觉节奏服从定稿分镜、schema 枚举不重复列举、
     无字数硬限制、episode 约束在场且 scene_id 对齐要求不施加固定格式。"""
 
     @staticmethod
@@ -628,7 +629,8 @@ class TestPromptAuthoringPromptGuards:
 
     def test_drama_prompt_injects_pacing(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ARCREEL_PROFILE_DIR", str(tmp_path / "missing-profile"))
-        assert "开篇~4秒承担钩子职能" in self._squash(self._drama_prompt())
+        assert "视觉节奏服从下方已经定稿的分镜内容" in self._squash(self._drama_prompt())
+        assert "不因固定秒数要求改变人物动作与选择" in self._squash(self._drama_prompt())
 
     @pytest.mark.parametrize("instructions", [None, "", "末镜保留雨声。"])
     def test_narration_instructions_are_an_optional_section(self, instructions):

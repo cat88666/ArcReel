@@ -110,7 +110,9 @@ OPEN_DRAFT = ToolDeclaration(
 PATCH_DRAFT = ToolDeclaration(
     name="patch_draft",
     description=(
-        "按 canonical revision 原子替换草稿正文；revision 冲突时拒绝且不写入。"
+        "按 canonical revision 原子修改草稿正文；content 完整替换与 edits 字段替换恰选一个。"
+        '优先用 edits，例如 [{"path":["scenes",3,"utterances"],"value":[...]}]，数组索引从 0 开始。'
+        "路径必须已存在；revision 冲突或任一编辑路径无效时整批拒绝且不写入，晋升仍须通过全量校验。"
         "给出 accept_formal_revision 即接受正式文档的并发修改，给出 source 即更新重判范围，二者显式传 null 同样生效。"
         "回执带新正文与 revision，不含违约：本工具不重判，修改后的违约以 promote_draft 的全量重判为准。"
     ),

@@ -43,7 +43,7 @@ protected: false
 **输出语言**：自然语言字符串值必须使用 {{ target_language }}；JSON 键名 / 枚举值保持英文。{{ variant("text/drama_script_plan/language_rule", source_kind) }}
 **结构约束**：字段 / 枚举 / 必填项由 response_schema 强制；本提示只解释**如何写好每个字段的内容**。
 
-{{ partial("shared/pacing/drama") }}
+{{ variant("text/drama_script_plan/pacing", source_kind) }}
 
 ## 项目信息
 
@@ -100,12 +100,14 @@ protected: false
 - **scene_id**：`E{{ episode }}S{两位序号}` 格式（如 E{{ episode }}S01），按分镜顺序递增，不得用其他集号前缀。
 - **duration_seconds**：
   - 档位：{% if default_duration %}从支持的秒数档位（{{ durations }}）中按画面内容选择：默认 {{ default_duration }} 秒，打斗 / 大场面 / 情绪铺陈等画面可取更长档至 {{ max_duration }} 秒，不要默认选最短档{% else %}从支持的秒数档位（{{ durations }}）中按画面内容复杂度匹配合适时长（最长 {{ max_duration }} 秒），不强制默认值{% endif %}。
-  - 口播下界：先估算该场 utterances（台词）念完约需的秒数（口播语速约 {{ speech_rate }} {{ speech_unit }}/秒），在上述档位里取**不低于**这个秒数的最接近档位。这是单向下界，画面 / 情绪留白可在此之上取更长档位；utterances 为空的分镜没有此下界；若口播估算已超过最长 {{ max_duration }} 秒，取最长档即可，不删减台词。
+  - 口播下界：先估算该场 utterances（台词）念完约需的秒数（口播语速约 {{ speech_rate }} {{ speech_unit }}/秒），在上述档位里取**不低于**这个秒数的最接近档位。这是单向下界，画面 / 情绪留白可在此之上取更长档位；utterances 为空的分镜没有此下界；{{ variant("text/drama_script_plan/overflow_rule", source_kind) }}。
 {% if episode_target_duration %}
   - 单集目标：{{ partial("shared/episode_target_duration_rule") }}。
 {% endif %}
 - **segment_break**：{{ variant("text/drama_script_plan/break_rule", source_kind) }}
-- **characters_in_scene** / **scenes** / **props**：从下列候选中列出此分镜实际出现的资产。
+- **characters_in_scene** / **scenes** / **props**：从下列候选中列出此分镜画面里看得见的资产。每项都会作为参考图发给图像模型：多列的角色会被画成多余的人，漏列的角色画不出本人。
+  - 只被提及、在画外或在车外 / 门外等镜头看不到处的角色不列；画面里出现的角色与必要道具不得漏列；台词说话人须在画面里。
+  - scenes 只列镜头所在的那一个空间（通常一个）。场景参考图画的是该空间本身，镜头在其外部时不列它（如镜头在街上拍马车外观，列街道而不列马车内景）。
   - 候选 characters：[{{ character_names | join(", ") or "（暂无）" }}]
   - 候选 scenes：[{{ scene_names | join(", ") or "（暂无）" }}]
   - 候选 props：[{{ prop_names | join(", ") or "（暂无）" }}]

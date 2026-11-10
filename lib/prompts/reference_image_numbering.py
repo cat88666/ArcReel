@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 #: 类型声明行的 YAML 键，插在 ``Style`` 与 ``Scene`` 之间。
 REFERENCE_IMAGES_KEY = "Reference_Images"
 
-#: 上一分镜图在参考图证据里的角色名。
+#: 上一分镜图在参考图证据里的角色名。分镜图装配已不再带上一分镜图（见 ``storyboard_image_input``），
+#: 保留它只为按原样渲染存量冻结输入。
 PREVIOUS_STORYBOARD_ROLE = "previous_storyboard"
 
 #: 上一分镜图的约束句，随类型声明行发给模型。
@@ -41,7 +42,8 @@ REFERENCE_IMAGES_CLAMPED_WARNING = "ref_too_many_images"
 #: 按资产类型的类型说明；商品条目并入保真要求。
 _TYPE_DESCRIPTIONS: dict[str, str] = {
     "product": "商品参考图，画面中的商品须与之完全一致",
-    "character": "角色参考图",
+    # 角色资产图是三视图（正面在最左）；不点明只取一个人像，模型会把侧面 / 背面画成分身。
+    "character": "角色参考图，每张只取最左侧那一个人像的长相与服装",
     "scene": "场景参考图",
     "prop": "道具参考图",
 }

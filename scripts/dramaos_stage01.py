@@ -30,7 +30,7 @@ from lib.infra.media_probe import MediaProbe, probe_media, probe_video_frame_tim
 
 SCHEMA_VERSION = "1.0"
 MAX_DURATION_SECONDS = 120.0
-SCHEMA_PATH = Path(__file__).resolve().parents[1] / "docs/dramaos/stage-01/schema.json"
+SCHEMA_PATH = Path(__file__).with_name("dramaos-stage01-schema.json")
 
 
 def aligned_shots(

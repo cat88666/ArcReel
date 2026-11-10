@@ -515,7 +515,7 @@ class TestExecuteGridTask:
             {"key": "ref_too_many_images", "params": {"count": 3, "model": "gpt-image-2", "max_count": 2}}
         ]
         prompt = captured[0]["prompt"]
-        assert prompt.startswith("Reference_Images: 图1、图2为角色参考图。")
+        assert prompt.startswith("Reference_Images: 图1、图2为角色参考图，每张只取最左侧那一个人像的长相与服装。")
         assert "图1站在门口" in prompt
         assert "图2站在门口" in prompt
         # 第 3 张没随请求发出，正文只留裸名，不指认一个不存在的图3

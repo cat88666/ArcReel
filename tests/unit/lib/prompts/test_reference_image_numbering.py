@@ -40,13 +40,13 @@ class TestReferenceImagesDeclaration:
     def test_numbers_follow_list_position_and_group_by_type(self):
         references = [_sheet("character", "林清"), _sheet("character", "沈茹/黑化"), _sheet("scene", "书房"), _PREVIOUS]
         assert reference_images_declaration(references) == (
-            f"图1、图2为角色参考图；图3为场景参考图；图4为上一分镜图，{PREVIOUS_STORYBOARD_REFERENCE_DESCRIPTION}。"
+            f"图1、图2为角色参考图，每张只取最左侧那一个人像的长相与服装；图3为场景参考图；图4为上一分镜图，{PREVIOUS_STORYBOARD_REFERENCE_DESCRIPTION}。"
         )
 
     def test_product_images_lead_and_carry_the_fidelity_clause(self):
         references = [_product("保温杯", "sheet"), _product("保温杯", "original"), _sheet("character", "Alice")]
         assert reference_images_declaration(references) == (
-            "图1、图2为商品参考图，画面中的商品须与之完全一致；图3为角色参考图。"
+            "图1、图2为商品参考图，画面中的商品须与之完全一致；图3为角色参考图，每张只取最左侧那一个人像的长相与服装。"
         )
 
     def test_props_and_extra_images_have_their_own_types(self):

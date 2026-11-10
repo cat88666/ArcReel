@@ -38,7 +38,7 @@ class TestPromptUtils:
         assert parsed["Style"] == "Anime"
         assert parsed["Scene"] == "夜雨中的街道"
         assert parsed["Composition"]["shot_type"] == "Medium Shot"
-        assert parsed["Avoid"] == "水印、多余文字、Logo"
+        assert parsed["Avoid"] == "分屏、拼图、同一人物出现多次、水印、多余文字、Logo"
 
     def test_long_values_with_ascii_spaces_stay_on_one_line(self):
         scene = "A rain-soaked neon street at night, " * 6 + "a lone figure walks under a red umbrella."

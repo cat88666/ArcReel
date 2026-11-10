@@ -1,7 +1,7 @@
 """登记依据与期望依据同源：执行器经 ``freeze()`` 得到的依据等于目标态规划器经 ``expected_basis()`` 投影的依据。
 
-同一份项目覆盖衍生引用、商品（资产图 + 原图）与上一分镜图；激活模式下规划器看得到本轮已规划的
-资产图与上一分镜图。生成输入有缺口的目标照常登记，缺口记在依据里，生成仍被拒（ADR 0098）。
+同一份项目覆盖衍生引用与商品（资产图 + 原图）；激活模式下规划器看得到本轮已规划的资产图。
+分镜图不带上一分镜图作参考。生成输入有缺口的目标照常登记，缺口记在依据里，生成仍被拒（ADR 0098）。
 """
 
 from __future__ import annotations
@@ -160,14 +160,13 @@ def _registration_basis(project_dir: Path) -> ArtifactBasis:
         ("source", "保温杯"),
         ("asset_sheet", "张三/劲装"),
         ("asset_sheet", "祠堂"),
-        ("previous_storyboard", "E1S01"),
     ]
     with generation_input.freeze(max_reference_images=2, model="m", bind_claims=_unbound) as frozen:
         return frozen.basis
 
 
 def test_executor_registration_basis_equals_the_planner_expected_basis(tmp_path: Path) -> None:
-    """提交后模式：规划器按磁盘清单判定资产图与上一分镜图可用。"""
+    """提交后模式：规划器按磁盘清单判定资产图可用。"""
 
     project_dir = _project_dir(tmp_path, target_generated=True)
     activate_artifact_target_state(project_dir, bump_schema=False)
@@ -178,7 +177,7 @@ def test_executor_registration_basis_equals_the_planner_expected_basis(tmp_path:
     assert _registration_basis(project_dir) == expected
 
 
-def test_activation_sees_the_sheets_and_previous_storyboard_planned_in_the_same_round(tmp_path: Path) -> None:
+def test_activation_sees_the_sheets_planned_in_the_same_round(tmp_path: Path) -> None:
     """激活模式：清单尚未写入，规划器按本轮已规划的条目判定可用。"""
 
     project_dir = _project_dir(tmp_path, target_generated=True)
@@ -358,8 +357,8 @@ def test_activation_registers_a_derivative_whose_owner_sheet_lost_its_original(t
     assert _absent(resolve_current_artifact_basis(project_dir, derivative)) == []
 
 
-def test_moving_a_shot_stales_the_storyboards_whose_previous_storyboard_changed(tmp_path: Path) -> None:
-    """上一分镜图是分镜图的输入：改序后上一条变了的分镜图转为过期，没变的保持 current。"""
+def test_moving_a_shot_keeps_its_storyboards_current(tmp_path: Path) -> None:
+    """上一分镜图不是分镜图的输入：改序不让任何分镜图过期。"""
 
     project_dir = _project_dir(tmp_path / "projects", target_generated=True)
     script_path = project_dir / "scripts" / "episode_1.json"
@@ -392,4 +391,4 @@ def test_moving_a_shot_stales_the_storyboards_whose_previous_storyboard_changed(
         ).status.value
         for shot_id in ("E1S01", "E1S02", "E1S03")
     }
-    assert statuses == {"E1S03": "stale", "E1S01": "stale", "E1S02": "current"}
+    assert statuses == {"E1S03": "current", "E1S01": "current", "E1S02": "current"}

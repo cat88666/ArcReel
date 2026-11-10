@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Annotated, Any, Literal, NamedTuple, Protocol, cast
+from typing import Annotated, Any, Literal, NamedTuple, Protocol, Self, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 from lib.artifacts.artifact_manifest import ArtifactBasis
@@ -138,10 +139,27 @@ class DraftLocator(_DraftRequest):
     )
 
 
+class DraftFieldEdit(BaseModel):
+    """替换草稿正文内一个已存在的字段或数组元素。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: list[Annotated[str, Field(strict=True)] | Annotated[int, Field(strict=True, ge=0)]] = Field(
+        min_length=1,
+        description='正文中的字段路径；字符串为对象键，整数为从 0 开始的数组索引，如 ["scenes", 3, "utterances"]',
+    )
+    value: Any = Field(description="替换值；路径必须已存在，不修改其他字段")
+
+
 class PatchDraftRequest(_DraftRequest):
     """``accept_formal_revision`` 与 ``source`` 以「是否出现」区分省略与显式 null：省略即不接受 / 不改。"""
 
-    content: dict[str, Any] = Field(description="替换后的完整草稿正文；允许中间态不通过业务校验")
+    content: dict[str, Any] | SkipJsonSchema[None] = Field(
+        default=None, description="替换后的完整草稿正文；与 edits 恰选一个，允许中间态不通过业务校验"
+    )
+    edits: Annotated[list[DraftFieldEdit], Field(min_length=1)] | SkipJsonSchema[None] = Field(
+        default=None, description="按顺序替换指定字段，避免复制整份正文；与 content 恰选一个"
+    )
     base_revision: str = Field(description=_DRAFT_REVISION_DESCRIPTION)
     accept_formal_revision: str | None = Field(
         default=None,
@@ -154,6 +172,15 @@ class PatchDraftRequest(_DraftRequest):
         default=None,
         description="可选源文范围；仅在修正 script_plan 草稿的重判范围时提供，null 清除范围，省略则保持不变",
     )
+
+    @model_validator(mode="after")
+    def require_one_patch_mode(self) -> Self:
+        """拒绝缺失、空值或同时提供两种正文修改方式。"""
+        if ("content" in self.model_fields_set) == ("edits" in self.model_fields_set):
+            raise ValueError("provide exactly one of content or edits")
+        if self.content is None and self.edits is None:
+            raise ValueError("content or edits must not be null")
+        return self
 
 
 class PromoteDraftRequest(_DraftRequest):
@@ -195,6 +222,27 @@ class DraftWorkflowError(Exception):
     @classmethod
     def video_facts(cls, failure: VideoRequestFactsFailure) -> DraftWorkflowError:
         return cls(failure.code, video_facts_failure_text(failure), failure=failure)
+
+
+def _apply_draft_edits(content: dict[str, Any], edits: list[DraftFieldEdit]) -> dict[str, Any]:
+    """在副本上依次替换已有路径；任一路径无效时不返回部分结果。"""
+    candidate = copy.deepcopy(content)
+    for index, edit in enumerate(edits):
+        node: Any = candidate
+        for position, key in enumerate(edit.path):
+            if isinstance(node, dict) and isinstance(key, str) and key in node:  # noqa: SIM114 - 保留 dict/list 键类型收窄
+                if position == len(edit.path) - 1:
+                    node[key] = copy.deepcopy(edit.value)
+                else:
+                    node = node[key]
+            elif isinstance(node, list) and isinstance(key, int) and 0 <= key < len(node):
+                if position == len(edit.path) - 1:
+                    node[key] = copy.deepcopy(edit.value)
+                else:
+                    node = node[key]
+            else:
+                raise DraftWorkflowError("invalid_request", f"edits[{index}].path does not exist: {edit.path!r}")
+    return candidate
 
 
 class ReferenceDraftRevalidation(NamedTuple):
@@ -570,7 +618,7 @@ def _render_script_plan_conflict_report(
         f"盘上现值指纹: {actual_literal}\n\n"
         f"{latest_block}\n\n"
         f"处置：调用 open_draft 读取当前草稿与 formal_revision，对照上方最新内容合并 {field_hint}；"
-        "再调用 patch_draft 提交完整 content，并把 formal_revision 作为 accept_formal_revision；"
+        "再调用 patch_draft 提交 content 或 edits，并把 formal_revision 作为 accept_formal_revision；"
         "该值为 null 时同样显式传入 null；"
         f'最后调用 {PROMOTE_TOOL_NAME}({{"episode_id": {episode}, "doc_type": "{doc_type}", '
         '"base_revision": "<patch_draft 返回的新 revision>"}) 重新晋升。'
@@ -593,7 +641,7 @@ def _render_prompt_authoring_conflict_report(
         f"盘上现值指纹: {json.dumps(script_review.published_revision(conflict.actual))}\n\n"
         f"当前正式剧本的最新内容：\n{latest}\n\n"
         "处置：调用 open_draft 读取当前草稿与 formal_revision，合并最新正式内容；"
-        "再调用 patch_draft 提交完整 content，并把 formal_revision 作为 accept_formal_revision；"
+        "再调用 patch_draft 提交 content 或 edits，并把 formal_revision 作为 accept_formal_revision；"
         "该值为 null 时同样显式传入 null；"
         f'最后调用 {PROMOTE_TOOL_NAME}({{"episode_id": {episode}, "doc_type": "reference_prompt_authoring", '
         '"base_revision": "<patch_draft 返回的新 revision>"}) 重新晋升。'
@@ -1328,13 +1376,14 @@ class DraftWorkflow:
         self,
         episode: int,
         resolved: str,
-        content: dict[str, Any],
+        content: dict[str, Any] | None,
         base_revision: str,
         accept_formal_revision: str | None,
         accepts_formal_revision: bool,
         source: str | None,
         updates_source: bool,
         before_commit: Callable[[], None] | None,
+        edits: list[DraftFieldEdit] | None,
     ) -> dict[str, Any]:
         path = quarantine_path(self.ctx.project_path, episode, resolved)
         draft = read_quarantine(self.ctx.project_path, episode, resolved)
@@ -1349,6 +1398,9 @@ class DraftWorkflow:
                 f"draft revision changed: expected {base_revision}, actual {actual_revision}",
             )
         self._reject_confirmed_script_plan_edit(episode, resolved, draft)
+        if edits is not None:
+            content = _apply_draft_edits(draft.content, edits)
+        assert content is not None
         meta = draft.meta
         if updates_source:
             if resolved == QUARANTINE_KIND_PROMPT_AUTHORING:
@@ -1389,7 +1441,7 @@ class DraftWorkflow:
         self,
         episode: int,
         doc_type: str,
-        content: dict[str, Any],
+        content: dict[str, Any] | None,
         base_revision: str,
         accept_formal_revision: str | None = None,
         accepts_formal_revision: bool = False,
@@ -1397,7 +1449,10 @@ class DraftWorkflow:
         updates_source: bool = False,
         *,
         before_commit: Callable[[], None] | None = None,
+        edits: list[DraftFieldEdit] | None = None,
     ) -> dict[str, Any]:
+        if (content is None) == (edits is None) or edits == []:
+            raise DraftWorkflowError("invalid_request", "provide exactly one of content or non-empty edits")
         resolved = await self._kind(episode, doc_type)
         _, path, locks = await asyncio.to_thread(self._quarantine_lock_target, episode, resolved)
         async with locks.async_file_lock(path):
@@ -1412,6 +1467,7 @@ class DraftWorkflow:
                 source,
                 updates_source,
                 before_commit,
+                edits,
             )
 
     async def promote(
