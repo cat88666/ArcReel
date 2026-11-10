@@ -11,6 +11,8 @@ Contributions of code, bug reports, and feature proposals are welcome.
 
 Contributions whose main purpose is to promote a commercial service (for example, adding an integration for one particular service, or adding service recommendations and links to the docs) do not go through the PR process, and such PRs will be closed. For collaboration, contact support@arc-reel.com.
 
+Issues labeled `ready-for-agent` already have implementation notes and are implemented by the maintainers' coding Agent. An external PR will not get them done sooner; it only adds another round of review, so such PRs will be closed.
+
 Before developing a new feature or making a large-scale change, open an issue to discuss the direction first.
 
 Before a PR can be merged, its author must sign the CLA. CLA Assistant posts the signing link as a PR comment.
@@ -39,6 +41,9 @@ uv run alembic upgrade head
 # Note: --reload-dir is required to limit the watched directories; otherwise watchfiles scans
 # node_modules / .venv / .git / .worktrees and hundreds of thousands of files, using over 50% of one CPU core
 uv run uvicorn server.app:app --reload --reload-dir server --reload-dir lib --port 1241
+# On native Windows, drop --reload: with reload enabled, uvicorn on Windows switches to an event loop
+# that cannot create subprocesses, so the built-in Agent cannot launch Claude Code. Restart the backend manually after code changes
+uv run uvicorn server.app:app --port 1241
 
 # Start the frontend (terminal 2)
 cd frontend && pnpm dev
@@ -122,6 +127,7 @@ Published pages also declare their documentation-refresh coverage tier via the `
 | `website/docs/guide/comfyui.md` | Importing ComfyUI workflows, node binding, conversion semantics for size/duration/seed, testing, and runtime limits | Deploying ComfyUI itself or installing custom nodes |
 | `website/docs/guide/market.md` | Managing market sources, confirming installation of market entries, updating, and uninstalling | Contribution workflow and steps for hosting a market source (the official market source repository docs are authoritative) |
 | `website/docs/guide/jianying-export.md` | Locating the Jianying draft directory, exporting, and further editing steps | The video generation process itself |
+| `website/docs/guide/files-and-trash.md` | File view roles and actions, deletion and restore rules per object type, project trash retention and cleanup, deleted projects, and what the Agent can delete and restore | Deployment-level backup and directory layout (covered by the deployment page) |
 | `website/docs/guide/faq.md` | Frequently asked questions and short answers | Long tutorials |
 | `website/docs/ops/deployment.md` | Deployment, upgrades, backup, recovery, monitoring, and security | Product marketing copy |
 | `website/docs/ops/migrate-to-postgres.md` | SQLite-to-PostgreSQL migration, verification, and rollback steps | Day-to-day PostgreSQL deployment and operations guidance |

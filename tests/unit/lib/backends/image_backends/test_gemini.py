@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,6 +10,7 @@ import pytest
 from PIL import Image as PILImage
 
 from lib.backends.image_backends.base import ImageCapability, ImageGenerationRequest, ReferenceImage
+from tests.unit.lib.backends.write_cancel_gate import WriteGate, cancel_during_write
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -92,15 +94,15 @@ class TestProperties:
         assert ImageCapability.TEXT_TO_IMAGE in caps
         assert ImageCapability.IMAGE_TO_IMAGE in caps
 
-    @pytest.mark.parametrize("model", ["gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"])
-    def test_declares_gemini_3_reference_image_limit(self, fake_rate_limiter, patch_genai, model):
-        # Gemini 3 图像模型官方上限：单请求最多混合 14 张参考图。
+    @pytest.mark.parametrize("model", ["gemini-3-pro-image-preview", "gemini-2.5-flash-image"])
+    def test_channel_declares_no_reference_limit_by_model_name(self, fake_rate_limiter, patch_genai, model):
+        # 各代 Gemini 图像模型的参考图上限是模型事实，记在条目上；通道本身不限张数。
         from lib.backends.image_backends.gemini import GeminiImageBackend
 
         backend = GeminiImageBackend(
             backend_type="aistudio", api_key="fake-key", rate_limiter=fake_rate_limiter, image_model=model
         )
-        assert backend.max_reference_images == 14
+        assert asyncio.run(backend.reference_image_limit()) is None
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +147,31 @@ class TestGenerate:
         assert result.usage.quantities == {"output_images": 1}
         assert result.usage.dimensions == {}
 
+    async def test_save_settles_through_cancellation(self, backend_aistudio, tmp_path):
+        """供应商已返回图片：取消落在解码保存期间时，保存先结算，取消随之消失，后续转码与产物提交照常执行。"""
+        gate = WriteGate()
+        output_file = tmp_path / "out.png"
+
+        class _BlockingImage:
+            def save(self, path):
+                gate.block()
+                PILImage.new("RGB", (8, 8), "red").save(path)
+
+        mock_part = MagicMock()
+        mock_part.inline_data = b"fake"
+        mock_part.as_image.return_value = _BlockingImage()
+        mock_response = MagicMock()
+        mock_response.parts = [mock_part]
+        backend_aistudio._client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+        steps = await cancel_during_write(
+            lambda: backend_aistudio.generate(ImageGenerationRequest(prompt="a red ball", output_path=output_file)),
+            gate,
+        )
+
+        assert steps == ["follow-up"]
+        assert PILImage.open(output_file).size == (8, 8)
+
     async def test_generate_with_reference_images(self, backend_aistudio, tmp_path):
         """参考图按顺序作为图片内容送入 SDK，prompt 置于末尾，中间不夹任何名称标签。"""
         output_file = tmp_path / "out.png"
@@ -175,8 +202,8 @@ class TestGenerate:
         assert isinstance(contents[0], PILImage.Image)
         assert contents[1] == "draw character"
 
-    async def test_generate_truncates_references_over_the_declared_limit(self, backend_aistudio, tmp_path):
-        """编排层未裁剪时的兜底：只把前 max_reference_images 张送入 SDK，prompt 仍在末尾。"""
+    async def test_generate_sends_every_reference_before_the_prompt(self, backend_aistudio, tmp_path):
+        """裁剪归编排层（按生效上限）：通道把收到的参考图全部送入 SDK，prompt 仍在末尾。"""
         refs = []
         for index in range(16):
             ref_path = tmp_path / f"ref{index}.png"
@@ -194,7 +221,7 @@ class TestGenerate:
         )
 
         contents = backend_aistudio._client.aio.models.generate_content.call_args.kwargs["contents"]
-        assert len(contents) == backend_aistudio.max_reference_images + 1 == 15
+        assert len(contents) == 17
         assert contents[-1] == "merge"
 
     async def test_generate_raises_on_empty_response(self, backend_aistudio, tmp_path):

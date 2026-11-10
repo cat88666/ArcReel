@@ -36,6 +36,7 @@ import type {
   ProjectEventSnapshotPayload,
   ProjectDeletedPayload,
   AssistantSessionResumedPayload,
+  AutoBackendsResponse,
   GetSystemConfigResponse,
   GetSystemVersionResponse,
   NarrationDefaultsResponse,
@@ -47,6 +48,22 @@ import type {
   OnboardingStatus,
   SystemConfigPatch,
   ApiKeyInfo,
+  AssetLibraryAccount,
+  AssetLibraryAccountList,
+  AssetLibraryBindableCredential,
+  AssetLibraryBindingStatus,
+  AssetLibraryCredentialType,
+  CreateAssetLibraryAccountPayload,
+  NewImageTarget,
+  SavedObjectStorageConnection,
+  ObjectStorageCleanupResult,
+  ObjectStorageSettings,
+  ProviderAssetImportResult,
+  ProviderAssetLink,
+  ProviderAssetLinkPanel,
+  ProviderAssetPage,
+  SaveObjectStorageConnectionPayload,
+  UpdateAssetLibraryAccountPayload,
   CreateApiKeyResponse,
   ProviderInfo,
   CatalogEntryHit,
@@ -113,6 +130,7 @@ import type {
   ReferenceGenerationRequestOptions,
   ReferenceBatchAdmission,
   ReferenceBatchGenerateRequest,
+  ReferenceBatchPreview,
   ScriptPreview,
   ReferenceUnitPromptPreview,
   ItemPromptPreview,
@@ -142,6 +160,13 @@ import type {
 } from "@/types/presentation";
 import type { Asset, AssetType, AssetCreatePayload, AssetListPage, AssetUpdatePayload } from "@/types/asset";
 import type { AgentMemoryOverview, AgentMemoryScope } from "@/types/agent-memory";
+import type {
+  DeletedProjectListing,
+  FileViewListing,
+  RestoreResult,
+  TrashListing,
+  TrashRecord,
+} from "@/types/file-view";
 import type {
   EpisodeNextStep,
   WorkflowMigrationReport,
@@ -215,6 +240,7 @@ import {
 } from "./api/errors";
 import type {
   AgentProfileStatus,
+  AssetCreateResult,
   AssetDeletionPreview,
   AssetMergeResult,
   AssetRenameResult,
@@ -247,6 +273,7 @@ export {
 } from "./api/errors";
 export type {
   AgentProfileStatus,
+  AssetCreateResult,
   AssetDeletionPreview,
   AssetMergeEpisodeImpact,
   AssetMergeResult,
@@ -423,6 +450,11 @@ class API {
     return this.request("/system/config/model-candidates", { signal: options.signal });
   }
 
+  /** 「自动选择」的实际模型：各用途在全部层留空时后端自动选中的模型，供应商配置变化后需重取。 */
+  static async getAutoBackends(options: { signal?: AbortSignal } = {}): Promise<AutoBackendsResponse> {
+    return this.request("/system/config/auto-backends", { signal: options.signal });
+  }
+
   /** 新建 TTS 项目的预填值（全局默认的 TTS 模型、音色与语速）。 */
   static async getNarrationDefaults(
     options: { signal?: AbortSignal } = {},
@@ -430,7 +462,7 @@ class API {
     return this.request("/system/narration-defaults", { signal: options.signal });
   }
 
-  /** 所选 TTS 模型（provider/model）的能力，目前只回答是否支持配音语速。 */
+  /** 所选 TTS 模型（provider/model）的能力：是否支持配音语速，以及它所用调用端点的音色表。 */
   static async getTtsModelCapabilities(
     backend: string,
     options: { signal?: AbortSignal } = {},
@@ -558,6 +590,69 @@ class API {
 
   // ==================== Agent 记忆 ====================
 
+  // ==================== 文件视图 ====================
+
+  /** 列出项目目录（`path` 为空串时是项目根）的直接子项，大目录按需逐级展开。 */
+  static async getFileView(
+    projectName: string,
+    path: string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<FileViewListing> {
+    const query = new URLSearchParams({ path }).toString();
+    return this.request(`/projects/${encodeURIComponent(projectName)}/file-view?${query}`, { signal: options.signal });
+  }
+
+  /** 读取单个文件的原始内容，用于预览与下载；鉴权接口，所以取 Blob 而不是给出可直接打开的地址。 */
+  static async getFileViewContent(
+    projectName: string,
+    path: string,
+    options: { download?: boolean; signal?: AbortSignal } = {}
+  ): Promise<Blob> {
+    const query = new URLSearchParams({ path, ...(options.download ? { download: "true" } : {}) }).toString();
+    const url = `/projects/${encodeURIComponent(projectName)}/file-view/content?${query}`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url, { signal: options.signal }));
+    await throwIfNotOk(response, i18n.t("errors:file_view_load_failed"));
+    return response.blob();
+  }
+
+  /** 把一个未引用文件或非当前的历史版本移进项目回收站；其余角色由服务端拒绝。 */
+  static async deleteFileViewEntry(projectName: string, path: string): Promise<{ record: TrashRecord }> {
+    const query = new URLSearchParams({ path }).toString();
+    return this.request(`/projects/${encodeURIComponent(projectName)}/file-view?${query}`, { method: "DELETE" });
+  }
+
+  // ==================== 项目回收站 ====================
+
+  static async getTrash(projectName: string, options: { signal?: AbortSignal } = {}): Promise<TrashListing> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/trash`, { signal: options.signal });
+  }
+
+  static async restoreTrashRecord(projectName: string, recordId: string): Promise<RestoreResult> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/trash/${encodeURIComponent(recordId)}/restore`,
+      { method: "POST" },
+    );
+  }
+
+  /** 下载删除记录里的一个被删文件（降级恢复后只能下载的结构文件）。 */
+  static async downloadTrashRecordFile(projectName: string, recordId: string, path: string): Promise<Blob> {
+    const query = new URLSearchParams({ path }).toString();
+    const url = `/projects/${encodeURIComponent(projectName)}/trash/${encodeURIComponent(recordId)}/files?${query}`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url));
+    await throwIfNotOk(response, i18n.t("errors:file_view_load_failed"));
+    return response.blob();
+  }
+
+  static async purgeTrashRecord(projectName: string, recordId: string): Promise<{ success: boolean }> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/trash/${encodeURIComponent(recordId)}`, {
+      method: "DELETE",
+    });
+  }
+
+  static async emptyTrash(projectName: string): Promise<{ purged: number }> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/trash`, { method: "DELETE" });
+  }
+
   /**
    * 用户记忆与项目记忆的接口形状完全一致，只有路径前缀不同；两级共用同一组方法，
    * 调用点（同一个文件柜组件）因此只换 scope，不换调用。
@@ -617,6 +712,19 @@ class API {
     return this.request(`/projects/${encodeURIComponent(name)}`, {
       method: "DELETE",
     });
+  }
+
+  static async listDeletedProjects(options: { signal?: AbortSignal } = {}): Promise<DeletedProjectListing> {
+    return this.request("/deleted-projects", { signal: options.signal });
+  }
+
+  /** 整体恢复已删除项目；原名被占用时服务端加后缀，返回恢复后的项目名。 */
+  static async restoreDeletedProject(id: string): Promise<{ name: string }> {
+    return this.request(`/deleted-projects/${encodeURIComponent(id)}/restore`, { method: "POST" });
+  }
+
+  static async purgeDeletedProject(id: string): Promise<{ success: boolean }> {
+    return this.request(`/deleted-projects/${encodeURIComponent(id)}`, { method: "DELETE" });
   }
 
   /**
@@ -924,7 +1032,7 @@ class API {
     name: string,
     description: string,
     voiceStyle: string = ""
-  ): Promise<SuccessResponse> {
+  ): Promise<AssetCreateResult> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/characters`,
       {
@@ -956,7 +1064,7 @@ class API {
 
   /**
    * 衍生是挂在角色下的子身份（换装、变身、易容），名字只在该角色内唯一，脚本中写作
-   * `@[角色/衍生]`。以下四个方法只做登记；资产图的读取与生成见本节末尾两个方法，版本与
+   * `@[角色/衍生]`。以下四个方法只做登记；资产图的读取、生成与上传见本节末尾三个方法，版本与
    * 图片编辑复用通用端点（资源类型 `character_derivatives` / `character_derivative`）。
    */
   static async addCharacterDerivative(
@@ -1041,6 +1149,22 @@ class API {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/generate/character/${encodeURIComponent(charName)}/derivatives/${encodeURIComponent(derivativeName)}`,
       { method: "POST" }
+    );
+  }
+
+  /**
+   * 上传一张图替换衍生资产图，成为该衍生的当前版本并进入版本历史。上传的图是成品：
+   * 不需要本体资产图，本体资产图重生成或改外观变化都不让它过期。
+   */
+  static async uploadCharacterDerivativeSheet(
+    projectName: string,
+    charName: string,
+    derivativeName: string,
+    file: File
+  ): Promise<ShotUploadResult> {
+    return API.postFileUpload<ShotUploadResult>(
+      `${derivativesPath(projectName, charName)}/${encodeURIComponent(derivativeName)}/upload`,
+      file
     );
   }
 
@@ -1131,7 +1255,7 @@ class API {
     projectName: string,
     name: string,
     description: string
-  ): Promise<SuccessResponse> {
+  ): Promise<AssetCreateResult> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/scenes`,
       {
@@ -1161,7 +1285,7 @@ class API {
     projectName: string,
     name: string,
     description: string
-  ): Promise<SuccessResponse> {
+  ): Promise<AssetCreateResult> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/props`,
       {
@@ -1193,7 +1317,7 @@ class API {
     description: string,
     brand?: string,
     sellingPoints?: string[]
-  ): Promise<SuccessResponse> {
+  ): Promise<AssetCreateResult> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/products`,
       {
@@ -3362,6 +3486,126 @@ class API {
     });
   }
 
+  // ==================== 对象存储与供应商素材库 ====================
+
+  static async getObjectStorageConnection(options: { signal?: AbortSignal } = {}): Promise<ObjectStorageSettings> {
+    return this.request("/object-storage/connection", { signal: options.signal });
+  }
+
+  static async saveNewImageTarget(target: NewImageTarget): Promise<{ target: NewImageTarget }> {
+    return this.request("/object-storage/new-image-target", { method: "PUT", body: JSON.stringify({ target }) });
+  }
+
+  static async saveObjectStorageConnection(data: SaveObjectStorageConnectionPayload): Promise<SavedObjectStorageConnection> {
+    return this.request("/object-storage/connection", { method: "PUT", body: JSON.stringify(data) });
+  }
+
+  static async deleteObjectStorageConnection(deleteRemoteObjects = true): Promise<ObjectStorageCleanupResult> {
+    return this.request(`/object-storage/connection?delete_remote_objects=${deleteRemoteObjects}`, { method: "DELETE" });
+  }
+
+  static async checkObjectStorageConnection(): Promise<{ success: boolean }> {
+    return this.request("/object-storage/connection/test", { method: "POST" });
+  }
+
+  static async listAssetLibraryAccounts(options: { signal?: AbortSignal } = {}): Promise<AssetLibraryAccountList> {
+    return this.request("/asset-library/accounts", { signal: options.signal });
+  }
+
+  static async createAssetLibraryAccount(data: CreateAssetLibraryAccountPayload): Promise<AssetLibraryAccount> {
+    return this.request("/asset-library/accounts", { method: "POST", body: JSON.stringify(data) });
+  }
+
+  static async updateAssetLibraryAccount(
+    accountId: number,
+    data: UpdateAssetLibraryAccountPayload,
+  ): Promise<AssetLibraryAccount> {
+    return this.request(`/asset-library/accounts/${accountId}`, { method: "PATCH", body: JSON.stringify(data) });
+  }
+
+  static async deleteAssetLibraryAccount(accountId: number): Promise<void> {
+    return this.request(`/asset-library/accounts/${accountId}`, { method: "DELETE" });
+  }
+
+  static async listAssetLibraryBindings(
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ credentials: AssetLibraryBindableCredential[] }> {
+    return this.request("/asset-library/bindings", { signal: options.signal });
+  }
+
+  /** 按推理凭证与账号的当前内容确认绑定；首次绑定、改绑与重新确认都走这里。 */
+  static async confirmAssetLibraryBinding(
+    credentialType: AssetLibraryCredentialType,
+    credentialId: number,
+    accountId: number,
+  ): Promise<{ account_id: number; status: AssetLibraryBindingStatus }> {
+    return this.request(`/asset-library/bindings/${credentialType}/${credentialId}`, {
+      method: "PUT",
+      body: JSON.stringify({ account_id: accountId }),
+    });
+  }
+
+  static async deleteAssetLibraryBinding(credentialType: AssetLibraryCredentialType, credentialId: number): Promise<void> {
+    return this.request(`/asset-library/bindings/${credentialType}/${credentialId}`, { method: "DELETE" });
+  }
+
+  static async listProviderAssets(
+    accountId: number,
+    params: { page: number; pageSize: number },
+    options: { signal?: AbortSignal } = {},
+  ): Promise<ProviderAssetPage> {
+    const query = new URLSearchParams({ page: String(params.page), page_size: String(params.pageSize) });
+    return this.request(`/asset-library/accounts/${accountId}/assets?${query.toString()}`, { signal: options.signal });
+  }
+
+  /** 图片当前选中版本在各个素材库范围里的关联与入库状态。 */
+  static async getProviderAssetLinks(
+    projectName: string,
+    resourceType: string,
+    resourceId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<ProviderAssetLinkPanel> {
+    const query = new URLSearchParams({ resource_type: resourceType, resource_id: resourceId });
+    return this.request(`/projects/${encodeURIComponent(projectName)}/provider-asset-links?${query.toString()}`, {
+      signal: options.signal,
+    });
+  }
+
+  /** 把图片当前选中的版本上传到素材库账号；立即返回入库任务，之后按状态轮询。 */
+  static async uploadToProviderAssetLibrary(
+    projectName: string,
+    body: { resource_type: string; resource_id: string; account_id: number },
+  ): Promise<ProviderAssetLink> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/provider-asset-links`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /** 从素材库选择一张可用的图片：取回原图保存为新版本，并为这个版本建立关联。 */
+  static async importProviderAsset(
+    projectName: string,
+    body: { resource_type: string; resource_id: string; account_id: number; asset_id: string },
+  ): Promise<ProviderAssetImportResult> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/provider-asset-links/import`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /** 解除关联：只解除当前关系，不删除 ArcReel 图片或供应商素材。 */
+  static async unlinkProviderAsset(projectName: string, linkId: number): Promise<void> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/provider-asset-links/${linkId}`, {
+      method: "DELETE",
+    });
+  }
+
+  static async refreshProviderAssetLink(projectName: string, linkId: number): Promise<ProviderAssetLink> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/provider-asset-links/${linkId}/refresh`, {
+      method: "POST",
+    });
+  }
+
   // ==================== Provider 凭证管理 API ====================
 
   static async listCredentials(providerId: string, options: { signal?: AbortSignal } = {}): Promise<{ credentials: ProviderCredential[] }> {
@@ -4192,6 +4436,19 @@ class API {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}/generate`,
       { method: "POST", body: JSON.stringify(options) },
+    );
+  }
+
+  /** 批量生成的准入预览：与提交同一份结论与预估费用，不建任务，供确认框列名单。 */
+  static async previewReferenceVideoBatch(
+    projectName: string,
+    episode: number,
+    payload: ReferenceBatchGenerateRequest,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<ReferenceBatchPreview> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/generate-batch/preview`,
+      { method: "POST", body: JSON.stringify(payload), signal: options.signal },
     );
   }
 

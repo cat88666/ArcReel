@@ -19,13 +19,12 @@
 发给 API 的模型名取 ``api_model_name``（registry 解耦键名与 API 名，供两栖模型共用 API 名），缺省回退
 到 registry 键名——不硬发键名，否则别名键会把 ``kling-v3-omni-image`` 误当 API 模型名。
 
-resolution（1K/2K/4K）由 registry 声明驱动 UI 下拉与计费，不下传请求体：可灵图像官方关键参数
-（model_name/prompt/image/aspect_ratio/n 等）未含 resolution 字段，与 KlingVideoBackend 一致只发
-已核实参数，避免猜测外部 API 结构。
+resolution 由模型目录声明可选档位，请求按 API 要求转为小写，计费维度使用大写档位。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import ClassVar
@@ -59,19 +58,14 @@ _IMAGE_ENDPOINT = "images/generations"
 _POLL_INTERVAL_SECONDS = 5.0
 _POLL_MAX_WAIT_SECONDS = 600.0
 
-# 各图像模型参考图上限（多图主体，按 registry 键名）：o1 / v3-omni 均支持多图主体，官方 o1 上限 10 张。
-_DEFAULT_REF_LIMIT = 10
-_MODEL_REF_LIMITS: dict[str, int] = {
-    "kling-image-o1": 10,
-    "kling-v3-omni-image": 10,
-}
-
 
 class KlingImageBackend(KlingBackendBase):
     """可灵 Kling 图像后端（异步轮询，JWT / Bearer 双模式）。"""
 
     # 文生图与图生图（多图主体）同一端点。
     CHANNEL_CAPABILITIES: ClassVar[frozenset[ImageCapability]] = BOTH_IMAGE_CAPABILITIES
+    # 通道本身不限参考图张数：各图像模型多图主体的上限是模型事实，记在条目上。
+    CHANNEL_REFERENCE_LIMIT: ClassVar[int | None] = None
 
     _media_label = "图像"
 
@@ -105,9 +99,8 @@ class KlingImageBackend(KlingBackendBase):
     def capabilities(self) -> set[ImageCapability]:
         return set(self.CHANNEL_CAPABILITIES)
 
-    @property
-    def max_reference_images(self) -> int:
-        return _MODEL_REF_LIMITS.get(self._model, _DEFAULT_REF_LIMIT)
+    async def reference_image_limit(self) -> int | None:
+        return self.CHANNEL_REFERENCE_LIMIT
 
     # ── request building ────────────────────────────────────────────────
 
@@ -119,13 +112,15 @@ class KlingImageBackend(KlingBackendBase):
             "aspect_ratio": request.aspect_ratio,
             "n": 1,
         }
+        if request.image_size:
+            payload["resolution"] = request.image_size.lower()
         images = self._encode_references(request.reference_images)
         if images:
             payload["image"] = images
         return payload
 
     def _encode_references(self, reference_images: list[ReferenceImage]) -> list[str]:
-        """参考图 → 纯 base64 列表（无 data URI 前缀）；超上限截断，缺失/不可读 fail-loud。"""
+        """参考图 → 纯 base64 列表（无 data URI 前缀）；缺失/不可读 fail-loud。"""
         if not reference_images:
             return []
         encoded: list[str] = []
@@ -147,14 +142,6 @@ class KlingImageBackend(KlingBackendBase):
             raise ImageCapabilityError(
                 "image_reference_images_unreadable", model=self._model, names=", ".join(unreadable)
             )
-        if len(encoded) > self.max_reference_images:
-            logger.warning(
-                "Kling 参考图数量 %d 超过 model=%s 上限 %d，截断",
-                len(encoded),
-                self._model,
-                self.max_reference_images,
-            )
-            encoded = encoded[: self.max_reference_images]
         return encoded
 
     @staticmethod
@@ -170,7 +157,7 @@ class KlingImageBackend(KlingBackendBase):
             "model_name": payload.get("model_name"),
             "aspect_ratio": payload.get("aspect_ratio"),
             "n": payload.get("n"),
-            "reference_count": len(images) if isinstance(images, list) else 0,
+            "reference_count": len(images) if isinstance(images, list) else int(bool(images)),
             "prompt_len": len(prompt) if isinstance(prompt, str) else 0,
         }
 
@@ -178,13 +165,15 @@ class KlingImageBackend(KlingBackendBase):
 
     @staticmethod
     def estimate_usage(facts: ImageRequestFacts) -> Usage:
-        """请求体不带分辨率（见模块说明），不报分辨率，按价目表的默认档计。"""
-        refs = facts.reference_count
-        limit = _MODEL_REF_LIMITS.get(facts.model, _DEFAULT_REF_LIMIT)
-        return per_image_usage(output_images=1, input_images=None if refs is None else min(refs, limit))
+        """按实际发送的分辨率与参考图数预估用量。"""
+        return per_image_usage(
+            output_images=1,
+            input_images=facts.reference_count,
+            dimensions={"resolution": facts.image_size.upper()} if facts.image_size else None,
+        )
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
-        payload = self._build_payload(request)
+        payload = await asyncio.to_thread(self._build_payload, request)
         logger.info("调用 Kling 图像 API payload=%s", self._safe_log_view(payload))
         async with artifact_http_client(timeout=self._http_timeout, transport_layer=self._transport_layer) as client:
             task_id = await self._submit_task(client, _IMAGE_ENDPOINT, payload)
@@ -201,12 +190,42 @@ class KlingImageBackend(KlingBackendBase):
         await download_image_to_path(download_url, request.output_path)
         logger.info("Kling 图像下载完成: %s", request.output_path)
 
+        images = payload.get("image")
         return ImageGenerationResult(
             image_path=request.output_path,
             provider=PROVIDER_KLING,
             model=self._model,
             image_uri=download_url,
             seed=request.seed,
-            # 请求体不带分辨率，不报分辨率。
-            usage=per_image_usage(output_images=1, input_images=len(payload.get("image", []))),
+            usage=per_image_usage(
+                output_images=1,
+                input_images=len(images) if isinstance(images, list) else int(bool(images)),
+                dimensions={"resolution": payload["resolution"].upper()} if "resolution" in payload else None,
+            ),
         )
+
+
+class KlingSingleImageBackend(KlingImageBackend):
+    """可灵单参考图通道：``image`` 是纯 base64 字符串。"""
+
+    CHANNEL_REFERENCE_LIMIT: ClassVar[int | None] = 1
+
+    def _build_payload(self, request: ImageGenerationRequest) -> dict:
+        limit = self.CHANNEL_REFERENCE_LIMIT
+        if limit is not None and len(request.reference_images) > limit:
+            raise ImageCapabilityError(
+                "image_reference_images_exceeded",
+                model=self._model,
+                limit=limit,
+                count=len(request.reference_images),
+            )
+        payload = super()._build_payload(request)
+        if images := payload.get("image"):
+            payload["image"] = images[0]
+        return payload
+
+
+KLING_IMAGE_BACKENDS: dict[str, type[KlingImageBackend]] = {
+    "kling-image": KlingImageBackend,
+    "kling-image-single": KlingSingleImageBackend,
+}

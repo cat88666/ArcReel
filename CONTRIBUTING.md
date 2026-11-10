@@ -4,7 +4,9 @@
 
 以推广某项商业服务为主要目的的贡献（例如新增某家服务的接入，或在文档中加入服务推荐与链接）不走 PR 流程，这类 PR 会被关闭；合作请联系 support@arc-reel.com。
 
-开发新功能或进行规模较大的改动前，先开 issue 讨论方向。
+带 `ready-for-agent` 标签的 issue 已写好实现说明，由维护方的 coding Agent 实现。外部 PR 不会让它更快完成，只会多一轮审查，这类 PR 会被关闭。
+
+开发新功能或进行规模较大的改动前，建议先开 issue 讨论方向，以免实现后因方向不符被关闭。
 
 PR 合并前，作者需要签署 CLA。签署入口由 CLA Assistant 在 PR 评论中给出。
 
@@ -32,6 +34,9 @@ uv run alembic upgrade head
 # 注意：必须用 --reload-dir 限定监视目录，否则 watchfiles 会扫描
 # node_modules / .venv / .git / .worktrees 等数十万个文件，单核 CPU 占用超过 50%
 uv run uvicorn server.app:app --reload --reload-dir server --reload-dir lib --port 1241
+# Windows 原生环境去掉 --reload：uvicorn 启用 reload 时在 Windows 上改用不支持子进程的事件循环，
+# 内置 Agent 无法拉起 Claude Code。改代码后手动重启后端
+uv run uvicorn server.app:app --port 1241
 
 # 启动前端 (终端 2)
 cd frontend && pnpm dev
@@ -115,6 +120,7 @@ pnpm e2e:remote   # 终端二：构建前端，连接容器里的浏览器运行
 | `website/docs/guide/comfyui.md` | ComfyUI workflow 的导入、节点绑定、尺寸/时长/种子换算语义、测试与运行限制 | ComfyUI 自身的部署方式与自定义节点安装教程 |
 | `website/docs/guide/market.md` | 市场源管理、市场条目的安装确认、更新与卸载 | 投稿流程与开设市场源的步骤（以官方市场源仓库文档为准） |
 | `website/docs/guide/jianying-export.md` | 剪映草稿目录定位、导出与二次编辑操作步骤 | 视频生成本身的流程说明 |
+| `website/docs/guide/files-and-trash.md` | 文件视图的角色与操作、各类对象的删除与恢复规则、项目回收站的保留与清除、已删除项目、Agent 的删除与恢复能力 | 部署层面的备份与目录布局（见部署页） |
 | `website/docs/guide/faq.md` | 高频问题和短答案 | 长篇教程 |
 | `website/docs/ops/deployment.md` | 部署、升级、备份、恢复、监控和安全 | 产品营销文案 |
 | `website/docs/ops/migrate-to-postgres.md` | SQLite 到 PostgreSQL 的迁移步骤、校验和回滚 | PostgreSQL 的日常部署与运维手册 |

@@ -1,14 +1,13 @@
 import json
 import shutil
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
 
 import pytest
 
 from lib.artifacts.artifact_manifest import ArtifactKey, ArtifactManifestEntry, ProjectArtifactManifestAdapter
 from lib.backends.providers import CallPurpose
+from lib.project import project_trash
 from lib.project.project_manager import EmptySourceError, ProjectManager
 from tests.fakes import use_text_generator
 
@@ -291,17 +290,13 @@ class TestProjectManager:
         synced = pm.sync_episode_from_script("demo", "episode_1.json")
         assert synced["episodes"][0]["episode"] == 1
 
-        # add_scene (drama format)
         drama_script = {
             "episode": 2,
             "title": "第二集",
             "content_mode": "drama",
-            "scenes": [],
+            "scenes": [{"scene_id": "E2S01", "duration_seconds": 8, "generated_assets": {}}],
         }
         pm.save_script("demo", drama_script, "episode_2.json", validate=False)
-        pm.add_scene("demo", "episode_2.json", {"duration_seconds": 8, "generated_assets": {}})
-        loaded_drama = pm.load_script("demo", "episode_2.json")
-        assert loaded_drama["scenes"][0]["scene_id"] == "001"
 
         # update_scene_asset + pending helpers
         narration_script = pm.load_script("demo", "episode_1.json")
@@ -331,7 +326,7 @@ class TestProjectManager:
             pm.update_scene_asset("demo", "episode_1.json", "NOT_FOUND", "video_clip", "x.mp4")
 
     def test_locked_script_helpers_drama_paths(self, tmp_path):
-        """覆盖经 locked_script 迁移的 helper 在 drama/scenes 分支与默认资产填充。"""
+        """覆盖经 locked_script 迁移的 helper 在 drama/scenes 分支。"""
         pm = ProjectManager(tmp_path / "projects")
         pm.create_project("demo")
         pm.create_project_metadata("demo", "Demo", "Anime", "drama")
@@ -340,16 +335,12 @@ class TestProjectManager:
             "episode": 1,
             "title": "第一集",
             "content_mode": "drama",
-            "scenes": [],
+            "scenes": [
+                {"scene_id": "001", "duration_seconds": 6, "generated_assets": {}},
+                {"scene_id": "002", "duration_seconds": 4, "generated_assets": {}},
+            ],
         }
         pm.save_script("demo", drama_script, "episode_1.json", validate=False)
-
-        # add_scene 未带 generated_assets：触发默认资产填充分支
-        pm.add_scene("demo", "episode_1.json", {"duration_seconds": 6})
-        pm.add_scene("demo", "episode_1.json", {"duration_seconds": 4})
-        loaded = pm.load_script("demo", "episode_1.json")
-        assert [s["scene_id"] for s in loaded["scenes"]] == ["001", "002"]
-        assert loaded["scenes"][0]["generated_assets"]["status"] == "pending"
 
         # update_scene_asset 走 drama/scenes 分支（else: scene_id）
         pm.update_scene_asset("demo", "episode_1.json", "001", "storyboard_image", "sb/001.png")
@@ -561,7 +552,14 @@ class TestProjectManager:
         stored = json.loads((project_dir / "scripts" / "episode_1.json").read_text(encoding="utf-8"))
         assert stored["segments"][0]["segment_id"] == "E1S01"
         assert pm.load_project("demo")["episodes"] == [
-            {"episode": 1, "source_origin": "none", "title": "Episode 1", "script_file": "scripts/episode_1.json"}
+            {
+                "episode": 1,
+                "source_origin": "none",
+                "title": "Episode 1",
+                "script_file": "scripts/episode_1.json",
+                # 剧本落盘时记下本集条目编号用过的最大号
+                "item_id_high_water": 1,
+            }
         ]
 
     @pytest.mark.parametrize(
@@ -790,7 +788,7 @@ class TestProjectManager:
         assert alice["description"] == "hero rewritten"
         assert alice["derivatives"] == table
 
-    def test_reference_audio_cleanup_cannot_delete_a_newer_concurrent_selection(self, tmp_path, monkeypatch):
+    def test_replaced_and_cleared_reference_audio_go_to_the_project_trash(self, tmp_path):
         pm = ProjectManager(tmp_path / "projects")
         pm.create_project("demo")
         pm.create_project_metadata("demo", "Demo")
@@ -798,38 +796,39 @@ class TestProjectManager:
         wav_rel = "characters/refs_audio/Alice.wav"
         mp3_rel = "characters/refs_audio/Alice.mp3"
         pm.install_character_reference_audio("demo", "Alice", wav_rel, b"old-wav")
-
-        first_cleanup_ready = Event()
-        continue_first_cleanup = Event()
-        original_cleanup = pm._discard_stale_reference_audio_if_unreferenced
-
-        def _delay_first_cleanup(project_name: str, stale_audio: Path | None) -> None:
-            if stale_audio is not None and stale_audio.name == "Alice.wav" and not first_cleanup_ready.is_set():
-                first_cleanup_ready.set()
-                assert continue_first_cleanup.wait(timeout=2)
-            original_cleanup(project_name, stale_audio)
-
-        monkeypatch.setattr(pm, "_discard_stale_reference_audio_if_unreferenced", _delay_first_cleanup)
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            first = executor.submit(
-                pm.install_character_reference_audio,
-                "demo",
-                "Alice",
-                mp3_rel,
-                b"intermediate-mp3",
-            )
-            try:
-                assert first_cleanup_ready.wait(timeout=2)
-                pm.install_character_reference_audio("demo", "Alice", wav_rel, b"new-wav")
-            finally:
-                continue_first_cleanup.set()
-            first.result(timeout=2)
+        pm.install_character_reference_audio("demo", "Alice", mp3_rel, b"new-mp3")
+        pm.clear_character_reference_audio("demo", "Alice")
 
         project_dir = pm.get_project_path("demo")
-        assert pm.load_project("demo")["characters"]["Alice"]["reference_audio"] == wav_rel
-        assert (project_dir / wav_rel).read_bytes() == b"new-wav"
+        assert pm.load_project("demo")["characters"]["Alice"]["reference_audio"] == ""
+        assert not (project_dir / wav_rel).exists()
         assert not (project_dir / mp3_rel).exists()
+        records = project_trash.list_records(project_dir)
+        assert sorted(record.files[0] for record in records) == [mp3_rel, wav_rel]
+        assert {record.object["kind"] for record in records} == {"reference_audio"}
+
+    def test_clearing_reference_audio_under_another_name_leaves_the_file(self, tmp_path):
+        """参考音频按名归属：清空或替换只回收角色自己名下的旧文件，指向别处的旧值只是解除引用。"""
+        pm = ProjectManager(tmp_path / "projects")
+        pm.create_project("demo")
+        pm.create_project_metadata("demo", "Demo")
+        pm.add_project_character("demo", "Alice", "hero", "soft")
+        pm.add_project_character("demo", "Bob", "friend", "calm")
+        foreign_rel = "characters/refs_audio/Alice.wav"
+        pm.install_character_reference_audio("demo", "Alice", foreign_rel, b"alice")
+
+        def point_bob_at_alice(entry: dict) -> None:
+            entry["reference_audio"] = foreign_rel
+
+        pm.update_asset_entry("character", "demo", "Bob", point_bob_at_alice)
+        pm.install_character_reference_audio("demo", "Bob", "characters/refs_audio/Bob.mp3", b"bob")
+        pm.update_asset_entry("character", "demo", "Bob", point_bob_at_alice)
+        pm.clear_character_reference_audio("demo", "Bob")
+
+        project_dir = pm.get_project_path("demo")
+        assert pm.load_project("demo")["characters"]["Bob"]["reference_audio"] == ""
+        assert (project_dir / foreign_rel).read_bytes() == b"alice"
+        assert project_trash.list_records(project_dir) == []
 
     @pytest.mark.asyncio
     async def test_reference_read_source_and_generate_overview(self, tmp_path, monkeypatch):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from pathlib import Path
 
 import httpx
@@ -10,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from mcp.types import ImageContent
+from mcp.types import ImageContent, TextContent
 
 from lib.artifacts.artifact_activation import activate_artifact_target_state, register_current_artifact_if_provable
 from lib.artifacts.artifact_manifest import ArtifactKey
@@ -21,7 +22,11 @@ from lib.generation.generation_result import GenerationSelectionMode
 from lib.generation.generation_worker import CapacityTable, GenerationWorker
 from lib.infra.api_errors import ConflictError
 from lib.project.project_manager import ProjectManager
-from lib.project.project_migration_failure import MIGRATION_FAILURE_CODE, record_migration_failure
+from lib.project.project_migration_failure import (
+    MIGRATION_FAILURE_CODE,
+    MIGRATION_FAILURE_FILENAME,
+    record_migration_failure,
+)
 from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
 from lib.script.draft_quarantine import QUARANTINE_KIND_DRAMA_SCRIPT_PLAN, read_quarantine
 from lib.workflow.workflow_plan import WorkflowPlanRequest, build_workflow_plan
@@ -32,6 +37,7 @@ from server.agent_toolset.toolset import ARCREEL_MCP_TOOL_IDS
 from server.auth import create_download_token, create_token
 from server.cors_config import resolve_cors_policy
 from server.remote_mcp import ArcApiKeyVerifier, RemoteMCPHost, build_remote_mcp_server, mount_remote_mcp
+from server.services.project.workflow_planner import WorkflowPlanner
 from server.tool_runtime import Services, TextGenerationResult
 from tests.factories import install_current_video, make_test_clip, make_video_request_facts, register_project_sources
 from tests.fakes import refuse_resume_execution
@@ -1053,6 +1059,113 @@ async def test_remote_mcp_draft_preserves_explicit_null_updates(remote_server, r
     assert draft is not None
     assert draft.meta["base_fingerprint"] is None
     assert draft.meta["source"] is None
+
+
+@pytest.mark.usefixtures("video_request_facts")
+async def test_remote_mcp_draft_errors_name_only_project_relative_paths(remote_server, remote_projects) -> None:
+    """违约报告会原样回给远程 Agent：只指名项目内相对路径，不带服务端目录（含解析符号链接后的写法）。"""
+    (remote_projects.get_project_path("demo") / "scripts" / "episode_1.json").unlink()
+    project_dir = remote_projects.get_project_path("demo")
+    app = _mounted(remote_server)
+    async with (
+        remote_server.session_manager.run(),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://localhost",
+            headers={"Authorization": "Bearer arc-valid"},
+            follow_redirects=True,
+        ) as client,
+        streamable_http_client("http://localhost/mcp", http_client=client) as (read, write, _),
+        ClientSession(read, write) as session,
+    ):
+        await session.initialize()
+        args = {"project": "demo", "episode_id": 1, "doc_type": "drama_script_plan"}
+        opened = await session.call_tool("open_draft", {**args, "source": "source/episode_1.txt"})
+        patched = await session.call_tool(
+            "patch_draft",
+            {**args, "content": {"scenes": [{}]}, "base_revision": opened.structuredContent["draft"]["revision"]},
+        )
+        promoted = await session.call_tool(
+            "promote_draft", {**args, "base_revision": patched.structuredContent["draft"]["revision"]}
+        )
+
+    assert promoted.isError
+    message = json.dumps(promoted.structuredContent, ensure_ascii=False) + "".join(
+        block.text for block in promoted.content if isinstance(block, TextContent)
+    )
+    assert "drafts/episode_1/script_plan_normalized_script.invalid.json" in message
+    assert str(project_dir) not in message
+    assert str(project_dir.resolve()) not in message
+
+
+def _plant_migration_failure(project_dir: Path, origin: str) -> None:
+    script = project_dir / "scripts" / "episode_1.json"
+    if origin == "raised":
+        record_migration_failure(
+            project_dir,
+            FileNotFoundError(2, "No such file or directory", str(script)),
+            schema_version=CURRENT_PROJECT_SCHEMA_VERSION,
+        )
+    elif origin == "legacy_record":
+        reason = f"cannot read {script.resolve()}"
+        (project_dir / MIGRATION_FAILURE_FILENAME).write_text(
+            json.dumps(
+                {
+                    "schema_version": CURRENT_PROJECT_SCHEMA_VERSION,
+                    "failed_at": "2026-01-01T00:00:00",
+                    "reason": reason,
+                    "details": [{"file": str(script), "violation": reason}],
+                }
+            ),
+            encoding="utf-8",
+        )
+    else:  # 判定记录本身读不出：OSError 文本带着记录文件的绝对路径
+        (project_dir / MIGRATION_FAILURE_FILENAME).mkdir()
+
+
+@pytest.mark.parametrize("origin", ["raised", "legacy_record", "unreadable_record"])
+async def test_remote_workflow_plan_names_migration_failures_by_project_relative_path(
+    remote_projects: ProjectManager, origin: str
+) -> None:
+    """迁移失败原因经成功返回值回给远程 Agent：只带项目内相对路径，仍能定位问题文件。"""
+    project_dir = remote_projects.get_project_path("demo")
+    _plant_migration_failure(project_dir, origin)
+
+    async def verify_api_key(token: str):
+        return {"sub": "apikey:test", "via": "apikey"} if token == "arc-valid" else None
+
+    services = Services(
+        projects=remote_projects, workflow_planner=WorkflowPlanner(remote_projects), capabilities=_Capabilities()
+    )
+    server = build_remote_mcp_server(
+        projects=remote_projects, services=services, token_verifier=ArcApiKeyVerifier(verify_api_key)
+    )
+    app = _mounted(server)
+    async with (
+        server.session_manager.run(),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://localhost",
+            headers={"Authorization": "Bearer arc-valid"},
+            follow_redirects=True,
+        ) as client,
+        streamable_http_client("http://localhost/mcp", http_client=client) as (read, write, _),
+        ClientSession(read, write) as session,
+    ):
+        await session.initialize()
+        result = await session.call_tool("get_workflow_plan", {"project": "demo", "episode_id": 1})
+
+    assert not result.isError
+    plan = result.structuredContent["workflow_plan"]
+    message = json.dumps(result.structuredContent, ensure_ascii=False) + "".join(
+        block.text for block in result.content if isinstance(block, TextContent)
+    )
+    assert str(project_dir) not in message
+    assert str(project_dir.resolve()) not in message
+    blocker = next(item for item in plan["blockers"] if item["code"] == MIGRATION_FAILURE_CODE)
+    expected = MIGRATION_FAILURE_FILENAME if origin == "unreadable_record" else "scripts/episode_1.json"
+    assert expected in blocker["reason"]
+    assert expected in json.dumps(plan["next_action"]["args"]["details"], ensure_ascii=False)
 
 
 async def test_remote_mcp_host_initializes_first_request_and_can_restart() -> None:

@@ -2,7 +2,6 @@
 
 import json
 import re
-import shutil
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
@@ -20,6 +19,7 @@ from lib.catalog.errors import ModelNotInCatalogError
 from lib.db.models.api_call import ApiCall
 from lib.db.repositories.session_repo import SessionRepository
 from lib.db.repositories.task_repo import TaskRepository
+from lib.infra.data_root_layout import DataRootLayout
 from lib.project.project_manager import EmptySourceError
 from lib.script.script_batch_edit import (
     InsertAfterOperation,
@@ -33,7 +33,7 @@ from lib.script.script_batch_edit import (
 from lib.script.script_editor import ScriptEditError, patch_field, resolve_items
 from lib.speech.speech_composition import admit_script_unit
 from lib.workflow.workflow_state import ArtifactCount, EpisodesSummary, EpisodeSummary, ProjectSummary
-from tests.fakes import use_project_manager
+from tests.fakes import use_project_manager, use_projects_session_factory
 
 
 class _OverviewProbe(BaseModel):
@@ -52,6 +52,7 @@ class _FakePM:
     def __init__(self, base: Path):
         self.base = base
         self.data_root = base
+        self.layout = DataRootLayout(base)
         self.projects_dir = base
         self.project_data = {
             "ready": {
@@ -135,9 +136,6 @@ class _FakePM:
     def locked_source_registration(self, name):
         with self.locked_source_mutation(name) as source_dir:
             yield source_dir, self.project_data.setdefault(name, {"episodes": []}), ExitStack()
-
-    def delete_project_directory(self, name):
-        shutil.rmtree(self.get_project_path(name))
 
     def get_project_status(self, name):
         return {"current_stage": "source_ready"}
@@ -465,7 +463,7 @@ def build_projects_client(monkeypatch, fake_pm, fake_summaries=None, *, session_
     """``session_factory`` 给出时，路由经它开数据库会话（默认是生产的 ``async_session_factory``）。"""
     use_project_manager(monkeypatch, fake_pm)
     if session_factory is not None:
-        monkeypatch.setattr(projects, "async_session_factory", session_factory)
+        use_projects_session_factory(monkeypatch, session_factory)
 
     app = FastAPI()
     app.dependency_overrides[projects.get_workflow_state_service] = lambda: fake_summaries or _FakeSummaries()

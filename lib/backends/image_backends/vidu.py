@@ -64,6 +64,7 @@ class ViduImageBackend:
     """Vidu 图片生成后端。"""
 
     CHANNEL_CAPABILITIES: ClassVar[frozenset[ImageCapability]] = BOTH_IMAGE_CAPABILITIES
+    CHANNEL_REFERENCE_LIMIT: ClassVar[int | None] = _MAX_REFERENCE_IMAGES
 
     def __init__(
         self,
@@ -88,9 +89,8 @@ class ViduImageBackend:
     def capabilities(self) -> set[ImageCapability]:
         return set(self.CHANNEL_CAPABILITIES)
 
-    @property
-    def max_reference_images(self) -> int:
-        return _MAX_REFERENCE_IMAGES
+    async def reference_image_limit(self) -> int | None:
+        return self.CHANNEL_REFERENCE_LIMIT
 
     @staticmethod
     def estimate_usage(facts: ImageRequestFacts) -> Usage:
@@ -98,16 +98,12 @@ class ViduImageBackend:
         resolution = facts.image_size or None
         return per_image_usage(
             output_images=1,
-            input_images=None if refs is None else min(refs, _MAX_REFERENCE_IMAGES),
+            input_images=refs,
             dimensions={"resolution": resolution} if resolution is not None else None,
         )
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
-        # viduq1 必须 1-7 张；viduq2 允许 0-7 张。这里截断到上限。
         refs = list(request.reference_images or [])
-        if len(refs) > _MAX_REFERENCE_IMAGES:
-            logger.warning("Vidu 参考图数量 %d 超过上限 %d，截断", len(refs), _MAX_REFERENCE_IMAGES)
-            refs = refs[:_MAX_REFERENCE_IMAGES]
 
         prompt = (request.prompt or "")[:_PROMPT_MAX_LEN]
         body: dict = {

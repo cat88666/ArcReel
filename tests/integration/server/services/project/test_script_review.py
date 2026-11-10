@@ -20,6 +20,7 @@ from lib.config.resolver import ConfigResolver
 from lib.generation.video_request_facts import VideoRequestFactsFailure
 from lib.i18n import _ as i18n_message
 from lib.infra.json_io import atomic_write_json
+from lib.project import project_trash
 from lib.project.project_activity import ACTIVITY_FILENAME, record_project_activity, recorded_project_activity
 from lib.project.project_manager import ProjectManager, find_episode
 from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
@@ -105,6 +106,24 @@ def _rv_script_plan() -> dict:
             }
         ],
     }
+
+
+def _narrowed_rv_facts(supported_durations):
+    """生效档位为 4/8 秒，覆盖配置收窄与换型号后声明全集收窄。"""
+    return make_video_request_facts(
+        route="reference_video",
+        generation_type="i2v",
+        supported_durations=supported_durations,
+        allowed_durations=(4, 8),
+    )
+
+
+def _off_tier_rv_script_plan() -> dict:
+    """第二个单元的已确认时长 6 秒落在收窄后的档位之外。"""
+    plan = _rv_script_plan()
+    plan["units"][0]["duration_seconds"] = 4
+    plan["units"].append({"unit_id": "E1U02", "text": "@[裴与] 策马而来。", "duration_seconds": 6})
+    return plan
 
 
 @pytest.fixture(autouse=True)
@@ -526,7 +545,7 @@ class TestConfirmMaterializesScript:
 
         [unit] = _formal_script(pm)["video_units"]
         planned = _rv_script_plan()["units"][0]
-        assert unit["unit_id"] == "E1U01"
+        assert unit["unit_id"] == "E1U1"
         assert unit["text"] == planned["text"]
         assert unit["duration_seconds"] == planned["duration_seconds"]
         assert unit["source_text"] == planned["source_text"]
@@ -545,7 +564,7 @@ class TestConfirmMaterializesScript:
         before = (pm.get_project_path("demo") / "scripts" / "episode_1.json").read_bytes()
         svc = _service(pm)
         expected_overwrite = {
-            "revision": script_review.content_fingerprint_of_data(json.loads(before)),
+            "revision": script_review.published_revision(script_review.content_fingerprint_of_data(json.loads(before))),
             "entries": [
                 {
                     "id": "E1S01",
@@ -581,8 +600,9 @@ class TestConfirmMaterializesScript:
         assert (pm.get_project_path("demo") / "scripts" / "episode_1.json").read_bytes() == before
         assert script_review.stored_review(pm.load_project("demo"), 1) == {}
 
+    @pytest.mark.parametrize("spelling", ["prefixed", "bare"])
     async def test_acknowledged_overwrite_replaces_script_and_forgets_old_entry_claims(
-        self, tmp_path, video_request_facts
+        self, tmp_path, video_request_facts, spelling: str
     ):
         pm = _make_project(tmp_path, "narration")
         _write_script_plan(pm, "narration", _narration_script_plan())
@@ -595,21 +615,24 @@ class TestConfirmMaterializesScript:
         svc = _service(pm)
         revision = (await svc.get_state("demo", 1))["script_overwrite"]["revision"]
 
+        assert revision.startswith("sha256-v1:")
+        if spelling == "bare":
+            revision = revision.removeprefix("sha256-v1:")
+
         state = await svc.confirm("demo", 1, overwrite_revision=revision)
 
         assert state["status"] == "confirmed"
         [segment] = _formal_script(pm)["segments"]
-        assert segment["segment_id"] == "E1S01"
+        # 规划里的 E1S01 已被旧剧本用过，转出时换成本集用过的最大号之后的新编号
+        assert segment["segment_id"] == "E1S10"
         assert segment["pending_authoring"] is True
         assert segment["image_prompt"] is None
         snapshot = adapter.snapshot_entries()
         assert not old_claims.keys() & snapshot.keys()
         assert ArtifactKey.episode_script(1) in snapshot
 
-    async def test_acknowledged_overwrite_clears_history_and_files_of_reused_entry_ids(
-        self, tmp_path, video_request_facts
-    ):
-        """新脚本沿用旧编号的条目是新身份：旧版本历史与当前媒体文件随覆盖清理；被移除的条目不动。"""
+    async def test_acknowledged_overwrite_moves_old_entries_to_the_project_trash(self, tmp_path, video_request_facts):
+        """覆盖后旧条目的媒体与版本历史移进项目回收站：新条目换新编号，不接旧历史；被移除的条目同样移走。"""
         pm = _make_project(tmp_path, "narration")
         _write_script_plan(pm, "narration", _narration_script_plan())
         _write_script(pm, _narration_script(_narration_script_segment("E1S01"), _narration_script_segment("E1S09")))
@@ -624,16 +647,33 @@ class TestConfirmMaterializesScript:
 
         await _confirm_over_existing_script(pm)
 
-        for resource_type in ("storyboards", "end_frames", "videos", "audio"):
-            assert versions.get_current_version(resource_type, "E1S01") == 0
-            assert not (project_path / resource_relative_path(resource_type, "E1S01")).exists()
-            assert versions.get_current_version(resource_type, "E1S09") == 1
-            assert (project_path / resource_relative_path(resource_type, "E1S09")).exists()
+        for entry_id in ("E1S01", "E1S09"):
+            for resource_type in ("storyboards", "end_frames", "videos", "audio"):
+                assert not versions.has_versions(resource_type, entry_id)
+                assert not (project_path / resource_relative_path(resource_type, entry_id)).exists()
+        records = {record.object["id"]: record for record in project_trash.list_records(project_path)}
+        assert set(records) == {"E1S01", "E1S09"}
+        assert "storyboards/scene_E1S09.png" in records["E1S09"].files
 
-    async def test_overwrite_still_succeeds_when_history_cleanup_fails_after_commit(
+    async def test_acknowledged_overwrite_keeps_old_entries_without_media_recoverable(
         self, tmp_path, video_request_facts
     ):
-        """清理是提交后的收尾：版本记录读不出时覆盖照常完成，当前文件仍被清掉，不把已提交的覆盖报成失败。"""
+        """覆盖时旧分镜都按结构移除处置：没有生成媒体、只有文字的旧条目同样成为删除记录。"""
+        pm = _make_project(tmp_path, "narration")
+        _write_script_plan(pm, "narration", _narration_script_plan())
+        _write_script(pm, _narration_script(_narration_script_segment("E1S01"), _narration_script_segment("E1S09")))
+        project_path = pm.get_project_path("demo")
+
+        await _confirm_over_existing_script(pm)
+
+        records = {record.object["id"]: record for record in project_trash.list_records(project_path)}
+        assert set(records) == {"E1S01", "E1S09"}
+        assert all(record.has_snapshot for record in records.values())
+
+    async def test_overwrite_is_refused_untouched_when_version_history_is_unreadable(
+        self, tmp_path, video_request_facts
+    ):
+        """旧条目移进项目回收站是覆盖的一部分：版本记录读不出时整次覆盖不写入，剧本与旧媒体原样保留。"""
         pm = _make_project(tmp_path, "narration")
         _write_script_plan(pm, "narration", _narration_script_plan())
         _write_script(pm, _narration_script(_narration_script_segment("E1S01")))
@@ -643,12 +683,14 @@ class TestConfirmMaterializesScript:
         current.write_bytes(b"old")
         (project_path / "versions").mkdir(exist_ok=True)
         (project_path / "versions" / "versions.json").write_text("{broken", encoding="utf-8")
+        before = (project_path / "scripts" / "episode_1.json").read_bytes()
 
-        await _confirm_over_existing_script(pm)
+        with pytest.raises(ScriptReviewError):
+            await _confirm_over_existing_script(pm)
 
-        segment = json.loads((project_path / "scripts" / "episode_1.json").read_text(encoding="utf-8"))["segments"][0]
-        assert segment["pending_authoring"] is True
-        assert not current.exists()
+        assert (project_path / "scripts" / "episode_1.json").read_bytes() == before
+        assert current.read_bytes() == b"old"
+        assert project_trash.list_records(project_path) == []
 
     async def test_acknowledgement_of_an_outdated_script_is_refused_with_the_current_listing(self, tmp_path):
         """认可只对应被列出的那份正式脚本：列出之后正式脚本又有变化，带旧版本的确认按新清单再次拒绝。"""
@@ -1000,6 +1042,61 @@ class TestReferenceVideoGateFlow:
             await svc.confirm("demo", 1)
 
         assert exc.value.code == "speech_admission"
+
+    @pytest.mark.parametrize("supported_durations", [(4, 6, 8), (4, 8)])
+    async def test_confirm_names_the_off_tier_unit_by_position(
+        self, tmp_path, set_video_request_facts, supported_durations
+    ):
+        """已确认时长被收窄出局的单元：按脚本规划里的单元位置报出现时长与可选档位，原因不带内部单元 ID。"""
+        set_video_request_facts(_narrowed_rv_facts(supported_durations))
+        pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+        _write_rv_script_plan(pm, _off_tier_rv_script_plan())
+
+        with pytest.raises(ScriptReviewError) as exc:
+            await _service(pm).confirm("demo", 1)
+
+        assert exc.value.code == "duration_off_tier"
+        assert exc.value.params == {"position": 2, "duration_seconds": 6, "tiers": "4 / 8"}
+        assert "视频单元 2" in exc.value.message
+        assert "E1U02" not in exc.value.message
+        assert not (pm.get_project_path("demo") / "scripts" / "episode_1.json").exists()
+        assert (await _service(pm).get_state("demo", 1))["status"] == "pending_review"
+
+    @pytest.mark.parametrize("supported_durations", [(4, 6, 8), (4, 8)])
+    async def test_confirm_tool_reports_the_off_tier_unit_by_position(
+        self, tmp_path, set_video_request_facts, supported_durations
+    ):
+        """Agent 入口：同一场景下失败原因按单元位置说明，不含内部单元 ID。"""
+        set_video_request_facts(_narrowed_rv_facts(supported_durations))
+        pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+        _write_rv_script_plan(pm, _off_tier_rv_script_plan())
+        ctx = ToolHarness(
+            project_name="demo",
+            data_root=tmp_path / "projects",
+            pm=pm,
+            config_resolver=cast(ConfigResolver, FakeConfigResolver()),
+        )
+
+        refused = await run_declared_tool(CONFIRM_SCRIPT_REVIEW, ctx, {"episode_id": 1})
+
+        assert refused.problem is not None
+        assert "视频单元 2" in refused.problem.detail
+        assert "6s" in refused.problem.detail
+        assert "[4, 8]" in refused.problem.detail
+        assert "E1U02" not in refused.problem.detail
+
+    async def test_confirm_other_conversion_refusals_stay_generic(self, tmp_path, video_request_facts):
+        """时长越档之外的转换拒绝仍走通用的 conversion_refused。"""
+        pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+        plan = _rv_script_plan()
+        plan["units"].append(dict(plan["units"][0]))
+        _write_rv_script_plan(pm, plan)
+
+        with pytest.raises(ScriptReviewError) as exc:
+            await _service(pm).confirm("demo", 1)
+
+        assert exc.value.code == "conversion_refused"
+        assert "unit_id 重复" in exc.value.message
 
     async def test_reference_duration_tiers_take_narrowed_with_reference_durations(
         self, tmp_path, set_video_request_facts

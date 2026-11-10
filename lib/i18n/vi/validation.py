@@ -160,6 +160,10 @@ MESSAGES = {
         "Không nhận diện được bảng mã tệp nguồn nên chưa chuyển sang UTF-8: source/{name} "
         "(khâu hoạch định tập không đọc được tệp này)"
     ),
+    "arch_provider_asset_links_not_restored": (
+        "Đã nhập dự án nhưng không lưu được {count} liên kết thư viện tư liệu; khi tạo, các ảnh này được "
+        "gửi dưới dạng nội dung ảnh. Nếu cần, hãy tải lên lại hoặc chọn từ thư viện tư liệu"
+    ),
     "arch_non_standard_entry_excluded": "Thư mục/tệp cấp cao không chuẩn '{entry}' không được đưa vào bản xuất",
     "arch_invalid_project_json": "Không phân tích được {file}: {path}",
     "arch_version_history_malformed": "{location}: cấu trúc lịch sử phiên bản không đúng định dạng mong đợi",
@@ -347,6 +351,7 @@ MESSAGES = {
     "val_ce_enum_map_value_missing": "enum_maps.{name} không có ánh xạ cho '{value}'",
     "val_ce_template_text_variable_null": "Biến {name} rỗng nên không thể chèn vào văn bản",
     "val_ce_each_value_not_list": "$each.in trỏ tới {name}, có giá trị khi chạy không phải danh sách",
+    "val_ce_each_key_duplicate": "$each dạng đối tượng tạo ra khóa {field} trùng với một khóa khác trong cùng đối tượng, nên yêu cầu không thể mang đủ mọi tư liệu",
     # ---- Điểm cuối ComfyUI: liên kết node và phân loại khi nhập ----
     "val_ce_comfyui_binding_required": (
         "{binding_key} phải được liên kết với một node trước khi lưu: "

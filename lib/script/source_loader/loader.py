@@ -141,16 +141,12 @@ class SourceLoader:
             if on_conflict == "rename":
                 target_stem = suggested_stem
                 effective_filename = f"{suggested_stem}{ext}"
-            # on_conflict == "replace" → 沿用原 stem，覆盖
+            # on_conflict == "replace" → 沿用原 stem，覆盖。旧文件与同主干的原始上传件由调用方先移入项目回收站
+            # （lib.episode.source_trash），否则「下载原始格式」会指向被覆盖前的内容。
 
         extracted = _EXTRACTORS[ext]().extract(src)
         normalized_path = safe_join(dst_dir, f"{target_stem}.txt")
         normalized_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # replace 场景：提前清理同 stem 的历史 raw 备份，避免前端"下载原始格式"
-        # 链接指向被覆盖前的陈旧内容；只匹配 {stem}.* 精确避免误删其他文件
-        if has_conflict and on_conflict == "replace":
-            cls._purge_stale_raw(dst_dir, target_stem)
 
         normalized_path.write_text(extracted.text, encoding="utf-8")
 
@@ -164,6 +160,7 @@ class SourceLoader:
             )
         except Exception:
             # raw 备份失败：回滚已写入的 normalized，避免孤儿文件误导后续 detect_conflict
+            # hard-delete: rollback -- 原始上传件备份失败时移除目标路径的规范化文本；replace 时被覆盖的旧内容不会恢复
             normalized_path.unlink(missing_ok=True)
             raise
 
@@ -194,18 +191,3 @@ class SourceLoader:
         raw_path = safe_join(raw_dir, effective_filename)
         shutil.copyfile(src, raw_path)
         return raw_path
-
-    @staticmethod
-    def _purge_stale_raw(dst_dir: Path, target_stem: str) -> None:
-        """replace 冲突策略下，清掉同 stem 的旧 raw 备份。
-
-        若不清理，当新上传为纯 UTF-8 .txt（不产生 raw）而旧上传留下
-        raw/{stem}.docx 等备份时，list_project_files 仍会按 stem 暴露 raw_filename，
-        前端的"下载原始格式"按钮会指向被覆盖前的陈旧内容。
-        """
-        raw_dir = safe_join(dst_dir, "raw")
-        if not raw_dir.exists():
-            return
-        for stale in raw_dir.iterdir():
-            if stale.is_file() and stale.stem == target_stem:
-                stale.unlink(missing_ok=True)

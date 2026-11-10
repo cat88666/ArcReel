@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import cast
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -203,7 +204,9 @@ class TestScriptReviewRouter:
             script_path.write_text(json.dumps(produced, ensure_ascii=False), encoding="utf-8")
             before = script_path.read_bytes()
             expected_overwrite = {
-                "revision": script_review.content_fingerprint_of_data(json.loads(before)),
+                "revision": script_review.published_revision(
+                    script_review.content_fingerprint_of_data(json.loads(before))
+                ),
                 "entries": [
                     {
                         "id": "E1S01",
@@ -374,6 +377,68 @@ class TestReferenceVideoRouter:
             assert confirmed.status_code == 200
             assert confirmed.json()["status"] == "confirmed"
             assert script_review.review_status(pm.get_project_path("demo"), pm.load_project("demo"), 1) == "confirmed"
+
+    @pytest.mark.parametrize("supported_durations", [(4, 6, 8), (4, 8)])
+    def test_confirm_with_off_tier_unit_names_its_position_and_tiers(
+        self, tmp_path, monkeypatch, set_video_request_facts, supported_durations
+    ):
+        """已确认时长被收窄出局：422 专用文案按单元位置给出现时长与可选档位，不回落通用的转换拒绝。"""
+        set_video_request_facts(
+            make_video_request_facts(
+                route="reference_video",
+                generation_type="i2v",
+                supported_durations=supported_durations,
+                allowed_durations=(4, 8),
+            )
+        )
+        client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
+        with client:
+            base = "/api/v1/projects/demo/episodes/1/script-review"
+            plan = _rv_script_plan()
+            plan["units"].append({"unit_id": "E1U02", "text": "@[阿离] 转身。", "duration_seconds": 6})
+            _write_rv_script_plan(pm, plan)
+
+            refused = client.post(f"{base}/confirm")
+
+            assert refused.status_code == 422
+            assert refused.json()["detail"] == i18n_message(
+                "script_review_duration_off_tier", position=2, duration_seconds=6, tiers="4 / 8"
+            )
+            assert "E1U02" not in refused.text
+            assert not (pm.get_project_path("demo") / "scripts" / "episode_1.json").exists()
+
+    def test_web_save_and_confirm_tag_project_changes_as_webui(self, tmp_path, monkeypatch, video_request_facts):
+        """内容确认页的保存与确认是用户在 Web 上的操作：写入产生的项目变更须标为 webui。
+
+        未标注时变更按默认的 filesystem 来源广播，前端把它当作外部改动，自动跳到确认时登记的资产窗格。
+        """
+        from lib.project.project_change_hints import (
+            register_project_change_batch_listener,
+            register_project_change_listener,
+        )
+
+        client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
+        sources: list[str] = []
+        unregister_hint = register_project_change_listener(lambda _name, source, _paths: sources.append(source))
+        unregister_batch = register_project_change_batch_listener(
+            lambda _name, source, _changes: sources.append(source)
+        )
+        try:
+            with client:
+                base = "/api/v1/projects/demo/episodes/1/script-review"
+                _write_rv_script_plan(pm, _rv_script_plan())
+                sources.clear()
+
+                edited = _rv_script_plan()
+                edited["units"][0]["text"] = "@[阿离] 转身离去。"
+                assert client.put(f"{base}/content", json=edited).status_code == 200
+                assert client.post(f"{base}/confirm").status_code == 200
+        finally:
+            unregister_hint()
+            unregister_batch()
+
+        assert sources
+        assert set(sources) == {"webui"}
 
     def test_quarantine_surfaced_with_recomputed_line_anchored_violations(
         self, tmp_path, monkeypatch, video_request_facts

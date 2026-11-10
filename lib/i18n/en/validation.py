@@ -160,6 +160,10 @@ MESSAGES = {
         "Source file encoding could not be detected and was not converted to UTF-8: source/{name} "
         "(episode planning cannot read this file)"
     ),
+    "arch_provider_asset_links_not_restored": (
+        "The project was imported, but {count} asset library links could not be saved; generation sends these "
+        "images as image content. Upload them again or select them from the asset library if needed"
+    ),
     "arch_non_standard_entry_excluded": "Non-standard top-level directory/file '{entry}' was excluded from the export",
     "arch_invalid_project_json": "Cannot parse {file}: {path}",
     "arch_version_history_malformed": "{location}: the version history is not in the expected format",
@@ -339,6 +343,7 @@ MESSAGES = {
     "val_ce_enum_map_value_missing": "enum_maps.{name} has no entry for '{value}'",
     "val_ce_template_text_variable_null": "Variable {name} is null and cannot be embedded in text",
     "val_ce_each_value_not_list": "$each.in points at {name}, whose runtime value is not a list",
+    "val_ce_each_key_duplicate": "Object-form $each produced the key {field}, which another key in the same object already uses, so the request cannot carry every input",
     # ---- ComfyUI endpoint: node bindings and import routing ----
     "val_ce_comfyui_binding_required": (
         "{binding_key} must be bound to a node before this endpoint can be saved: "

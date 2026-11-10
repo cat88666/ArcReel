@@ -26,7 +26,9 @@ import { StoryboardBatchDialog } from "@/components/canvas/timeline/StoryboardBa
 import { createScriptEditTimeline } from "@/components/canvas/edit-render/create-script-timeline";
 import { refreshAfterWrite } from "@/components/canvas/shared/refreshAfterWrite";
 import { promptAuthoringHandoffText } from "@/components/canvas/shared/prompt-authoring-handoff";
-import { DiscardDraftDialog, draftFallbackText, draftFixRequestText, prefillAssistant } from "@/components/shared/DraftStatus";
+import { DiscardDraftDialog } from "@/components/shared/DraftStatus";
+import { draftFallbackText, draftFixRequestText } from "@/components/shared/draft-text";
+import { prefillAssistant } from "@/components/shared/prefill-assistant";
 import { diagnosticCode } from "@/hooks/useDraftEditor";
 import { useEpisodeLedger } from "@/hooks/useEpisodeLedger";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
@@ -41,7 +43,8 @@ import type { ProjectData, StoryboardBatchKind } from "@/types";
 import type { EpisodeEditOverview } from "@/types/edit-timeline";
 import type { DraftDocType } from "@/types/reference-video";
 import { errMsg } from "@/utils/async";
-import { episodeAgentRef } from "@/utils/episode-display";
+import { episodeAgentRef, episodeItemAgentRef, itemPositionLabel } from "@/utils/episode-display";
+import { episodeItemKind, findEpisodeItem } from "@/utils/episode-item";
 import {
   WORKSPACE_ROUTE_CHARACTERS,
   WORKSPACE_ROUTE_PRODUCTS,
@@ -164,6 +167,7 @@ export function WorkflowPanel({ projectName, episode, onViewUnit, onRegenerate, 
   const refreshPlan = useWorkflowStore((s) => s.refreshPlan);
   const resetTarget = useWorkflowStore((s) => s.resetTarget);
   const projectData = useProjectsStore((s) => s.currentProjectData);
+  const scripts = useProjectsStore((s) => s.currentScripts);
   const ledger = useEpisodeLedger();
 
   // 项目快照修订号与任务指纹是两条既有的变更信号：前者随 project.json / 剧本写入递增
@@ -210,6 +214,9 @@ export function WorkflowPanel({ projectName, episode, onViewUnit, onRegenerate, 
       lang: i18n.language,
       episodeId,
       episodeRef,
+      itemLabel: (itemId) =>
+        itemPositionLabel(episodeItemKind(itemId), findEpisodeItem(scripts, itemId)?.position ?? null, t),
+      itemAgentRef: (itemId) => episodeItemAgentRef(itemId, scripts, t),
       episodeDurationSeconds: episodeMeta?.duration_seconds ?? null,
       adTargetSeconds: projectData?.content_mode === "ad" ? (projectData.target_duration ?? null) : null,
       assetRoute: (name) => assetRouteIn(projectData, name),
@@ -218,7 +225,7 @@ export function WorkflowPanel({ projectName, episode, onViewUnit, onRegenerate, 
       canViewUnit: Boolean(onViewUnit),
       editOverview,
     });
-  }, [shown, episodeId, episodeRef, episodeMeta, projectData, t, i18n.language, onAuthorPrompts, onViewUnit, editOverview]);
+  }, [shown, episodeId, episodeRef, scripts, episodeMeta, projectData, t, i18n.language, onAuthorPrompts, onViewUnit, editOverview]);
 
   const blockers = useMemo(() => (shown ? blockerViews(t, shown.blockers) : []), [shown, t]);
   const issues = useMemo(() => (shown ? blockerViews(t, shown.status.issues) : []), [shown, t]);

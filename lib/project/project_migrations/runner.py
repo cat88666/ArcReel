@@ -62,6 +62,7 @@ from lib.project.project_migrations.v17_to_v18_timeline_agent_turn import (
     migrate_v17_to_v18,
     timeline_backup_sources,
 )
+from lib.project.project_migrations.v18_to_v19_item_id_high_water import migrate_v18_to_v19
 from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION, parse_project_schema_version
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,8 @@ def migrate_project_dir(project_dir: Path, *, recorded_episode_ids: RecordedEpis
                 raise RuntimeError(f"no migrator from v{version}")
             if migrator is migrate_v15_to_v16:
                 step_outcome = migrate_v15_to_v16(project_dir, recorded_episode_ids=recorded_episode_ids)
+            elif migrator is migrate_v5_to_v6:
+                step_outcome = migrate_v5_to_v6(project_dir, record=adjusted)
             elif migrator is migrate_v6_to_v7:
                 step_outcome = migrate_v6_to_v7(project_dir, record=adjusted)
             else:
@@ -407,7 +410,7 @@ def cleanup_stale_backups(projects_dir: Path, max_age_days: int = 7) -> None:
                     continue
                 try:
                     if bak.stat().st_mtime < cutoff:
-                        bak.unlink()
+                        bak.unlink()  # hard-delete: infra -- 过期的迁移备份
                 except OSError:
                     logger.warning("无法删除备份：%s", bak)
         for bak_dir in versioned_backup_candidates(project_dir / "clues", (0,)):
@@ -415,7 +418,7 @@ def cleanup_stale_backups(projects_dir: Path, max_age_days: int = 7) -> None:
                 continue
             try:
                 if bak_dir.stat().st_mtime < cutoff:
-                    shutil.rmtree(bak_dir, ignore_errors=True)
+                    shutil.rmtree(bak_dir, ignore_errors=True)  # hard-delete: infra -- 过期的迁移备份目录
             except OSError:
                 logger.warning("无法删除 clues 备份：%s", bak_dir)
 
@@ -439,3 +442,4 @@ MIGRATORS[14] = migrate_v14_to_v15
 MIGRATORS[15] = migrate_v15_to_v16
 MIGRATORS[16] = migrate_v16_to_v17
 MIGRATORS[17] = migrate_v17_to_v18
+MIGRATORS[18] = migrate_v18_to_v19

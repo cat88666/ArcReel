@@ -18,6 +18,11 @@ v6→v7 的剧本改写、产物目标态规划（v7→v8 起的各步与归档�
   留第一条，其余从资产表去掉；资产图文件不动，改前的 ``project.json`` 留作保留副本。去掉的条目
   名下的衍生按资产合并的规则并进保留条目（迁走的衍生图搬到保留名下），各集剧本与草稿里指向只差
   大小写那条的引用改写为保留名。
+- **资产图、参考图或参考音频指向别的资产名下的文件**（旧版资产 PATCH 接受任意路径）：复制一份到本资产名下
+  并改指过去，原文件留给它的主人。落点仍被其他字段引用时，先统一规划这些字段的副本与改指，保持内容不变。
+  本资产名下的落点已被另一份内容占着时，那一份先挪成保留副本。资产图的清单
+  登记随之改写：登记在旧路径上的换到副本（同字节，依据摘要不变），登记在落点上的描述的是被挪走的那份，撤掉。
+  这些文件按名归属，之后的改名、删除与恢复只处理本资产名下的文件。
 - **剧本条目缺 id 或 id 重复**：缺的补新 id，重复的从第二条起换新 id（取号规则同新增条目）；换号
   条目上指向原 id 规范媒体路径的产物引用清空——那些文件属于保留原 id 的条目；只描述这些媒体的
   生成状态一并清空，换号条目读作尚未生成。
@@ -35,32 +40,37 @@ import json
 import logging
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field, replace
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Any, cast
 
 from lib.artifacts.artifact_manifest import (
     MANIFEST_FILENAME,
     ArtifactKey,
+    ArtifactManifestEntry,
     ProjectArtifactManifestAdapter,
     normalize_artifact_path,
 )
+from lib.artifacts.formal_write import formal_write_transaction
 from lib.episode.episode_paths import episode_drafts_dir, episode_script_relpath
-from lib.infra.json_io import atomic_write_json
+from lib.infra.json_io import atomic_write_bytes, atomic_write_json
 from lib.infra.path_safety import try_safe_join
 from lib.project.asset_derivatives import (
     DERIVATIVE_ASSET_TYPE,
     derivative_artifact_id,
     derivative_artifact_key,
+    derivative_sheet_dir,
     derivative_sheet_relative_path,
     derivative_table,
     ensure_derivative_table,
 )
 from lib.project.asset_merge import DerivativeMergePlan, merge_payload_references, plan_derivative_merge
+from lib.project.asset_rename import named_file_fields, owns_named_file
 from lib.project.asset_types import (
     ASSET_SPECS,
     DERIVATIVES_FIELD,
+    AssetSpec,
     asset_name_comparison_key,
     asset_name_namespace_key,
     normalize_asset_name,
@@ -708,9 +718,327 @@ def _relocate_derivative_sheet(work: _Work, derivative: object, owner: str, kept
         os.replace(source, target)
         # 只是收纳目录：非空或删不掉都不影响任何登记。
         with contextlib.suppress(OSError):
-            source.parent.rmdir()
+            source.parent.rmdir()  # hard-delete: infra -- 迁移搬走后的空目录
     derivative[_DERIVATIVE_SHEET_FIELD] = new_rel
     return {normalize_artifact_path(value): normalize_artifact_path(new_rel)}
+
+
+#: 参考文件字段 → 本资产名下的落点（资产类型目录下的子目录）；多图序列按 ``名字_{序号}`` 命名。资产图落在类型目录本级。
+_REFERENCE_FILE_SUBDIRS = {"reference_image": "refs", "reference_audio": "refs_audio", "reference_images": "refs"}
+
+
+def normalize_shared_reference_files(project_dir: Path, *, schema_version: int) -> list[MigrationAdjustment]:
+    """只规整共用的资产图与参考文件，供资产名称空间迁移在暂存树里提前拆分引用。"""
+    project = _load_object(project_dir / "project.json")
+    if project is None:
+        return []
+    work = _Work(project_dir=project_dir, schema_version=schema_version, project=project)
+    _copy_shared_reference_files(work)
+    return work.adjusted
+
+
+def _named_file_fields(work: _Work) -> Iterator[tuple[str, str, dict[str, Any], str]]:
+    for asset_type, spec in ASSET_SPECS.items():
+        bucket = work.project.get(spec.bucket_key)
+        if not isinstance(bucket, dict):
+            continue
+        for name, entry in bucket.items():
+            # 复制目标用资产名拼文件名；导入包在校验资产名之前就跑迁移链，含路径分隔符的名字会把副本写出目录。
+            if not isinstance(name, str) or not isinstance(entry, dict) or "/" in name or "\\" in name:
+                continue
+            for field_name in named_file_fields(spec):
+                yield asset_type, name, entry, field_name
+
+
+def _copy_shared_reference_files(work: _Work) -> None:
+    """资产图与参考文件复制到本资产名下；互相引用时冻结源字节，引用提交失败则源文件与清单一并恢复供重试。"""
+    fields = list(_named_file_fields(work))
+    frozen: dict[str, bytes] = {}
+    before = len(work.adjusted)
+    #: 改指到副本的资产图：（资产类型, 名字, 旧值, 副本路径）。
+    sheets: list[tuple[str, str, str, str]] = []
+    planned: dict[str, tuple[bytes | None, MigrationAdjustment]] = {}
+    pending = [
+        (asset_type, name, entry, field_name, index, item)
+        for asset_type, name, entry, field_name in fields
+        for index, item in (
+            enumerate(entry[field_name]) if isinstance(entry.get(field_name), list) else [(None, entry.get(field_name))]
+        )
+    ]
+    # 新落点可能占用另一字段的源路径；继续规划受影响字段，直到每个引用都有稳定落点。
+    while pending:
+        remaining = []
+        for asset_type, name, entry, field_name, index, value in pending:
+            copied = _plan_reference_copy(
+                work,
+                asset_type,
+                name,
+                field_name,
+                value,
+                frozen,
+                planned,
+                siblings=entry[field_name] if index is not None else None,
+            )
+            if copied is None:
+                remaining.append((asset_type, name, entry, field_name, index, value))
+                continue
+            if index is not None:
+                entry[field_name][index] = copied
+            else:
+                entry[field_name] = copied
+                if field_name == ASSET_SPECS[asset_type].sheet_field:
+                    sheets.append((asset_type, name, cast(str, value), copied))
+        if len(remaining) == len(pending):
+            break
+        pending = remaining
+    manifest = work.project_dir / MANIFEST_FILENAME
+    try:
+        with (
+            formal_write_transaction(
+                work.project_dir / "project.json", manifest, *(work.project_dir / rel for rel in frozen)
+            ),
+            contextlib.ExitStack() as copies,
+        ):
+            for target_rel, (data, adjustment) in planned.items():
+                target = work.project_dir / target_rel
+                copies.enter_context(formal_write_transaction(target))
+                if target.is_symlink() or (target.exists() and not (target.is_file() and target.read_bytes() == data)):
+                    backup = work.rel(copies.enter_context(_displaced_copy(target, work.schema_version)))
+                    adjustment = adjustment.model_copy(update={"backup": backup})
+                if data is not None and not target.is_file():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_bytes(target, data)
+                if data is not None or adjustment.backup is not None:
+                    work.adjusted.append(adjustment)
+            if planned:
+                work.project_changed = True
+                _carry_sheet_claims(work, sheets)
+                _commit_project(work)
+    except BaseException:
+        del work.adjusted[before:]
+        raise
+
+
+def _carry_sheet_claims(work: _Work, sheets: list[tuple[str, str, str, str]]) -> None:
+    """改指到副本的资产图带上清单登记，时效与改指前相同。
+
+    改指前的时效看登记是否在旧值的路径上：在的话把它换到副本，依据摘要原样保留（副本与原文件同字节，读作时新
+    的仍读作时新）；不在的话本就读作缺失，落点上的登记描述的是被挪成保留副本的那份图，撤掉，不借副本伪造成时新。
+    互相共用时登记可能交叉在对方的路径上，逐条改写会经过同一路径被两个键登记的中间态，所以一次整体提交。
+    """
+
+    if not sheets or not (work.project_dir / MANIFEST_FILENAME).is_file():
+        return
+    adapter = ProjectArtifactManifestAdapter(work.project_dir)
+    expected: dict[ArtifactKey, ArtifactManifestEntry | None] = {}
+    replacements: dict[ArtifactKey, ArtifactManifestEntry | None] = {}
+    for asset_type, name, old_value, copied in sheets:
+        identity = asset_name_comparison_key(name)
+        if not identity:
+            continue
+        key = ArtifactKey.asset_sheet(asset_type, identity)
+        stored = adapter.get_entry(key)
+        if stored is None:
+            continue
+        try:
+            declared = normalize_artifact_path(old_value)
+        except ValueError:
+            declared = None
+        if stored.artifact_path == declared:
+            replacement: ArtifactManifestEntry | None = replace(stored, artifact_path=normalize_artifact_path(copied))
+        elif stored.artifact_path == normalize_artifact_path(copied):
+            replacement = None
+        else:
+            continue
+        expected[key] = stored
+        replacements[key] = replacement
+    if not replacements:
+        return
+    ensure_versioned_backup(work.project_dir / MANIFEST_FILENAME, work.schema_version)
+    if not adapter.replace_entries_if_matches_atomically(expected=expected, replacements=replacements):
+        raise RuntimeError("artifact manifest changed while carrying an asset sheet claim")
+
+
+def _plan_reference_copy(
+    work: _Work,
+    asset_type: str,
+    name: str,
+    field_name: str,
+    value: object,
+    frozen: dict[str, bytes],
+    planned: dict[str, tuple[bytes | None, MigrationAdjustment]],
+    *,
+    siblings: list[Any] | None = None,
+) -> str | None:
+    """规划跨资产副本与落点被副本占用的引用；不必改指时返回 ``None``。
+
+    引用本就读不到内容（文件缺失或路径含符号链接）而落点要写入副本时，改指到同样没有文件的本资产落点，
+    继续读作缺失；该落点已被占用时把占用文件挪成保留副本，并同步处理它的引用。
+    """
+
+    spec = ASSET_SPECS[asset_type]
+    if not isinstance(value, str) or not value:
+        return None
+    rel = _canonical_reference(work.project_dir, value)
+    collided = _planned_target_at(work.project_dir, rel, planned)
+    owner = _named_file_owner(work.project, rel)
+    # 本资产名下或不归任何资产的路径原本不必复制，只有落点要写入副本时才让位。
+    stays_put = owns_named_file(spec, name, rel) or owner is None
+    if stays_put and collided is None:
+        return None
+    target_dir = PurePosixPath(spec.subdir)
+    if field_name != spec.sheet_field:
+        target_dir /= _REFERENCE_FILE_SUBDIRS[field_name]
+    # 参考音频只认角色参考音频目录里的文件，别处的值本就不生效，复制过来反倒让它生效。
+    if field_name == "reference_audio" and PurePosixPath(rel).parent != target_dir:
+        return None
+    source = _copy_source(work.project_dir, rel)
+    if source is None and collided is None:
+        return None
+    content: bytes | None = None
+    if source is not None:
+        if rel not in frozen:
+            frozen[rel] = source.read_bytes()
+        content = frozen[rel]
+        if stays_put and collided is not None and planned[collided][0] == content:
+            return None
+    if any(
+        (work.project_dir / directory).is_symlink()
+        for directory in (target_dir, *target_dir.parents)
+        if directory != PurePosixPath(".")
+    ):
+        raise ValueError(f"asset copy directory is a symlink: {target_dir}")
+    stem, suffix = normalize_asset_name(name), PurePosixPath(rel).suffix
+    if siblings is None:
+        target_rel = (target_dir / f"{stem}{suffix}").as_posix()
+    else:
+        target_rel = _sequenced_copy_target(work, spec, target_dir, stem, suffix, content, siblings, planned)
+    owner_name = owner[1] if owner is not None else planned[cast(str, collided)][1].params["name"]
+    planned[target_rel] = (
+        content,
+        MigrationAdjustment(
+            code="shared_reference_file_copied" if content is not None else "missing_reference_preserved",
+            file=target_rel,
+            params={"asset_type": asset_type, "name": name, "owner": owner_name, "from": rel},
+        ),
+    )
+    return target_rel
+
+
+def _planned_target_at(
+    project_dir: Path, rel: str, planned: dict[str, tuple[bytes | None, MigrationAdjustment]]
+) -> str | None:
+    """*rel* 落在哪个副本落点上；大小写或 Unicode 不敏感的文件系统上，写法不同的路径可能是同一文件。"""
+
+    if rel in planned:
+        return rel
+    path = project_dir / rel
+    if not planned:
+        return None
+    return next(
+        (
+            target
+            for target in planned
+            if (
+                path.samefile(project_dir / target)
+                if path.exists() and (project_dir / target).exists()
+                # 悬空引用没有文件身份可比，保守预留大小写与 Unicode 等价写法，避免写入后接管它。
+                else normalize_asset_name(rel).casefold() == normalize_asset_name(target).casefold()
+            )
+        ),
+        None,
+    )
+
+
+def _copy_source(project_dir: Path, rel: str) -> Path | None:
+    """*rel* 可以作为复制来源时返回文件路径；不在项目内、路径含符号链接或不是文件时为 ``None``。"""
+
+    path = PurePosixPath(rel)
+    if any((project_dir / part).is_symlink() for part in (path, *path.parents) if part != PurePosixPath(".")):
+        return None
+    source = try_safe_join(project_dir, rel)
+    return source if source is not None and source.is_file() else None
+
+
+@contextlib.contextmanager
+def _displaced_copy(target: Path, schema_version: int) -> Generator[Path]:
+    """保留被替下的文件；外层提交失败时挪回原位，避免重试积累重复保留副本。"""
+    backup = set_aside_as_kept_copy(target, schema_version)
+    try:
+        yield backup
+    except BaseException:
+        backup.replace(target)
+        raise
+
+
+def _sequenced_copy_target(
+    work: _Work,
+    spec: AssetSpec,
+    target_dir: PurePosixPath,
+    stem: str,
+    suffix: str,
+    content: bytes | None,
+    siblings: list[Any],
+    planned: dict[str, tuple[bytes | None, MigrationAdjustment]],
+) -> str:
+    """多图序列里新副本的落点：已有同字节、尚未登记的本资产文件就用它（重跑收敛），否则取最小的空闲序号。"""
+
+    listed = {item.replace("\\", "/") for item in siblings if isinstance(item, str)}
+    directory = work.project_dir.joinpath(*target_dir.parts)
+    # 序列里已声明的序号即使文件缺失也算占用，否则新副本会成为那一项读到的内容。
+    taken = {
+        normalize_asset_name(PurePosixPath(rel).stem)
+        for rel in (*planned, *listed)
+        if PurePosixPath(rel).parent == target_dir
+    }
+    for existing in sorted(directory.iterdir()) if directory.is_dir() else ():
+        existing_rel = (target_dir / existing.name).as_posix()
+        if not owns_named_file(spec, stem, existing_rel):
+            continue
+        taken.add(normalize_asset_name(existing.stem))
+        if (
+            existing_rel not in listed
+            and existing_rel not in planned
+            and existing.suffix == suffix
+            and not existing.is_symlink()
+            and existing.is_file()
+            and existing.read_bytes() == content
+        ):
+            return existing_rel
+    sequence = 1
+    while f"{stem}_{sequence}" in taken:
+        sequence += 1
+    return (target_dir / f"{stem}_{sequence}{suffix}").as_posix()
+
+
+def _canonical_reference(project_dir: Path, value: str) -> str:
+    """参考文件字段值的项目相对写法。
+
+    旧版 PATCH 原样收下任意字符串，运行时按项目内的落点解析：``refs/../refs/名.png``、``./``、反斜杠与
+    指向项目内的绝对路径都归到同一写法，归属判定才认得出它们。落在项目之外的值原样返回，不归任何资产。
+    """
+
+    # 按运行平台的路径语义拼接：Windows 上 ``C:/…`` 才会被认作绝对路径。
+    joined = os.path.normpath(os.path.join(project_dir, value.replace("\\", "/")))
+    for base in dict.fromkeys((os.path.normpath(project_dir), os.path.realpath(project_dir))):
+        if joined.startswith(base + os.sep):
+            return PurePath(joined[len(base) + 1 :]).as_posix()
+    return value
+
+
+def _named_file_owner(project: dict[str, Any], rel: str) -> tuple[str, str] | None:
+    """按名归属 *rel* 的资产（类型、名字）；不在任何资产名下时为 ``None``。"""
+
+    for asset_type, spec in ASSET_SPECS.items():
+        bucket = project.get(spec.bucket_key)
+        for name in bucket if isinstance(bucket, dict) else ():
+            if not isinstance(name, str):
+                continue
+            if owns_named_file(spec, name, rel) or (
+                spec.supports_derivatives and PurePosixPath(rel).parent == PurePosixPath(derivative_sheet_dir(name))
+            ):
+                return asset_type, name
+    return None
 
 
 #: 条目 id 的集号前缀（与 ``script_editor`` 的条目 id 形态一致，含 ``_N`` 拆分后缀）。
@@ -885,6 +1213,7 @@ def normalize_legacy_shapes(project_dir: Path, *, schema_version: int, record: l
         # 资产去重先于改绑：第一次提交 project.json 时，它的规整项已在待提交之列，留下的就是保留副本，
         # 能覆盖全部 project.json 规整项。它平移确认指纹时自己先行提交，同样留保留副本。
         _drop_duplicate_assets(work)
+        _copy_shared_reference_files(work)
         _canonicalize_bindings(work)
         _correct_script_episodes(work)
         _repair_item_ids(work)
@@ -900,4 +1229,4 @@ def normalize_legacy_shapes(project_dir: Path, *, schema_version: int, record: l
         logger.info("规整旧形态 %s：%d 处", project_dir.name, len(work.adjusted))
 
 
-__all__ = ["NORMALIZE_FROM_SCHEMA_VERSION", "normalize_legacy_shapes"]
+__all__ = ["NORMALIZE_FROM_SCHEMA_VERSION", "normalize_legacy_shapes", "normalize_shared_reference_files"]

@@ -1,27 +1,27 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { cn } from "cn";
+import { TruncatedText } from "@/components/shared/TruncatedText";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import type { CapabilityKey, CapabilityOverrides, ProviderModelCapabilities } from "@/types";
 import { DurationParseError, compactRangeFormat, parseDurationInput } from "@/utils/duration_format";
-import { DURATION_ERROR_KEY } from "./CustomProviderModelTable";
+import {
+  BOOL_KEYS,
+  ENUM_OPTIONS,
+  asConstraints,
+  capabilityValueText,
+  sameResolution,
+  scalarText,
+  withoutDroppedResolutions,
+  type Constraints,
+} from "./capabilityValues";
+import { DURATION_ERROR_KEY } from "./durationErrors";
 
-type Constraints = NonNullable<CapabilityOverrides["duration_constraints"]>;
-
-const BOOL_KEYS = new Set<CapabilityKey>([
-  "image_input",
-  "structured_output",
-  "text_to_image",
-  "image_to_image",
-  "text_to_video",
-  "first_frame",
-  "last_frame",
-]);
-/** 数值维度：`nullable` 的留空表示不加约束，`min` 是允许的最小值。 */
+/** 数值维度：`nullable` 的留空表示未收录，`min` 是允许的最小值。 */
 const NUMBER_KEYS: Partial<Record<CapabilityKey, { min: number; nullable: boolean; float?: boolean }>> = {
   max_output_tokens: { min: 1, nullable: false },
   max_reference_images: { min: 0, nullable: false },
@@ -29,65 +29,9 @@ const NUMBER_KEYS: Partial<Record<CapabilityKey, { min: number; nullable: boolea
   max_reference_audio_total_seconds: { min: 0, nullable: true, float: true },
   max_prompt_chars: { min: 1, nullable: true },
 };
-const ENUM_OPTIONS: Partial<Record<CapabilityKey, string[]>> = {
-  reference_audio_mode: ["none", "direct"],
-  audio_track: ["controllable", "always_on", "always_off"],
-  reference_route_audio_track: ["controllable", "always_on", "always_off"],
-};
 
 function durationText(value: unknown): string {
   return Array.isArray(value) ? compactRangeFormat(value as number[]) : "";
-}
-
-function asConstraints(value: unknown): Constraints {
-  return value && typeof value === "object" ? (value) : {};
-}
-
-/** 时长联动约束的分辨率键与可选分辨率按小写比较（与服务端一致）。 */
-function sameResolution(a: string, b: string): boolean {
-  return a.trim().toLowerCase() === b.trim().toLowerCase();
-}
-
-/** 去掉时长联动约束里已不在可选分辨率中的分辨率。 */
-export function withoutDroppedResolutions(constraints: unknown, resolutions: string[]): Constraints {
-  const value = asConstraints(constraints);
-  const byResolution = Object.fromEntries(
-    Object.entries(value.by_resolution ?? {}).filter(([res]) => resolutions.some((kept) => sameResolution(kept, res))),
-  );
-  return { ...value, by_resolution: byResolution };
-}
-
-function scalarText(value: unknown): string {
-  return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
-    ? String(value)
-    : JSON.stringify(value);
-}
-
-/** 维度取值的文字：原值与修改后的值共用。`null` 表示不加约束。 */
-export function capabilityValueText(t: TFunction, key: CapabilityKey, value: unknown): string {
-  if (value === null || value === undefined) return t("pm_cap_value_unlimited");
-  if (BOOL_KEYS.has(key)) return t(value ? "pm_cap_value_supported" : "pm_cap_value_unsupported");
-  if (key === "durations") {
-    const list = value as number[];
-    return list.length ? t("pm_cap_value_seconds", { list: compactRangeFormat(list) }) : t("pm_cap_value_none");
-  }
-  if (key === "resolutions") {
-    const list = value as string[];
-    return list.length ? list.join(t("pm_cap_value_list_separator")) : t("pm_cap_value_none");
-  }
-  if (key === "duration_constraints") {
-    const constraints = asConstraints(value);
-    const parts = Object.entries(constraints.by_resolution ?? {}).map(([res, allowed]) =>
-      t("pm_cap_constraint_resolution_item", { resolution: res, list: compactRangeFormat(allowed) }),
-    );
-    if (constraints.with_reference_images?.length) {
-      parts.push(t("pm_cap_constraint_reference_item", { list: compactRangeFormat(constraints.with_reference_images) }));
-    }
-    return parts.length ? parts.join(t("pm_cap_value_group_separator")) : t("pm_cap_value_none");
-  }
-  if (ENUM_OPTIONS[key]) return t(`pm_cap_option_${key === "reference_audio_mode" ? "audio_mode" : "audio_track"}_${scalarText(value)}`);
-  if (key === "max_reference_audio_total_seconds") return t("pm_cap_value_seconds", { list: scalarText(value) });
-  return scalarText(value);
 }
 
 interface Props {
@@ -99,17 +43,18 @@ interface Props {
 }
 
 /**
- * 「这个供应商支持的参数」：每个维度一行原值与「修改」，修改后整维替换并可编辑，「恢复」即去掉这一维的覆盖。
- * 原值是没有修改时运行时采用的值（对应条目的值，对应不上条目时为回落的结果）。可选时长下方紧跟时长联动约束。
+ * 「这个供应商支持的参数」：每个维度一行。可以修改的维度显示原值与「修改」，修改后整维替换并可编辑，「恢复」即去掉
+ * 这一维的覆盖；不能修改的维度（官方收录的模型的全部维度等）只读显示生效值。原值是没有修改时运行时
+ * 采用的值（模型条目与调用通道两侧求值的结果），两侧都没有声明的数值显示「未收录」。可选时长下方紧跟时长联动约束。
  */
 export function ProviderCapabilityOverrides({ capabilities, value, onChange, onValidityChange }: Props) {
   const { t } = useTranslation("dashboard");
 
   const set = (key: CapabilityKey, next: unknown) => {
     const draft: Record<string, unknown> = { ...value };
+    // 「恢复」卸载这一维的编辑器，编辑器里没改对的输入在卸载时自己收回「不合法」
     if (next === undefined) {
       delete draft[key];
-      onValidityChange(key, true);
     } else {
       draft[key] = next;
     }
@@ -128,11 +73,25 @@ export function ProviderCapabilityOverrides({ capabilities, value, onChange, onV
     return Object.keys(constraints.by_resolution ?? {});
   })();
 
+  const editable = new Set(capabilities.editable);
   return (
     <ul className="flex flex-col divide-y divide-border/60 rounded-lg border border-border">
-      {capabilities.editable.map((key) => {
-        const overridden = key in value;
+      {capabilities.displayed.map((key) => {
         const label = t(`pm_cap_${key}`);
+        if (!editable.has(key)) {
+          return (
+            <li key={key} className={cn("flex items-center gap-2 px-3 py-2", key === "duration_constraints" && "pl-6")}>
+              <span className="w-36 shrink-0 text-sm">{label}</span>
+              <span className="min-w-0 flex-1">
+                <TruncatedText
+                  className="text-sm text-subtle-foreground"
+                  text={capabilityValueText(t, key, key in capabilities.effective ? capabilities.effective[key] : capabilities.base[key])}
+                />
+              </span>
+            </li>
+          );
+        }
+        const overridden = key in value;
         const base = capabilities.base[key];
         return (
           <li
@@ -170,6 +129,11 @@ export function ProviderCapabilityOverrides({ capabilities, value, onChange, onV
                 label={label}
                 value={value[key]}
                 resolutions={effectiveResolutions}
+                hint={
+                  capabilities.media_type === "image" && key === "max_reference_images"
+                    ? t("pm_cap_reference_images_hint")
+                    : undefined
+                }
                 onChange={(next) => set(key, next)}
                 onValidityChange={(valid) => onValidityChange(key, valid)}
               />
@@ -181,7 +145,7 @@ export function ProviderCapabilityOverrides({ capabilities, value, onChange, onV
   );
 }
 
-/** 点「修改」时的起始值：原值；不加约束的维度给一个可直接编辑的起点。 */
+/** 点「修改」时的起始值：原值；未收录的维度给一个可直接编辑的起点。 */
 function initialOverride(key: CapabilityKey, base: unknown): unknown {
   if (base !== null && base !== undefined) return structuredClone(base);
   if (BOOL_KEYS.has(key)) return true;
@@ -197,15 +161,17 @@ interface EditorProps {
   label: string;
   value: unknown;
   resolutions: string[];
+  /** 数值输入下方的提示，给出时替换该维度的默认提示（如图片参考图上限的 0 与图生图的关系）。 */
+  hint?: string;
   onChange: (next: unknown) => void;
   onValidityChange: (valid: boolean) => void;
 }
 
 /**
  * 一个能力维度的取值编辑器，「这个供应商支持的参数」与「模型信息」共用。文本输入只在挂载时取 `value` 作初值，
- * 外部改了取值（放弃修改、采用官方值）时由调用方换 `key` 重新挂载。
+ * 外部改了取值（放弃修改、采用官方值）时由调用方换 `key` 重新挂载；卸载的文本输入不再拦着保存。
  */
-export function CapabilityValueEditor({ dimension, label, value, resolutions, onChange, onValidityChange }: EditorProps) {
+export function CapabilityValueEditor({ dimension, label, value, resolutions, hint, onChange, onValidityChange }: EditorProps) {
   const { t } = useTranslation("dashboard");
   const editLabel = t("pm_cap_edit_named", { name: label });
 
@@ -291,7 +257,7 @@ export function CapabilityValueEditor({ dimension, label, value, resolutions, on
       label={editLabel}
       initial={value === null || value === undefined ? "" : scalarText(value)}
       inputMode={numeric.float ? "decimal" : "numeric"}
-      hint={numeric.nullable ? t("pm_cap_empty_unlimited_hint") : undefined}
+      hint={hint ?? (numeric.nullable ? t("pm_cap_empty_unrecorded_hint") : undefined)}
       parse={(text) => {
         const trimmed = text.trim();
         if (!trimmed) return numeric.nullable ? { value: null } : { error: t("pm_cap_error_required") };
@@ -328,12 +294,19 @@ interface ParsedInputProps {
   onValidityChange: (valid: boolean) => void;
 }
 
-/** 文本输入：每次输入都解析，合法时写回修改，不合法时就地提示并让保存栏拦下保存。 */
+/**
+ * 文本输入：每次输入都解析，合法时写回修改，不合法时就地提示并让保存栏拦下保存。
+ * 卸载时收回自己报的「不合法」：换一代重新挂载、约束行随分辨率删除后，没改对的旧输入不再拦着保存。
+ */
 function ParsedInput({ label, initial, hint, inputMode, parse, onChange, onValidityChange }: ParsedInputProps) {
   const [text, setText] = useState(initial);
   const [error, setError] = useState<string | null>(null);
   const hintId = useId();
   const note = error ?? hint;
+  const releaseInvalid = useEffectEvent(() => {
+    if (error !== null) onValidityChange(true);
+  });
+  useEffect(() => () => releaseInvalid(), []);
   return (
     <div className="flex flex-col gap-1">
       <Input
@@ -369,7 +342,7 @@ interface ConstraintsEditorProps {
   onValidityChange: (valid: boolean) => void;
 }
 
-/** 时长联动约束：每个分辨率一行可选时长，另有「使用参考图时」一行；留空表示这一行不加约束。 */
+/** 时长联动约束：每个分辨率一行可选时长，另有「使用参考图时」一行；留空表示这一行不限定时长。 */
 function ConstraintsEditor({ value, resolutions, onChange, onValidityChange }: ConstraintsEditorProps) {
   const { t } = useTranslation("dashboard");
   // 各行输入是否合法只用来汇总成整维的合法性，不参与渲染
@@ -379,19 +352,6 @@ function ConstraintsEditor({ value, resolutions, onChange, onValidityChange }: C
     else invalid.current.add(row);
     onValidityChange(invalid.current.size === 0);
   };
-  // 删掉分辨率时它那一行随之消失：行里没改对的输入不再拦着保存
-  const rowKeys = resolutions.map((resolution) => `res:${resolution}`).join("\n");
-  useEffect(() => {
-    const kept = new Set(rowKeys.split("\n"));
-    let pruned = false;
-    for (const key of invalid.current) {
-      if (key !== "reference" && !kept.has(key)) {
-        invalid.current.delete(key);
-        pruned = true;
-      }
-    }
-    if (pruned) onValidityChange(invalid.current.size === 0);
-  }, [rowKeys, onValidityChange]);
   const byResolution = value.by_resolution ?? {};
   const allowedFor = (resolution: string) =>
     Object.entries(byResolution).find(([res]) => sameResolution(res, resolution))?.[1];

@@ -35,7 +35,7 @@ from lib.custom_provider.declarative_backend import (
     response_extract_guard,
 )
 from lib.custom_provider.path_overrides import NO_PATH_OVERRIDES, PathOverrides
-from lib.infra.async_thread import run_sync_transaction
+from lib.infra.async_thread import run_noninterruptible_sync
 
 _HTTP_TIMEOUT_SECONDS = 60
 
@@ -53,6 +53,17 @@ _IMAGE_CAPABILITY_BY_FIELD: Mapping[str, ImageCapability] = {
     "text_to_image": ImageCapability.TEXT_TO_IMAGE,
     "image_to_image": ImageCapability.IMAGE_TO_IMAGE,
 }
+
+
+def definition_reference_limit(definition: Mapping[str, Any]) -> int | None:
+    """定义声明的参考图上限（通道事实）；未声明或不是正数时为 ``None``，即通道不限张数。
+
+    定义里的 ``max_reference_images: 0`` 沿用协议约定，表示不声明上限。校验器保证声明了图生图就有正数上限。
+    """
+    value = (definition.get("capabilities") or {}).get("max_reference_images")
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 def image_capabilities_from_definition(definition: Mapping[str, Any]) -> frozenset[ImageCapability]:
@@ -160,18 +171,15 @@ class DeclarativeImageBackend:
     def capabilities(self) -> set[ImageCapability]:
         return set(image_capabilities_from_definition(self._definition))
 
+    async def reference_image_limit(self) -> int | None:
+        return self._reference_limit
+
     @property
-    def max_reference_images(self) -> int:
-        """定义声明的参考图上限；未声明时为 ``0``。校验器保证声明了图生图就有正数上限。"""
-        value = (self._definition.get("capabilities") or {}).get("max_reference_images")
-        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+    def _reference_limit(self) -> int | None:
+        return definition_reference_limit(self._definition)
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
-        # 编排层已按 max_reference_images 裁剪并提示；这里的截断只是兜底，超出的图没有落点。上限为 0
-        # 时按协议不裁剪。
         references = request.reference_images
-        if self.max_reference_images:
-            references = references[: self.max_reference_images]
         context = await asyncio.to_thread(
             self._engine.request_context,
             {
@@ -249,7 +257,7 @@ async def _write_inline_image(state: ImageJobState, output_path: Path) -> None:
 
     try:
         # 解码大图是 CPU 密集操作，放到线程里免得卡住事件循环。
-        await run_sync_transaction(decode_and_save)
+        await run_noninterruptible_sync(decode_and_save)
     except ValueError as exc:
         raise DeclarativeRuntimeError("declarative_response_extract_failed", detail=str(exc)) from exc
     except OSError as exc:

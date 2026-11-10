@@ -50,6 +50,7 @@ from lib.episode.episode_paths import (
 from lib.infra.content_digest import prefixed_canonical_json_digest
 from lib.infra.json_io import atomic_write_json, load_json_or_none
 from lib.project.project_activity import record_project_activity
+from lib.project.project_change_hints import emit_project_change_hint
 from lib.script.draft_violation import DraftViolation, render_violation_report
 
 #: 草稿的产出来源。``content`` 与该来源那一步的模型输出 schema 同形：参考生视频 script_plan 是
@@ -264,6 +265,16 @@ def violation_entries(violations: list[DraftViolation]) -> list[dict[str, Any]]:
     return entries
 
 
+def announce_draft_change(project_path: Path, path: Path) -> None:
+    """草稿文件刚写入或删除：按当前来源发一次项目变更 hint。
+
+    草稿不经 ProjectManager 写盘，事件服务靠轮询发现它的变化，来源取同一扫描窗口内到达的 hint。
+    写盘后立即发出，Web 端的手修保存才会按 ``webui`` 结算；Agent 与文本任务不设来源，仍按
+    ``filesystem`` 广播。
+    """
+    emit_project_change_hint(project_path.name, changed_paths=[path.relative_to(project_path).as_posix()])
+
+
 def write_quarantine(
     project_path: Path,
     episode: int,
@@ -290,6 +301,7 @@ def write_quarantine(
             meta=meta,
         ),
     )
+    announce_draft_change(project_path, path)
     record_project_activity(project_path)
     return path
 
@@ -340,22 +352,25 @@ def quarantine_exists(project_path: Path, episode: int, kind: str) -> bool:
 
 
 def clear_quarantine(project_path: Path, episode: int, kind: str, *, record_activity: bool = True) -> bool:
-    """清除草稿（晋升成功或用户丢弃），返回是否真的删掉了文件；删掉时推进项目活动。
+    """晋升成功后清除草稿，返回是否真的删掉了文件；删掉时推进项目活动。丢弃草稿走 :func:`lib.script.planning_draft_trash.discard_quarantine`。
 
     缺失时静默——晋升可能来自一次直接重跑，本就没有草稿要清。在外层写事务内清除时传
     ``record_activity=False``，由外层提交后记账：账本是项目全局的，不随事务回滚。
     """
+    path = quarantine_path(project_path, episode, kind)
     try:
-        quarantine_path(project_path, episode, kind).unlink()
+        # hard-delete: temp -- 晋升的暂存草稿，内容已写入正式文件
+        path.unlink()
     except FileNotFoundError:
         return False
+    announce_draft_change(project_path, path)
     if record_activity:
         record_project_activity(project_path)
     return True
 
 
 def render_report(draft: Path, kind: str, violations: list[DraftViolation], *, episode: int) -> str:
-    """渲染回给 Agent 的违约报告：逐条定位 + 按处置路径写的修复指引。
+    """渲染回给 Agent 的违约报告：逐条定位 + 按处置路径写的修复指引。``draft`` 是项目内相对路径。
 
     指引写「改哪个文件的哪个字段、改完调什么」而非泛泛的「请修正」：处置路径是本机制的全部
     要点，Agent 若不知道产物还在盘上，就会退回重抽。
@@ -363,7 +378,7 @@ def render_report(draft: Path, kind: str, violations: list[DraftViolation], *, e
     stage, field = _QUARANTINE_REPORT_HINTS[kind]
     doc_type = QUARANTINE_KIND_TO_DOC_TYPE[kind]
     return (
-        f"❌ {stage}产出有 {len(violations)} 处违约，已保存为待修复草稿（正式文件未被改动）：{draft}\n\n"
+        f"❌ {stage}产出有 {len(violations)} 处违约，已保存为待修复草稿（正式文件未被改动）：{draft.as_posix()}\n\n"
         f"{render_violation_report(violations)}\n\n"
         f'处置：调用 open_draft({{"episode_id": {episode}, "doc_type": "{doc_type}"}}) 读取正文与 revision；'
         f"修正 {field} 后用 patch_draft 携带 base_revision 提交；"
@@ -390,7 +405,8 @@ def quarantine_and_report(
     出现「报告说去改某个文件、而那个文件没被写出来」的分叉。
     """
     path = write_quarantine(project_path, episode, kind, content=content, violations=violations, meta=meta)
-    return render_report(path, kind, violations, episode=episode)
+    # 报告会原样回给（可能在远程的）Agent：草稿只按项目内相对路径指名，不外泄服务端目录布局。
+    return render_report(path.relative_to(project_path), kind, violations, episode=episode)
 
 
 __all__ = [

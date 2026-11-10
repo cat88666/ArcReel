@@ -4,12 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
-import type { EpisodeView, EpisodeViewTab } from "./episode-view";
-
-/** 视图 tab 的元素 id，视图区以它作为无障碍名。 */
-export function episodeViewTabId(view: EpisodeView): string {
-  return `episode-view-tab-${view}`;
-}
+import { episodeViewTabId, type EpisodeView, type EpisodeViewTab } from "./episode-view";
 
 /**
  * 置灰的视图 tab：目前只在还没有正式脚本时出现（分镜、多宫格分镜图），悬停与读屏都说明「脚本生成后可用」。
@@ -39,6 +34,7 @@ function DisabledViewTab({ view, label }: { view: EpisodeView; label: string }) 
  */
 export function EpisodePageHeader({
   head,
+  sourceEntry,
   progress,
   tabs,
   view,
@@ -47,6 +43,8 @@ export function EpisodePageHeader({
   onActionsSlot,
 }: {
   head: ReactNode;
+  /** 只读的「查看原文」入口，本集没有可查看的原文时不渲染内容。 */
+  sourceEntry: ReactNode;
   /** 制作进度入口；演示项目没有。 */
   progress: ReactNode;
   tabs: EpisodeViewTab[];
@@ -68,6 +66,7 @@ export function EpisodePageHeader({
     <header className="shrink-0 border-b border-border">
       <div className="flex h-11 items-center gap-3 px-4">
         {head}
+        {sourceEntry}
         {progress}
       </div>
       <div className="flex h-10 items-center gap-3 px-4">

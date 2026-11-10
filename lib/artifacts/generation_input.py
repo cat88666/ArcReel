@@ -40,6 +40,7 @@ from lib.artifacts.visual_artifact_provenance import (
     VisualReference,
     build_asset_sheet_visual_basis,
     build_storyboard_image_visual_basis,
+    project_basis_records_asset_names,
 )
 from lib.project.asset_derivatives import (
     DERIVATIVE_ASSET_TYPE,
@@ -179,6 +180,8 @@ class StoryboardImageSemantics:
     image_prompt: object
     style: str
     style_description: str
+    #: schema < 19 的项目沿用记资产名的依据口径（``project_basis_records_asset_names``）。
+    asset_names: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,14 +291,16 @@ class ImageGenerationInput[S: GenerationSemantics]:
             absent=self.gaps,
         )
 
-    def render(self, *, max_reference_images: int, model: str) -> RenderedInput:
+    def render(self, *, max_reference_images: int | None, model: str) -> RenderedInput:
         """按供应商上限裁剪后渲染提示词，不冻结参考图；预览用，编号与 :meth:`freeze` 一致。"""
 
         self._require_complete()
         visuals = [reference.visual for reference in self.references]
         return _render_clamped(self.semantics, visuals, max_reference_images=max_reference_images, model=model)
 
-    def freeze(self, *, max_reference_images: int, model: str, bind_claims: ClaimBinder) -> FrozenGenerationInput:
+    def freeze(
+        self, *, max_reference_images: int | None, model: str, bind_claims: ClaimBinder
+    ) -> FrozenGenerationInput:
         """把完整参考图集冻结到任务私有快照，再绑定 claim、裁剪、渲染并构造登记依据。
 
         依据与 claim 按完整冻结集，供应商只收前 N 张；裁剪发生时结果带一条 warning。
@@ -382,6 +387,7 @@ def storyboard_image_input(
             image_prompt=image_prompt,
             style=style,
             style_description=style_description,
+            asset_names=project_basis_records_asset_names(project),
         ),
         canvas_ratio=canvas_ratio,
         references=tuple(assembly.references),
@@ -775,6 +781,7 @@ def _visual_basis(
                 aspect_ratio=canvas_ratio,
                 references=references,
                 absent=absent,
+                asset_names=semantics.asset_names,
             )
         case AssetSheetSemantics():
             return build_asset_sheet_visual_basis(
@@ -831,7 +838,7 @@ def _render_clamped(
     semantics: GenerationSemantics,
     visuals: Sequence[VisualReference],
     *,
-    max_reference_images: int,
+    max_reference_images: int | None,
     model: str,
 ) -> RenderedInput:
     clamp = clamp_reference_images(visuals, max_reference_images, model=model)
@@ -848,7 +855,7 @@ def _freeze(
     canvas_ratio: str,
     references: Sequence[AssembledReference],
     *,
-    max_reference_images: int,
+    max_reference_images: int | None,
     model: str,
     bind_claims: ClaimBinder,
 ) -> FrozenGenerationInput:

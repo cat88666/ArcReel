@@ -96,6 +96,8 @@ export interface EpisodeScriptSnapshot {
 export interface VersionInfo {
   version: number;
   filename: string;
+  /** 快照的项目内相对路径；移入项目回收站时作为文件视图删除接口的 path。 */
+  file?: string;
   created_at: string;
   file_size: number;
   is_current: boolean;
@@ -200,6 +202,11 @@ export interface UsageSummaryQuery {
 export interface SuccessResponse {
   success: boolean;
   message?: string;
+}
+
+/** 新建项目资产的结果；项目回收站里有同类型同名资产的删除记录时带上最新那条的 ID。 */
+export interface AssetCreateResult extends SuccessResponse {
+  trash_record_id?: string | null;
 }
 
 export interface AgentProfileStatus {

@@ -8,9 +8,9 @@ import { PresentationPlayer } from "@/components/shared/PresentationPlayer";
 import { NarrationAudioCard } from "@/components/canvas/timeline/NarrationAudioCard";
 import { UPLOAD_VIDEO_ACCEPT, UploadIconButton } from "@/components/canvas/shared/UploadIconButton";
 import { formatCost } from "@/utils/cost-format";
-import { StatusBadge, resolveUnitStatus } from "./unit-status";
+import { resolveUnitStatus } from "./unit-status";
+import { UnitStatusBadge } from "./UnitStatusBadge";
 import type { CostBreakdown, ReferenceVideoUnit, UnitStatus } from "@/types";
-import { itemIdWithinEpisode } from "@/utils/episode-display";
 import { previewAspect } from "@/utils/preview-aspect";
 import { Button } from "@/components/ui/button";
 
@@ -164,7 +164,7 @@ export function UnitPreviewPanel({
             iconOnly
           />
         )}
-        <StatusBadge status={effectiveStatus} />
+        <UnitStatusBadge status={effectiveStatus} />
       </div>
 
       {/* 画框按项目画幅：竖屏 9:16、高度取 55dvh 与栏宽换算值中较小的一个；横屏 16:9、高度同样不超过 55dvh。
@@ -285,17 +285,13 @@ export function UnitPreviewPanel({
       <section className="rounded-lg border border-border bg-card p-3">
         <h3 className="mb-2 text-xs font-medium text-muted-foreground">{t("reference_preview_metadata")}</h3>
         <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3.5 gap-y-1.5 text-xs">
-          <dt className="text-muted-foreground">{t("reference_meta_unit")}</dt>
-          <dd className="font-mono text-subtle-foreground" translate="no">
-            {itemIdWithinEpisode(unit.unit_id)}
-          </dd>
           <dt className="text-muted-foreground">{t("reference_meta_duration")}</dt>
           <dd className="font-mono tabular-nums text-subtle-foreground">
             {t("reference_editor_unit_meta", { duration: unit.duration_seconds })}
           </dd>
           <dt className="text-muted-foreground">{t("reference_meta_status")}</dt>
           <dd>
-            <StatusBadge status={effectiveStatus} />
+            <UnitStatusBadge status={effectiveStatus} />
           </dd>
           {hasCost(actualCost) && (
             <>

@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple, Protocol, cast
 
@@ -35,6 +35,7 @@ from lib.script.draft_quarantine import (
     QUARANTINE_KIND_SCRIPT_PLAN,
     QUARANTINE_KIND_TO_DOC_TYPE,
     QuarantinedDraft,
+    announce_draft_change,
     clear_quarantine,
     draft_owner,
     draft_payload,
@@ -48,6 +49,7 @@ from lib.script.draft_quarantine import (
 )
 from lib.script.draft_violation import DraftViolation, schema_violations
 from lib.script.plan_new_assets import NEW_ASSETS_FIELD, dedupe_new_assets, planning_project, with_new_assets
+from lib.script.planning_draft_trash import discard_quarantine
 from lib.script.script_generator import ScriptGenerator
 from lib.script.script_models import (
     NarrationScriptPlanDraft,
@@ -72,8 +74,10 @@ from server.text_generation import (
     load_script_plan_source_with_basis,
     narration_script_plan_path,
     narration_script_plan_result_text,
+    plan_item_ids,
     reference_result_text,
     reference_soft_violations,
+    reissue_plan_item_ids,
     render_soft_violation_lines,
     render_soft_violation_section,
     uses_reference_video_units,
@@ -109,7 +113,7 @@ EPISODE_ID_DESCRIPTION = (
 )
 
 
-_DRAFT_REVISION_DESCRIPTION = "open_draft / 上次 patch_draft 返回的 revision"
+_DRAFT_REVISION_DESCRIPTION = "open_draft / 上次 patch_draft 返回的 revision；带 sha256-v1: 前缀与裸 hex 两种写法等价"
 
 
 class _DraftRequest(BaseModel):
@@ -142,8 +146,8 @@ class PatchDraftRequest(_DraftRequest):
     accept_formal_revision: str | None = Field(
         default=None,
         description=(
-            "合并正式文档并发修改后，显式接受 open_draft 返回的 formal_revision；"
-            "正式文档已不存在时该值为 null，同样显式传 null。省略表示不接受"
+            "合并正式文档并发修改后，显式接受 open_draft 返回的 formal_revision（带 sha256-v1: 前缀与裸 hex "
+            "两种写法等价）；正式文档已不存在时该值为 null，同样显式传 null。省略表示不接受"
         ),
     )
     source: str | None = Field(
@@ -153,7 +157,7 @@ class PatchDraftRequest(_DraftRequest):
 
 
 class PromoteDraftRequest(_DraftRequest):
-    base_revision: str = Field(description="open_draft 返回的当前草稿 revision")
+    base_revision: str = Field(description=_DRAFT_REVISION_DESCRIPTION)
 
 
 class DiscardDraftRequest(_DraftRequest):
@@ -165,6 +169,9 @@ class DraftWorkflowError(Exception):
 
     ``failure`` 非空表示重判被视频请求事实挡下（模型能力不满足、档位缺失等配置问题，不是草稿本身的
     违约）：``code`` 即其问题码，Web 与 Agent 都按问题码、参数与修复指引呈现真实原因。
+
+    ``notice_key`` 非空表示违约带有面向用户的文案 key 与参数 ``notice_params``（如晋升前正式剧本单元
+    没过预判）：``code`` 不变，Web 按该 key 本地化说明原因，``detail`` 仍面向 Agent。
     """
 
     def __init__(
@@ -174,12 +181,16 @@ class DraftWorkflowError(Exception):
         *,
         draft_refreshed: bool = False,
         failure: VideoRequestFactsFailure | None = None,
+        notice_key: str | None = None,
+        notice_params: dict[str, Any] | None = None,
     ):
         super().__init__(detail)
         self.code = code
         self.detail = detail
         self.draft_refreshed = draft_refreshed
         self.failure = failure
+        self.notice_key = notice_key
+        self.notice_params = notice_params or {}
 
     @classmethod
     def video_facts(cls, failure: VideoRequestFactsFailure) -> DraftWorkflowError:
@@ -319,6 +330,14 @@ async def revalidate_reference_script_plan_draft(
         soft_violations=soft_violations,
         new_assets=new_assets,
     )
+
+
+def _project_relative(path: Path, project_path: Path) -> str:
+    """回执里的路径只写项目内相对路径，不外泄服务端文件系统布局；不在项目目录下时只给文件名。"""
+    try:
+        return path.relative_to(project_path).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _commit_reference_script_plan(
@@ -465,11 +484,22 @@ async def _promote_reference_script_plan(
         )
         raise DraftWorkflowError("draft_invalid", report + _soft_violation_section(revalidation), draft_refreshed=True)
 
+    # 编号只由服务端发、只分配不复用：沿用盘上正式规划按位置已发的编号（原样晋升因此逐字不变），
+    # 多出的单元另发新号；回执里的降级提示按落盘的编号定位。
+    formal_ids = await asyncio.to_thread(
+        plan_item_ids, script_review.official_reference_script_plan_path(project_path, episode)
+    )
+    unit_ids = formal_ids[: len(flat_units)]
+    if len(flat_units) > len(unit_ids):
+        unit_ids += await run_sync_transaction(
+            ctx.pm.reserve_item_ids, ctx.project_name, episode, "video_units", len(flat_units) - len(unit_ids)
+        )
     units = build_reference_units_from_flat(
         flat_units,
         planning_project(project, revalidation.new_assets),
         episode=episode,
         max_refs=split_caps.max_refs,
+        unit_ids=unit_ids,
     )
     # 写盘经单一出口（lib.script.script_review.write_script_plan_locked）：锁、基线比对、prompt_authoring 草稿清理
     # 只存在那一处。基线指纹取自取回 / 草稿产出时记进 meta 的 base_fingerprint——正式文件在草稿
@@ -498,9 +528,11 @@ async def _promote_reference_script_plan(
             ),
         ) from conflict
     return reference_result_text(
-        script_review.official_reference_script_plan_path(project_path, episode),
+        script_review.official_reference_script_plan_path(project_path, episode).relative_to(project_path),
         units,
-        render_soft_violation_lines(revalidation.soft_violations),
+        render_soft_violation_lines(
+            [replace(soft, item_id=unit_ids[soft.item_index]) for soft in revalidation.soft_violations]
+        ),
         action="晋升",
     )
 
@@ -529,12 +561,13 @@ def _render_script_plan_conflict_report(
         latest_block = "当前正式文件不存在或不是合法的 script_plan JSON，无法附上最新内容；请自行读取该文件确认。"
     # 指纹按 JSON 字面量给：正式文件已被删除时现值是 null，写成 "None" 会让 Agent
     # 接受错误的基线，之后每次重晋升都比对不上、拿到同一份报告，冲突再也解不掉。
-    actual_literal = json.dumps(conflict.actual)
+    actual_literal = json.dumps(script_review.published_revision(conflict.actual))
     doc_type = QUARANTINE_KIND_TO_DOC_TYPE[draft.kind]
     return (
         "❌ 晋升中止（并发冲突）：正式 script_plan 在本草稿产出后已被其他写入方（如 Web 端保存）修改，"
         "直接晋升会覆盖对方的修改，本次未写盘、草稿仍在场。\n"
-        f"草稿基线指纹: {json.dumps(conflict.expected)}；盘上现值指纹: {actual_literal}\n\n"
+        f"草稿基线指纹: {json.dumps(script_review.published_revision(conflict.expected))}；"
+        f"盘上现值指纹: {actual_literal}\n\n"
         f"{latest_block}\n\n"
         f"处置：调用 open_draft 读取当前草稿与 formal_revision，对照上方最新内容合并 {field_hint}；"
         "再调用 patch_draft 提交完整 content，并把 formal_revision 作为 accept_formal_revision；"
@@ -556,7 +589,8 @@ def _render_prompt_authoring_conflict_report(
     )
     return (
         "❌ 晋升中止（并发冲突）：正式剧本在本草稿产出后已被修改，本次未写盘、草稿仍在场。\n"
-        f"草稿基线指纹: {json.dumps(conflict.expected)}；盘上现值指纹: {json.dumps(conflict.actual)}\n\n"
+        f"草稿基线指纹: {json.dumps(script_review.published_revision(conflict.expected))}；"
+        f"盘上现值指纹: {json.dumps(script_review.published_revision(conflict.actual))}\n\n"
         f"当前正式剧本的最新内容：\n{latest}\n\n"
         "处置：调用 open_draft 读取当前草稿与 formal_revision，合并最新正式内容；"
         "再调用 patch_draft 提交完整 content，并把 formal_revision 作为 accept_formal_revision；"
@@ -746,6 +780,9 @@ async def _promote_drama_script_plan(
     # （Web 端保存、重跑 normalize）改过时晋升中止、返回冲突报告让 Agent 合并，不静默覆盖。
     expected = draft.meta.get("base_fingerprint", script_review.UNCHECKED_FINGERPRINT)
     script_plan_path = episode_drafts_dir(project_path, episode) / SCRIPT_PLAN_FILENAMES["drama"]
+    await reissue_plan_item_ids(
+        ctx.pm, ctx.project_name, episode, content, keep=await asyncio.to_thread(plan_item_ids, script_plan_path)
+    )
     try:
         await run_sync_transaction(
             commit_single_script_plan,
@@ -770,7 +807,7 @@ async def _promote_drama_script_plan(
         ) from conflict
     raw_scenes = content.get("scenes")
     return drama_script_plan_result_text(
-        script_plan_path,
+        script_plan_path.relative_to(project_path),
         raw_scenes if isinstance(raw_scenes, list) else [],
         action="晋升",
     )
@@ -948,6 +985,13 @@ async def _promote_narration_script_plan(
     # 缺少 base_fingerprint 的草稿按无基线晋升。
     expected = draft.meta.get("base_fingerprint", script_review.UNCHECKED_FINGERPRINT)
     script_plan_path = narration_script_plan_path(project_path, episode)
+    await reissue_plan_item_ids(
+        ctx.pm,
+        ctx.project_name,
+        episode,
+        revalidation.content,
+        keep=await asyncio.to_thread(plan_item_ids, script_plan_path),
+    )
     try:
         await run_sync_transaction(
             commit_single_script_plan,
@@ -970,7 +1014,7 @@ async def _promote_narration_script_plan(
         raise DraftWorkflowError("formal_revision_conflict", conflict_report) from conflict
     raw_segments = revalidation.content.get("segments")
     return narration_script_plan_result_text(
-        script_plan_path,
+        script_plan_path.relative_to(project_path),
         raw_segments if isinstance(raw_segments, list) else [],
         action="晋升",
     )
@@ -1185,7 +1229,9 @@ class DraftWorkflow:
         draft = read_quarantine(self.ctx.project_path, episode, kind)
         if draft is not None:
             payload = draft_payload(draft)
-            payload["formal_revision"] = script_review.content_fingerprint(self._formal_path(episode, kind))
+            payload["formal_revision"] = script_review.published_revision(
+                script_review.content_fingerprint(self._formal_path(episode, kind))
+            )
             return payload
         if quarantine_exists(self.ctx.project_path, episode, kind):
             detail = f"集（id={episode}）{doc_type_for_kind(kind)} draft is not a valid JSON envelope"
@@ -1295,7 +1341,9 @@ class DraftWorkflow:
         if draft is None:
             return self._read(episode, resolved)
         actual_revision = draft_revision(draft)
-        if base_revision != actual_revision:
+        if script_review.fingerprint_of_revision(base_revision) != script_review.fingerprint_of_revision(
+            actual_revision
+        ):
             raise DraftWorkflowError(
                 "revision_conflict",
                 f"draft revision changed: expected {base_revision}, actual {actual_revision}",
@@ -1309,11 +1357,12 @@ class DraftWorkflow:
             meta = {**meta, "source": source}
         if accepts_formal_revision:
             actual_formal_revision = script_review.content_fingerprint(self._formal_path(episode, resolved))
-            if accept_formal_revision != actual_formal_revision:
+            if script_review.fingerprint_of_revision(accept_formal_revision) != actual_formal_revision:
                 raise DraftWorkflowError(
                     "formal_revision_conflict",
                     "formal document changed again: "
-                    f"expected {accept_formal_revision}, actual {actual_formal_revision}",
+                    f"expected {accept_formal_revision}, "
+                    f"actual {script_review.published_revision(actual_formal_revision)}",
                 )
             meta = {**meta, "base_fingerprint": actual_formal_revision}
         if before_commit is not None:
@@ -1328,8 +1377,13 @@ class DraftWorkflow:
                 meta=meta,
             ),
         )
+        announce_draft_change(self.ctx.project_path, path)
         record_project_activity(self.ctx.project_path)
-        return self._read(episode, resolved)
+        receipt = self._read(episode, resolved)
+        # 草稿里的违约是上一轮产出 / 晋升针对旧正文的判定，修改后不再对应现值：回执不带它，
+        # 免得调用方把旧报告当成这次修改的结果。现值的违约以晋升时的全量重判为准。
+        receipt.pop("violations", None)
+        return receipt
 
     async def patch(
         self,
@@ -1386,7 +1440,9 @@ class DraftWorkflow:
             )
             if draft is None:
                 return await asyncio.to_thread(self._read, episode, resolved)
-            if base_revision != actual_revision:
+            if script_review.fingerprint_of_revision(base_revision) != script_review.fingerprint_of_revision(
+                actual_revision
+            ):
                 raise DraftWorkflowError(
                     "revision_conflict",
                     f"draft revision changed: expected {base_revision}, actual {actual_revision}",
@@ -1418,7 +1474,7 @@ class DraftWorkflow:
                         _prompt_authoring_lock_held=True,
                         **promote_kwargs,
                     )
-                    message = f"✅ 提示词编写晋升（正式剧本）已保存: {result_path}"
+                    message = f"✅ 提示词编写晋升（正式剧本）已保存: {_project_relative(result_path, project_path)}"
             except (DraftWorkflowError, ModelNotInCatalogError):
                 # ModelNotInCatalogError 原样上抛：调用方据此给出「重新选择模型」指引
                 raise
@@ -1427,8 +1483,17 @@ class DraftWorkflow:
                     "formal_revision_conflict", _render_prompt_authoring_conflict_report(episode, draft, exc)
                 ) from exc
             except DraftViolation as exc:
-                # 提示词编写晋升被违约挡下时，报告已写回草稿（code="quarantined"）；其余违约来自正式剧本。
-                raise DraftWorkflowError("draft_invalid", str(exc), draft_refreshed=exc.code == "quarantined") from exc
+                # 提示词编写晋升被违约挡下时，报告已写回草稿（code="quarantined"）；其余违约来自正式剧本，
+                # 带文案 key 的（正式剧本单元没过预判）按界面单元称呼说明原因。
+                refreshed = exc.code == "quarantined"
+                notice = exc.params is not None and not refreshed
+                raise DraftWorkflowError(
+                    "draft_invalid",
+                    str(exc),
+                    draft_refreshed=refreshed,
+                    notice_key=exc.code if notice else None,
+                    notice_params=dict(exc.params or {}) if notice else None,
+                ) from exc
             except Exception as exc:
                 raise DraftWorkflowError("draft_promote_failed", str(exc)) from exc
         value: dict[str, Any] = {
@@ -1438,7 +1503,7 @@ class DraftWorkflow:
             "message": message,
         }
         if result_path is not None:
-            value["path"] = str(result_path)
+            value["path"] = _project_relative(result_path, project_path)
         return value
 
     async def save(
@@ -1484,12 +1549,14 @@ class DraftWorkflow:
                 episode,
                 resolved,
             )
-            if draft is not None and base_revision != actual_revision:
+            if draft is not None and script_review.fingerprint_of_revision(
+                base_revision
+            ) != script_review.fingerprint_of_revision(actual_revision):
                 raise DraftWorkflowError(
                     "revision_conflict",
                     f"draft revision changed: expected {base_revision}, actual {actual_revision}",
                 )
-            discarded = await run_sync_transaction(clear_quarantine, project_path, episode, resolved)
+            discarded = await run_sync_transaction(discard_quarantine, project_path, episode, resolved)
         return {"episode": episode, "doc_type": doc_type, "discarded": discarded}
 
 

@@ -63,7 +63,6 @@ function model(id: number, modelId: string, endpoint = "openai-chat"): CustomPro
     matched_entry: null,
     capability_overrides: null,
     system_capabilities: null,
-    global_bucket_refs: [],
     path_overrides: null,
     requests: [],
   };
@@ -118,7 +117,10 @@ function listItem(modelId: string): ProviderModelItem {
     official: false,
     flags: ["unpriced"],
     price: null,
+    lifecycle: { status: "available", shutdown_date: null, successor: null },
     endpoint: "openai-chat",
+    min_app_version: null,
+    min_app_version_satisfied: true,
   };
 }
 
@@ -129,11 +131,12 @@ function detailOf(item: ProviderModelItem): ProviderModelDetail {
     provider_multiplier: 1,
     entry: null,
     entry_binding: null,
-    capabilities: { media_type: "text", editable: [], base: {}, overrides: {}, effective: {} },
+    capabilities: { media_type: "text", editable: [], displayed: [], base: {}, overrides: {}, effective: {} },
     endpoint: "openai-chat",
     resolution: null,
     path_overrides: null,
     requests: [],
+    endpoint_options: [],
   };
 }
 

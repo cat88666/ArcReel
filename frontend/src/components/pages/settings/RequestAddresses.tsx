@@ -4,10 +4,11 @@ import { cn } from "cn";
 import { TruncatedText } from "@/components/shared/TruncatedText";
 import { Button } from "@/components/ui/button";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { InfoTip, InfoTipContent, InfoTipTrigger } from "@/components/ui/info-tip";
 import type { EndpointRequest, PathOverrides } from "@/types";
 
 const MODEL_PLACEHOLDER = /\{\{\s*model\s*\}\}/g;
+// 与服务端 url_utils.strip_base_url_version 同口径（只认 ASCII 数字）
 const VERSION_SUFFIX = /\/v\d+(?:\.\d+)?[a-zA-Z]*$/;
 const ENSURED_SUFFIX: Partial<Record<EndpointRequest["base_url_rule"], string>> = {
   ensure_api_v3: "/api/v3",
@@ -166,20 +167,19 @@ function AddressBar({ request, rawBase, override, display, onCommit }: AddressBa
     >
       <TruncatedText text={base} className="max-w-3/5 shrink-0 text-muted-foreground" />
       {autoV1 && (
-        <Tooltip>
-          <TooltipTrigger
+        <InfoTip>
+          <InfoTipTrigger
             render={
-              <span
-                // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- 悬停或聚焦都要能看到说明；它没有可执行的动作
-                tabIndex={0}
+              <button
+                type="button"
                 className="mx-0.5 shrink-0 rounded-sm border border-dashed border-border px-0.5 text-muted-foreground"
               />
             }
           >
             /v1
-          </TooltipTrigger>
-          <TooltipContent>{t("cp_request_auto_v1")}</TooltipContent>
-        </Tooltip>
+          </InfoTipTrigger>
+          <InfoTipContent title="/v1">{t("cp_request_auto_v1")}</InfoTipContent>
+        </InfoTip>
       )}
       <button
         type="button"

@@ -39,7 +39,9 @@ import { isResourceBusy } from "@/stores/tasks-store";
 import type { PromptOverwrite } from "@/types";
 import { errMsg } from "@/utils/async";
 import { useEpisodeLedger } from "@/hooks/useEpisodeLedger";
-import { episodeAgentRef, itemIdsInEpisodeText } from "@/utils/episode-display";
+import { episodeAgentRef, episodeItemAgentRef, itemIdsAsPositionsInText } from "@/utils/episode-display";
+import { EpisodeItemRef } from "@/components/shared/episode-item/EpisodeItemRef";
+import { useProjectsStore } from "@/stores/projects-store";
 import { promptAuthoringEntries, type PromptAuthoringEntry } from "./prompt-authoring-entries";
 import { promptAuthoringHandoffText } from "./prompt-authoring-handoff";
 
@@ -104,6 +106,7 @@ export function PromptAuthoringDialog({
   onClose,
 }: DialogProps) {
   const { t } = useTranslation("dashboard");
+  const scripts = useProjectsStore((s) => s.currentScripts);
   const episodeLedger = useEpisodeLedger();
   const scopeLabelId = useId();
   const rewriteId = useId();
@@ -125,10 +128,11 @@ export function PromptAuthoringDialog({
   const [submitting, setSubmitting] = useState(false);
   const [overwrite, setOverwrite] = useState<PromptOverwrite | null>(null);
 
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
   // 脚本在弹窗打开期间变化（条目被删）时，自选范围只算仍在脚本里的条目，按剧本顺序。
   const selectedIds = useMemo(
-    () => entries.filter((entry) => selected.includes(entry.id)).map((entry) => entry.id),
-    [entries, selected],
+    () => entries.filter((entry) => selectedSet.has(entry.id)).map((entry) => entry.id),
+    [entries, selectedSet],
   );
 
   const entryIds: string[] | null =
@@ -137,7 +141,7 @@ export function PromptAuthoringDialog({
   const scopeLabel =
     scope === "pending"
       ? t("prompt_authoring_scope_pending_prefill", { count: pendingCount })
-      : (entryIds ?? []).join(t("prompt_authoring_id_separator"));
+      : (entryIds ?? []).map((id) => episodeItemAgentRef(id, scripts, t)).join(t("prompt_authoring_id_separator"));
 
   const guardBusy = (): boolean => {
     if (isResourceBusy("text_episode_script", projectName, promptAuthoringResourceId(episode))) {
@@ -179,8 +183,9 @@ export function PromptAuthoringDialog({
       await API.savePromptAuthoringInstructions(projectName, episode, instructions.trim());
     } catch (err) {
       useAppStore.getState().pushToast(errMsg(err), "error");
-      setSubmitting(false);
       return;
+    } finally {
+      setSubmitting(false);
     }
     useAssistantStore.getState().setInput(
       promptAuthoringHandoffText(t, {
@@ -191,7 +196,6 @@ export function PromptAuthoringDialog({
       }),
     );
     useAppStore.getState().setAssistantPanelOpen(true);
-    setSubmitting(false);
     onClose();
   };
 
@@ -251,11 +255,11 @@ export function PromptAuthoringDialog({
                       <li key={entry.id} className="rounded-sm px-1.5 py-1 hover:bg-muted/50">
                         <Label className="w-full">
                           <Checkbox
-                            checked={selected.includes(entry.id)}
+                            checked={selectedSet.has(entry.id)}
                             disabled={submitting}
                             onCheckedChange={() => toggle(entry.id)}
                           />
-                          <span className="font-mono text-foreground">{entry.id}</span>
+                          <EpisodeItemRef itemId={entry.id} className="min-w-0" />
                           <span className="ml-auto text-xs text-muted-foreground">
                             {entry.pending
                               ? t("prompt_authoring_entry_pending")
@@ -335,7 +339,7 @@ export function PromptAuthoringDialog({
           <AlertDialogBody tabIndex={0} role="region" aria-label={t("prompt_authoring_overwrite_title")}>
             <AlertDialogDescription>
               <span className="whitespace-pre-line wrap-break-word">
-                {overwrite ? itemIdsInEpisodeText(overwrite.text) : null}
+                {overwrite ? itemIdsAsPositionsInText(overwrite.text, scripts, t) : null}
               </span>
             </AlertDialogDescription>
           </AlertDialogBody>

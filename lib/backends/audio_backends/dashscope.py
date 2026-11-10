@@ -5,12 +5,16 @@
 ``output.audio.url`` 给出 wav 文件 URL（24kHz，24h 有效），再 HTTP GET 下载字节落盘。
 TTS 同步调用不带 X-DashScope-Async 头（该头仅图像/视频异步两步式使用）。
 schema 依据 docs/api-docs/providers/dashscope.md 所列一手官方文档。
+
+百炼的其他同步语音合成端点（如 SpeechSynthesizer，见 ``dashscope_speech_synthesizer``）沿用同一套
+「计费 POST 取 URL → 独立重试下载」流程，子类只换请求路径、请求体、音色表与用量解析。
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -41,7 +45,7 @@ from lib.backends.dashscope_shared import (
 )
 from lib.backends.providers import PROVIDER_DASHSCOPE
 from lib.backends.transport_layer import TransportLayer
-from lib.infra.async_thread import run_sync_transaction
+from lib.infra.async_thread import run_noninterruptible_sync
 from lib.infra.logging_utils import format_kwargs_for_log
 from lib.infra.retry import with_retry_async
 
@@ -92,6 +96,9 @@ class _EmptyDownloadError(RuntimeError):
 class DashScopeAudioBackend:
     """阿里百炼语音合成后端（同步 multimodal 端点）。"""
 
+    #: 合成请求相对 ``{host}/api/v1`` 的路径。
+    _endpoint_path = _TTS_ENDPOINT
+
     def __init__(
         self,
         *,
@@ -122,15 +129,28 @@ class DashScopeAudioBackend:
     def list_voices(self) -> list[VoiceOption]:
         return list(_VOICE_CATALOG)
 
-    async def synthesize(self, request: AudioSynthesisRequest) -> AudioSynthesisResult:
+    def _synthesis_input(self, request: AudioSynthesisRequest) -> dict[str, Any]:
+        """请求体 ``input`` 段。multimodal 端点只收文本、音色与语种。"""
         if request.speed is not None:
             # 同步 qwen3-tts-flash 不支持 speech_rate（仅 realtime WebSocket 版可用），忽略。
             logger.debug("DashScope 同步 TTS 不支持语速参数 speed=%s，已忽略", request.speed)
+        return {
+            "text": request.text,
+            "voice": request.voice,
+            "language_type": request.language_type,
+        }
 
+    def _usage_tokens(self, response: dict[str, Any]) -> tuple[int | None, int | None]:
+        """从合成响应取 (输入 token, 输出音频 token)。qwen3-tts 按字符计价，不报 token。"""
+        return None, None
+
+    async def synthesize(self, request: AudioSynthesisRequest) -> AudioSynthesisResult:
         # 合成（计费）与下载分两段独立重试：下载瞬时失败只重试 GET，绝不回头重跑会再次计费的
         # 合成 POST（与 lib.infra.retry.DOWNLOAD_* 注释「下载失败不浪费生成额度」一致）。
-        url = await self._request_synthesis(request)
-        await self._download_audio(url, request.output_path)
+        response = await self._request_synthesis(request)
+        # 用量在下载之前取出：下载失败时整次调用失败、不落账，取用量的位置不影响计费口径。
+        input_tokens, audio_output_tokens = self._usage_tokens(response)
+        await self._download_audio(extract_audio_url(response), request.output_path)
 
         logger.info("DashScope 语音合成完成: %s", request.output_path)
 
@@ -139,19 +159,14 @@ class DashScopeAudioBackend:
             model=self._model,
             text=request.text,
             output_path=request.output_path,
+            input_tokens=input_tokens,
+            audio_output_tokens=audio_output_tokens,
         )
 
     @with_retry_async(retry_if=should_retry_submit)
-    async def _request_synthesis(self, request: AudioSynthesisRequest) -> str:
-        """提交合成请求（计费段），返回 output.audio.url。"""
-        payload = {
-            "model": self._model,
-            "input": {
-                "text": request.text,
-                "voice": request.voice,
-                "language_type": request.language_type,
-            },
-        }
+    async def _request_synthesis(self, request: AudioSynthesisRequest) -> dict[str, Any]:
+        """提交合成请求（计费段），返回响应体；响应缺 output.audio.url 时在此抛错。"""
+        payload = {"model": self._model, "input": self._synthesis_input(request)}
         # safe_body_for_log 只输出 model + parameters 白名单，不读取 input.text，
         # 合成文本不会进日志（CodeQL clear-text-logging 告警对此为误报）。
         logger.info(
@@ -169,14 +184,17 @@ class DashScopeAudioBackend:
             # （保留 status_code），交 should_retry_submit 按状态码分流——4xx fail-fast、5xx/429 重试。
             resp = await submit_post(
                 lambda: client.post(
-                    f"{self._base_url}{_TTS_ENDPOINT}",
+                    f"{self._base_url}{self._endpoint_path}",
                     json=payload,
                     headers=dashscope_headers(self._api_key),
                 ),
                 provider=PROVIDER_DASHSCOPE,
                 include_provider_reason=False,
             )
-            return extract_audio_url(resp.json())
+            body = resp.json()
+            # 缺 URL 的响应（含顶层业务错误）在计费段内抛出。
+            extract_audio_url(body)
+            return body
 
     async def _download_audio(self, url: str, output_path: Path) -> None:
         """下载合成音频（非计费段），走共用的产物下载预算。
@@ -185,13 +203,18 @@ class DashScopeAudioBackend:
         预签发 URL 的 4xx 是确定性错误一律 fail-fast），5xx/传输/网络错误重试，业务错误
         fail-fast；200-空体（``_EmptyDownloadError``）属瞬态另行重试。
         """
-        await with_artifact_retry(
-            lambda: self._fetch_audio(url, output_path),
+        content = await with_artifact_retry(
+            lambda: self._fetch_audio(url),
             label="DashScope 音频",
             retry_if=lambda e: isinstance(e, _EmptyDownloadError) or should_retry_signed_download(e),
         )
+        # 落盘放在重试的墙钟预算之外：不可中断的线程调用若落在 asyncio.timeout 块内，超时就失效。
+        # 取消落在写盘期间时线程照常写完，取消随之消失，调用方 MediaGenerator.generate_audio_async
+        # 的 finally 清理 staging 路径与后续产物提交都在写入结算之后进行（docs/standards/backend.md
+        # 「供应商返回之后的落账段不可中断」）。
+        await run_noninterruptible_sync(output_path.write_bytes, content)
 
-    async def _fetch_audio(self, url: str, output_path: Path) -> None:
+    async def _fetch_audio(self, url: str) -> bytes:
         # 日志与异常只带去掉 query 的 URL：预签名参数在有效期内等同下载凭证
         safe_url = url.split("?", 1)[0]
         async with (
@@ -211,8 +234,4 @@ class DashScopeAudioBackend:
         if not content:
             # 200 但空体：不写 0 字节 wav
             raise _EmptyDownloadError(f"DashScope 音频下载返回空内容: {safe_url}")
-        # 走 run_sync_transaction 而非裸 to_thread：调用方 MediaGenerator.generate_audio_async
-        # 的 finally 会 unlink staging 路径，取消时线程若仍在写就会与该清理交错
-        # （POSIX 下写出孤儿文件，Windows 下 unlink 报 PermissionError）。写入先结算、
-        # 再放取消传出去。
-        await run_sync_transaction(output_path.write_bytes, content)
+        return content

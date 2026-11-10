@@ -65,6 +65,7 @@ updates:
           - "google-genai"
           - "openai"
           - "volcengine-python-sdk*"
+          - "tos"
           - "xai-sdk"
           - "instructor"
         update-types:
@@ -92,7 +93,6 @@ updates:
           - "pdf-oxide"
           - "mammoth"
           - "docx2txt"
-          - "ebooklib"
           - "beautifulsoup4"
           - "lxml"
           - "charset-normalizer"
@@ -114,6 +114,7 @@ updates:
           - "patch"
       dev-dependencies:
         patterns:
+          - "anyio"
           - "pytest*"
           - "ruff"
           - "basedpyright"

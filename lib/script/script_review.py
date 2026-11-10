@@ -38,10 +38,11 @@ from lib.episode.episode_paths import (
     episode_drafts_dir,
     episode_script_filename,
 )
-from lib.infra.content_digest import canonical_json_digest
+from lib.infra.content_digest import canonical_json_digest, prefixed, unprefixed
 from lib.infra.json_io import atomic_write_json, load_json_or_none
 from lib.infra.path_safety import try_safe_join
 from lib.infra.validation_messages import default_translate
+from lib.project import project_trash
 from lib.project.project_activity import record_project_activity
 from lib.project.project_manager import ProjectManager, find_episode, is_reference_video_project
 from lib.script.draft_quarantine import (
@@ -50,7 +51,6 @@ from lib.script.draft_quarantine import (
     QUARANTINE_KIND_NARRATION_SCRIPT_PLAN,
     QUARANTINE_KIND_PROMPT_AUTHORING,
     QUARANTINE_KIND_SCRIPT_PLAN,
-    clear_quarantine,
     draft_owner,
     quarantine_path,
     read_quarantine,
@@ -185,6 +185,20 @@ def content_fingerprint(path: Path) -> str | None:
     return content_fingerprint_of_data(parsed)
 
 
+def published_revision(fingerprint: str | None) -> str | None:
+    """内容指纹对外的 revision 写法：带 ``sha256-v1:`` 前缀，与读取面其余 revision 同一种表示。
+
+    指纹本身（落盘的基线、草稿 meta、项目记录）仍是裸 hexdigest；只在交给客户端时加前缀，
+    入参经 ``fingerprint_of_revision`` 去前缀后再与指纹比对。
+    """
+    return prefixed(fingerprint) if fingerprint is not None else None
+
+
+def fingerprint_of_revision(revision: str | None) -> str | None:
+    """客户端传回的 revision → 内容指纹：带前缀与裸 hexdigest 两种写法都接受。"""
+    return unprefixed(revision) if revision is not None else None
+
+
 class _UncheckedFingerprint(enum.Enum):
     """``write_script_plan_locked`` 的 ``expected_fingerprint`` 哨兵类型：区分「不做基线比对」与
     「基线是 None（写入方取基线时正式文件不存在）」——两者都要能表达，``None`` 只够表达后者。"""
@@ -248,7 +262,7 @@ def complete_stale_script_plan_rebuild(
             raise ScriptPlanRebuildCompletionError("not_stale", "episode is not awaiting a stale script_plan rebuild")
         if STALE_SCRIPT_PLAN_REVISION_FIELD not in entry:
             raise ScriptPlanRebuildCompletionError("missing_baseline", "stale episode has no rebuild baseline")
-        if entry.get(STALE_SCRIPT_PLAN_REVISION_FIELD) != expected_stale_revision:
+        if entry.get(STALE_SCRIPT_PLAN_REVISION_FIELD) != fingerprint_of_revision(expected_stale_revision):
             raise ScriptPlanRebuildCompletionError(
                 "baseline_conflict", "stale script_plan baseline changed; refresh workflow status"
             )
@@ -368,15 +382,29 @@ def formal_script_plan_write_transaction(
 
 
 def delete_script_plan_file(project_path: Path, episode: int, path: Path) -> bool:
-    """Delete a formal script_plan and forget its active claim through the same transaction."""
+    """把正式 script_plan 移进项目回收站，并在同一事务里撤掉它的产物登记。"""
 
     pm = ProjectManager.for_project_dir(project_path)
     with pm.file_lock(path):
         if not path.exists():
             return False
-        with formal_script_plan_write_transaction(project_path, episode, path):
-            path.unlink()
+        trash_script_plan_locked(project_path, episode, path)
     return True
+
+
+def trash_script_plan_locked(project_path: Path, episode: int, path: Path) -> None:
+    """:func:`delete_script_plan_file` 的锁内主体：调用方已持有该文件的 per-path 锁。"""
+    from lib.script.planning_draft_trash import trash_planning_draft
+
+    record = None
+    try:
+        with formal_script_plan_write_transaction(project_path, episode, path):
+            record = trash_planning_draft(project_path, episode, path)
+    except BaseException:
+        # 撤登记失败时事务已把文件按字节写回，记录随之撤掉；写回也失败时记录留着，内容不丢。
+        if record is not None and path.is_file():
+            project_trash.purge(project_path, record.id)
+        raise
 
 
 def write_formal_script_plan_locked(
@@ -414,11 +442,21 @@ def write_formal_script_plan_locked(
     changed = previous != content
     quarantine = None if dependent_quarantine is None else quarantine_path(project_path, episode, dependent_quarantine)
     paths = (path,) if quarantine is None else (path, quarantine)
-    with formal_script_plan_write_transaction(project_path, episode, *paths, basis=basis, record_activity=changed):
-        atomic_write_json(path, content)
-        if changed and clear_dependent_quarantine and dependent_quarantine is not None:
-            # 内容变了才清，提交后由事务按内容变化记账
-            clear_quarantine(project_path, episode, dependent_quarantine, record_activity=False)
+    from lib.script.planning_draft_trash import trash_planning_draft
+
+    record = None
+    try:
+        with formal_script_plan_write_transaction(project_path, episode, *paths, basis=basis, record_activity=changed):
+            atomic_write_json(path, content)
+            if changed and clear_dependent_quarantine and quarantine is not None:
+                # 内容变了才作废：草稿进项目回收站，提交后由事务按内容变化记账
+                record = trash_planning_draft(project_path, episode, quarantine)
+    except BaseException:
+        # 事务已把草稿按字节写回，记录随之撤掉。
+        # shortcut: 外层另有 formal_write_transaction 包住草稿、在本函数返回后失败时，外层写回草稿而记录留着（多一条可恢复的记录，内容不丢）；需要严格时把记录建在最外层事务里。
+        if record is not None and quarantine is not None and quarantine.is_file():
+            project_trash.purge(project_path, record.id)
+        raise
     return changed
 
 
@@ -502,7 +540,7 @@ class OverwrittenScriptEntry:
 
 @dataclass(frozen=True, slots=True)
 class FormalScriptOverwrite:
-    """内容确认将覆盖的正式脚本：确认后旧条目全部移除，产物按分镜移除的口径撤登记。
+    """内容确认将覆盖的正式脚本：确认后旧条目全部移除，产物按分镜移除的口径撤登记、连同版本历史移进项目回收站。
 
     ``fingerprint`` 是读取时正式脚本的内容指纹，对外作 ``revision``：调用方认可覆盖时回传它，
     与确认时读到的正式脚本不符即视为未认可、按新清单重新拒绝；覆盖写入也以它为基线，认可只对应
@@ -514,7 +552,7 @@ class FormalScriptOverwrite:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "revision": self.fingerprint,
+            "revision": published_revision(self.fingerprint),
             "entries": [entry.to_dict() for entry in self.entries],
             "storyboard_count": sum(entry.has_storyboard for entry in self.entries),
             "video_count": sum(entry.has_video for entry in self.entries),

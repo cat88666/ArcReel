@@ -6,7 +6,7 @@ import { useHasUnsavedChanges } from "@/components/shared/edit-unit/LeaveGuard";
 import type { SseStreamHandle } from "@/utils/sse-stream";
 import { useAppStore } from "@/stores/app-store";
 import { useAssistantStore } from "@/stores/assistant-store";
-import { useProjectsStore } from "@/stores/projects-store";
+import { useProjectsStore, type RefreshProjectResult } from "@/stores/projects-store";
 import { useCostStore } from "@/stores/cost-store";
 import { SCRIPT_PLAN_TASK_TYPES, useTasksStore } from "@/stores/tasks-store";
 import { useUsageHeaderStore } from "@/stores/usage-header-store";
@@ -77,6 +77,11 @@ function isTaskChange(change: ProjectChange): boolean {
 /** 记账结算变更（刷新信号，非项目实体变更）。 */
 function isUsageRecordChange(change: ProjectChange): boolean {
   return change.entity_type === "usage_record";
+}
+
+/** 项目回收站变化（刷新信号，非项目实体变更）。 */
+function isTrashChange(change: ProjectChange): boolean {
+  return change.entity_type === "trash";
 }
 
 function getChangePriority(change: ProjectChange): number {
@@ -222,8 +227,8 @@ export function useProjectEventsSSE(projectName?: string | null): void {
     executeFocus(target);
   }, [executeFocus, hasUnsavedChanges]);
 
-  const refreshProject = useCallback(async () => {
-    if (!projectName) return;
+  const refreshProject = useCallback(async (): Promise<RefreshProjectResult> => {
+    if (!projectName) return "cancelled";
     // 在途合并逻辑（单飞 + 排队再跑一轮 + 失败留旧）已下沉到 projects-store.refreshProject；
     // 此处只保留 SSE 专属包装：失败时告警、刷新落定后消费排队的聚焦目标。
     //
@@ -238,14 +243,14 @@ export function useProjectEventsSSE(projectName?: string | null): void {
     // 等待期间没有别的调用改写过它，可以放心视为「跟自己这一轮对应」；ref 已变则跳过，
     // 交由改写它的那次调用在自己对应轮次落定后消费。
     const focusSnapshot = queuedFocusRef.current;
-    await useProjectsStore.getState().refreshProject(projectName, {
+    const result = await useProjectsStore.getState().refreshProject(projectName, {
       onError: (err) =>
         pushNotification(tRef.current("project_sync_failed", { message: errMsg(err) }), "warning"),
     });
-    if (queuedFocusRef.current !== focusSnapshot) {
-      return;
+    if (queuedFocusRef.current === focusSnapshot) {
+      flushQueuedFocus();
     }
-    flushQueuedFocus();
+    return result;
   }, [flushQueuedFocus, projectName, pushNotification]);
 
   useEffect(() => {
@@ -289,6 +294,8 @@ export function useProjectEventsSSE(projectName?: string | null): void {
         // 任务终态事件已经错过，顶栏用量按事件刷新，故在此补一次全量重取。
         if (previousFingerprint) {
           void useUsageHeaderStore.getState().refresh();
+          // 回收站不在快照指纹里，断线期间的增删同样只能在这里补拉。
+          useAppStore.getState().invalidateTrash();
         }
         // 会话恢复通知只推一次，订阅建立之前（含首次建连前的失败重试）发出的已经错过；
         // 首次快照也要核对：会话 hook 的加载读到的状态可能早于这次恢复。
@@ -309,8 +316,11 @@ export function useProjectEventsSSE(projectName?: string | null): void {
         // 记账结算与任务终态同为刷新信号：混进实体变更会在 entityRevisions 里留下永不
         // 被消费的 `usage_record:<id>` 键，并把前一批实体变更排队的聚焦目标清空。
         const entityChanges = payload.changes.filter(
-          (c) => !isTaskChange(c) && !isUsageRecordChange(c),
+          (c) => !isTaskChange(c) && !isUsageRecordChange(c) && !isTrashChange(c),
         );
+        if (payload.changes.some(isTrashChange)) {
+          useAppStore.getState().invalidateTrash();
+        }
 
         // 提取并更新 asset fingerprints（零延迟，立即写入 store）
         const mergedFingerprints: Record<string, number> = {};
@@ -419,22 +429,24 @@ export function useProjectEventsSSE(projectName?: string | null): void {
         // 重建窗口内落盘、却未被任何在途批次描述的变更，后端会补扫后单独广播。
         // 通知里的集标题与播出位置取刷新后的账本：Agent 新建、改名或调序的集在事件到达时
         // 还不在本地账本里，按旧账本成文会显示成未命名集或旧标题，推出后无法再改。
+        // 刷新没有成功时不成文：旧剧本里还没有新建的条目，会被写成「已删除」；同步失败已另行告警。
         if (entityChanges.length > 0) {
-          void refreshProject().finally(() => {
-            if (disposed || !notifyChanges) return;
-            const episodeLedger = useProjectsStore.getState().currentProjectData?.episodes ?? [];
+          void refreshProject().then((result) => {
+            if (disposed || !notifyChanges || result !== "success") return;
+            const { currentProjectData, currentScripts } = useProjectsStore.getState();
+            const episodeLedger = currentProjectData?.episodes ?? [];
             for (const group of groupedChanges) {
               if (!hasImportantChanges(group)) {
                 continue;
               }
               pushNotification(
-                formatGroupedNotificationText(group, tEventsRef.current, episodeLedger),
+                formatGroupedNotificationText(group, tEventsRef.current, episodeLedger, currentScripts),
                 "success",
               );
             }
             for (const { group, target } of workspaceNotifications) {
               pushWorkspaceNotification({
-                text: formatGroupedDeferredText(group, tEventsRef.current, episodeLedger),
+                text: formatGroupedDeferredText(group, tEventsRef.current, episodeLedger, currentScripts),
                 target,
               });
             }

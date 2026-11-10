@@ -16,17 +16,16 @@ import { useDraftEditor } from "@/hooks/useDraftEditor";
 import { useModelCapabilities } from "@/hooks/useModelCapabilities";
 import { useScriptReviewDraft } from "@/hooks/useScriptReviewDraft";
 import { voidPromise } from "@/utils/async";
-import { groupDraftViolations, groupSoftViolations } from "@/utils/draft-violations";
+import { draftViolationMessage, groupDraftViolations, groupSoftViolations } from "@/utils/draft-violations";
 import {
   AgentDraftBar,
   DiscardDraftDialog,
   DraftEpisodeViolations,
   DraftSoftViolationList,
   InvalidDraftBar,
-  draftFallbackText,
-  draftFixRequestText,
-  prefillAssistant,
 } from "@/components/shared/DraftStatus";
+import { draftFallbackText, draftFixRequestText } from "@/components/shared/draft-text";
+import { prefillAssistant } from "@/components/shared/prefill-assistant";
 import { sumItemDuration } from "@/utils/script-shape";
 import { EpisodeDurationSummary } from "@/components/shared/EpisodeDurationSummary";
 import { ScriptOverwriteConfirmDialog } from "@/components/shared/ScriptOverwriteConfirmDialog";
@@ -41,9 +40,11 @@ import { StartBlankScriptButton } from "@/components/canvas/shared/StartBlankScr
 import { ScriptHighlight } from "@/components/shared/ScriptHighlight";
 import { toScriptLines, type MentionLookup } from "@/hooks/useUnitPromptHighlight";
 import { dialogueSpeakers, extractMentions, normalizeAssetName } from "@/utils/reference-mentions";
-import { NewAssetsSection, hasValidNewAssets, type NewAssetEntryRefs } from "@/components/canvas/shared/NewAssetsSection";
+import { NewAssetsSection, type NewAssetEntryRefs } from "@/components/canvas/shared/NewAssetsSection";
+import { hasValidNewAssets } from "@/utils/plan-new-assets";
 import { useEpisodeLedger } from "@/hooks/useEpisodeLedger";
-import { episodeAgentRef, itemIdsInEpisodeText, itemIdWithinEpisode } from "@/utils/episode-display";
+import { episodeAgentRef } from "@/utils/episode-display";
+import { ItemPositionBadge } from "@/components/shared/episode-item/ItemPositionBadge";
 import { tierProblemText } from "./unit-tier-problem";
 import { ReferenceSplitAlert } from "./ReferenceSplitAlert";
 
@@ -71,10 +72,12 @@ const SPEECH_VIOLATION_KEYS: Record<string, string> = {
 /** unit 卡的统一显示形状：结构化（已晋升）与扁平（草稿）两种来源在这里收敛。 */
 interface DisplayUnit {
   key: string;
+  /** 在规划里的位置，从 1 起；界面以它称呼单元。 */
+  position: number;
   duration_seconds: number;
   sourceText: string;
   scriptText: string;
-  /** 正文与时长可就地修改（未确认的正式内容，或结构完好的待修复草稿）。 */
+  /** 正文、原文与时长可就地修改（未确认的正式内容，或结构完好的待修复草稿）。 */
   editable: boolean;
 }
 
@@ -87,8 +90,9 @@ function unitStats(scriptText: string, lookup: MentionLookup): { utterances: num
 }
 
 function structuredDisplayUnits(draft: ReferenceScriptPlanDraft): DisplayUnit[] {
-  return draft.units.map((u) => ({
+  return draft.units.map((u, i) => ({
     key: u.unit_id,
+    position: i + 1,
     duration_seconds: u.duration_seconds,
     sourceText: u.source_text,
     scriptText: u.text,
@@ -122,6 +126,8 @@ function narrowFlatUnitsDraft(content: Record<string, unknown> | null): FlatUnit
 function newAssetEntries(units: DisplayUnit[]): NewAssetEntryRefs[] {
   return units.map((unit) => ({
     id: unit.key,
+    position: unit.position,
+    kind: "unit" as const,
     names: [...extractMentions(unit.scriptText), ...dialogueSpeakers(unit.scriptText)],
     snippet: unit.sourceText,
   }));
@@ -149,6 +155,7 @@ function draftUnitKey(episode: number, index: number): string {
 function flatDisplayUnits(draft: FlatUnitsDraft, episode: number): DisplayUnit[] {
   return draft.units.map((u, i) => ({
     key: draftUnitKey(episode, i),
+    position: i + 1,
     duration_seconds: u.duration_seconds,
     sourceText: u.source_text,
     scriptText: u.text,
@@ -169,6 +176,7 @@ function brokenDraftDisplayUnits(content: Record<string, unknown> | null, episod
     return [
       {
         key: draftUnitKey(episode, i),
+        position: i + 1,
         duration_seconds: typeof u.duration_seconds === "number" ? u.duration_seconds : 0,
         sourceText: typeof u.source_text === "string" ? u.source_text : "",
         scriptText: typeof u.text === "string" ? u.text : "",
@@ -226,7 +234,7 @@ function unitLacksSceneReference(scriptText: string, lookup: MentionLookup, proj
   return !extractMentions(scriptText).some((name) => lookup[name] === "scene");
 }
 
-function InlineViolations({ violations, unitKey }: { violations: ScriptReviewViolation[]; unitKey: string }) {
+function InlineViolations({ violations, position }: { violations: ScriptReviewViolation[]; position: number }) {
   const { t } = useTranslation("dashboard");
   if (!violations.length) return null;
   return (
@@ -237,9 +245,10 @@ function InlineViolations({ violations, unitKey }: { violations: ScriptReviewVio
           ?.map(({ path, line }) => `${path.join(".")}${line === null ? "" : `:${line + 1}`}`)
           .join(", ");
         const message = speechKey && location
-          ? t(speechKey, { unitId: itemIdWithinEpisode(unitKey), location })
-          : itemIdsInEpisodeText(v.message);
+          ? t(speechKey, { position, location })
+          : draftViolationMessage(v, t, position);
         return (
+          // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 违约由服务端整表算出、没有 ID，同一 code 可重复出现；只读文本、行内无状态
           <p key={`${v.code}-${i}`} className="mt-1 flex items-start gap-1.5 pl-1 text-xs leading-snug text-destructive">
             <OctagonAlert className="mt-px size-3 shrink-0" aria-hidden="true" />
             <span>{message}</span>
@@ -260,6 +269,7 @@ function UnitCard({
   editing,
   onToggleEdit,
   onTextChange,
+  onSourceTextChange,
   supportedDurations,
   durationEndpointFixed,
   durationProblem,
@@ -279,6 +289,8 @@ function UnitCard({
   editing: boolean;
   onToggleEdit: () => void;
   onTextChange: ((text: string) => void) | null;
+  /** 原文与正文同进编辑态；是否逐字摘录由服务端在保存后校验，结论回流为「原文」小节的红标。 */
+  onSourceTextChange: ((sourceText: string) => void) | null;
   supportedDurations: number[] | null;
   durationEndpointFixed: boolean;
   /** 所落桶的视频请求事实失败：标签与带修复指引的提示，由 `tierProblemText` 按桶生成。 */
@@ -292,6 +304,7 @@ function UnitCard({
   busy: boolean;
 }) {
   const { t } = useTranslation("dashboard");
+  const unitLabel = t("common:item_position_unit", { position: unit.position });
   const hasViolation = violations.anchorSource.length + violations.byLine.size + violations.aggregate.length > 0;
   const anchorBroken = violations.anchorSource.length > 0;
   const stats = useMemo(() => unitStats(unit.scriptText, lookup), [unit.scriptText, lookup]);
@@ -309,7 +322,7 @@ function UnitCard({
       className={`scroll-mt-28 rounded-lg border bg-card p-4 ${hasViolation ? "border-destructive/45" : "border-border"}`}
     >
       <div className="flex items-center gap-2">
-        <span className="rounded-sm bg-muted px-1.5 py-0.5 font-mono text-xs text-subtle-foreground">{itemIdWithinEpisode(unit.key)}</span>
+        <ItemPositionBadge position={unit.position} kind="unit" />
         {durationProblem ? (
           <span className="text-xs font-medium text-warn">
             {durationProblem.label}
@@ -321,7 +334,7 @@ function UnitCard({
             options={durationOptions}
             onChange={(seconds) => onDurationChange?.(seconds)}
             disabled={busy}
-            label={t("reference_script_plan_duration_label", { unit: itemIdWithinEpisode(unit.key) })}
+            label={t("reference_script_plan_duration_label", { unit: unitLabel })}
             endpointFixed={durationEndpointFixed}
           />
         )}
@@ -364,14 +377,26 @@ function UnitCard({
             </span>
           )}
         </summary>
-        <p
-          className={`mt-1.5 border-l pl-3 text-xs leading-relaxed ${
-            anchorBroken ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground"
-          }`}
-        >
-          {unit.sourceText}
-        </p>
-        <InlineViolations violations={violations.anchorSource} unitKey={unit.key} />
+        {editing && unit.editable && onSourceTextChange ? (
+          <Textarea
+            value={unit.sourceText}
+            onChange={(e) => onSourceTextChange(e.target.value)}
+            disabled={busy}
+            placeholder={t("review_source_text_placeholder")}
+            aria-label={t("reference_script_plan_unit_source_text_label", { unit: unitLabel })}
+            aria-invalid={anchorBroken || undefined}
+            className="mt-1.5"
+          />
+        ) : (
+          <p
+            className={`mt-1.5 border-l pl-3 text-xs leading-relaxed ${
+              anchorBroken ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground"
+            }`}
+          >
+            {unit.sourceText}
+          </p>
+        )}
+        <InlineViolations violations={violations.anchorSource} position={unit.position} />
       </details>
 
       <div className="mt-3">
@@ -380,20 +405,20 @@ function UnitCard({
             value={unit.scriptText}
             onChange={(e) => onTextChange(e.target.value)}
             disabled={busy}
-            aria-label={t("reference_script_plan_unit_text_label", { unit: itemIdWithinEpisode(unit.key) })}
+            aria-label={t("reference_script_plan_unit_text_label", { unit: unitLabel })}
           />
         ) : (
           <ScriptHighlight
             text={unit.scriptText}
             lookup={lookup}
             renderAfterLine={(sourceLine) => (
-              <InlineViolations violations={violations.byLine.get(sourceLine) ?? []} unitKey={unit.key} />
+              <InlineViolations violations={violations.byLine.get(sourceLine) ?? []} position={unit.position} />
             )}
           />
         )}
       </div>
 
-      <InlineViolations violations={violations.aggregate} unitKey={unit.key} />
+      <InlineViolations violations={violations.aggregate} position={unit.position} />
 
       {/* 降级提示（不阻断确认），与违约的红标区分开：正文合法，只是画面地点没被钉住。 */}
       {lacksScene && (
@@ -402,7 +427,7 @@ function UnitCard({
           <span>{t("reference_script_plan_unit_without_scene")}</span>
         </p>
       )}
-      <DraftSoftViolationList softViolations={softViolations} />
+      <DraftSoftViolationList softViolations={softViolations} position={unit.position} />
     </article>
   );
 }
@@ -421,7 +446,7 @@ const LIVE_SOFT_VIOLATION_CODES: ReadonlySet<string> = new Set(["ref_warn_unit_w
  * 干净态仅需确认放行 prompt_authoring。
  *
  * 待修复草稿在场时面板呈现草稿本身：违约挂到所在 unit（语法类行内锚定到出问题的行）、整集层面的
- * 违约置顶，正文与时长可就地修改后保存并校验，违约清零即采用。Agent 的可编辑草稿在场时只提示有一份
+ * 违约置顶，正文、原文与时长可就地修改后保存并校验，违约清零即采用。Agent 的可编辑草稿在场时只提示有一份
  * 未完成的修改，正式内容只读。确认之后脚本规划只读，指引到时间线修改。
  */
 export function ReferenceScriptPlanPreviewPanel({
@@ -456,14 +481,11 @@ export function ReferenceScriptPlanPreviewPanel({
 
   const handleConfirmed = useCallback(() => {
     // 保存 / 确认两次 await 期间用户可能已切走项目（本组件所在的 tab 可能因此被卸载）：只在项目
-    // 本身变了才抑制全局副作用，否则会把续写消息写进用户切换到的别的项目/会话。同项目内切
-    // tab（如切到「视频单元」，本面板同样会被卸载）不属于这种情况——预填文案本身带着具体
-    // 集 ID，写进全局 assistant 输入框依然准确，不该被同一份卸载信号误伤。
+    // 本身变了才抑制确认提示，同项目内切 tab 照常提示。确认后不打开 Agent 面板，由页面的下一步
+    // 接续，与 ScriptReviewGate 一致。
     if (useProjectsStore.getState().currentProjectName !== projectName) return;
     pushToast(t("dashboard:review_confirmed"), "success");
-    // 确认放行 + 预填继续消息到会话输入框——只填不发送，用户自行核对后发送。
-    prefillAssistant(t("reference_script_plan_confirm_continue_prefill", { episodeRef }));
-  }, [projectName, episodeRef, pushToast, t]);
+  }, [projectName, pushToast, t]);
 
   const {
     state,
@@ -498,7 +520,7 @@ export function ReferenceScriptPlanPreviewPanel({
   const onDraft = quarantine != null;
 
   const updateUnit = useCallback(
-    (unitIndex: number, patch: { text?: string; duration_seconds?: number }) => {
+    (unitIndex: number, patch: { text?: string; source_text?: string; duration_seconds?: number }) => {
       if (onDraft) {
         setDraftContent((prev) => ({
           ...prev,
@@ -611,7 +633,7 @@ export function ReferenceScriptPlanPreviewPanel({
           violationCount={quarantine.violations.length}
           itemJumps={[...groups.byItem.entries()].map(([index, list]) => ({
             index,
-            label: itemIdWithinEpisode(displayUnits[index].key),
+            label: t("common:item_position_unit", { position: index + 1 }),
             count: list.length,
           }))}
           episodeLevelCount={groups.episodeLevel.length}
@@ -667,6 +689,7 @@ export function ReferenceScriptPlanPreviewPanel({
               editing={unit.editable && editingUnitKey === unit.key}
               onToggleEdit={() => setEditingUnitKey((prev) => (prev === unit.key ? null : unit.key))}
               onTextChange={unit.editable ? (text) => updateUnit(i, { text }) : null}
+              onSourceTextChange={unit.editable ? (sourceText) => updateUnit(i, { source_text: sourceText }) : null}
               // 草稿的 unit 尚未定桶，时长可选档位取结构区间全集；采用时由服务端按同一判据重判。
               supportedDurations={supportedDurations}
               durationEndpointFixed={false}
@@ -877,6 +900,7 @@ export function ReferenceScriptPlanPreviewPanel({
               editing={!readOnly && editingUnitKey === unit.key}
               onToggleEdit={() => setEditingUnitKey((prev) => (prev === unit.key ? null : unit.key))}
               onTextChange={readOnly ? null : (text) => updateUnit(i, { text })}
+              onSourceTextChange={readOnly ? null : (sourceText) => updateUnit(i, { source_text: sourceText })}
               supportedDurations={unitTiers(capability)}
               durationEndpointFixed={capability?.duration_endpoint_fixed ?? false}
               durationProblem={

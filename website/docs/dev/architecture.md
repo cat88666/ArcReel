@@ -181,7 +181,8 @@ flowchart TD
 - 参考生视频单元拆分；
 - 单集结构化剧本；
 - 资产生成；
-- 审片。
+- 审片；
+- 审图。
 
 其中前三项是脚本规划，规划时同时识别本集新增资产。
 
@@ -333,7 +334,9 @@ flowchart LR
 
 以下三件事不打断执行中的协程：正常关停时，`GenerationWorker.stop()` 等在飞任务跑完；用户取消只作用于排队任务；客户端断开只置标志位。
 
-这一范围之外，有些场景会自己发起取消：SSE 流式响应在客户端断开时取消事件生产协程，`TrialRunManager.cancel()` 取消进行中的供应商试跑，`SessionManager` 在会话驱逐或启动失败时取消收件处理任务。在这些场景里写对取消敏感的代码之前，先从代码找出全部取消来源。线程调用怎样防取消，见[后端规范](https://github.com/ArcReel/ArcReel/blob/main/docs/standards/backend.md)「线程里写入正式文件或创建临时产物时，用 `run_sync_transaction`」与「供应商返回之后的落账段不可中断」。
+这一范围之外，有些场景会自己发起取消：SSE 流式响应在客户端断开时取消事件生产协程，`TrialRunManager.cancel()` 取消进行中的供应商试跑，`SessionManager` 在会话驱逐或启动失败时取消收件处理任务，应用关停时取消模型目录官方同步、回收站过期清理等后台循环。在这些场景里写对取消敏感的代码之前，先从代码找出全部取消来源。
+
+取消正在经 httpx 发请求的任务时，一次 `Task.cancel()` 可能被 anyio 吞掉：建立连接时 httpcore 进入 anyio 的任务组，anyio 恰在同一轮调度里取消自己的域时，两次取消合并成一次，在域出口一并消失，任务照常往下跑。不要从外部反复取消来补发：重投的取消会打断任务在 `asyncio.shield` 里的收尾，例如 SQLAlchemy 会话的回滚与连接归还，等待方返回时收尾还没做完。由任务自己在 httpx 调用之后的检查点调用 `lib/infra/task_cancel.py` 的 `raise_if_cancel_absorbed`，等待方只取消一次，一直等到任务结束。线程调用怎样防取消，见[后端规范](https://github.com/ArcReel/ArcReel/blob/main/docs/standards/backend.md)「线程里写入正式文件或创建临时产物时，用 `run_sync_transaction`」与「供应商返回之后的落账段不可中断」。
 
 ## 9. 项目和资产模型 {#project-and-asset-model}
 
@@ -363,6 +366,7 @@ ArcReel 的项目不仅是一条数据库记录，还包括文件系统中的媒
 ```text
 <数据根>/
 ├── projects/<项目名>/         项目与生成资产
+├── deleted_projects/          已删除项目（保留期内可整体恢复）
 ├── global_assets/             全局资产库
 ├── users/<user_id>/memory/    Agent 用户记忆
 ├── arcreel.db                 默认 SQLite 数据库
@@ -416,6 +420,8 @@ ArcReel 使用 SQLAlchemy 2.0 异步 ORM。
 - 为项目归档提供完整上下文。
 
 服务层应通过统一的资产版本接口操作，而不是让各供应商适配器自行决定如何覆盖文件。
+
+Agent 工具 `inspect_images` 让 Agent 看资产图与分镜图：按 ID 读指定版本（默认 current）的版本快照；默认 current 没有版本记录时，读取元数据登记的当前图，返回 `version: null`，不补写版本记录。图片在内存里等比缩成长边不超过 2000 px 的 JPEG，以 MCP 图片内容块随结果返回，与[看素材](#video-review)的联系表走同一个 `images` 钩子。工具只读、不收费、不触发生成，一次调用最多 20 张图。资产图与分镜图生成后的审核检查点交给审图子智能体 `review-images`：它对照设定与提示词看图，只回文字报告，是否重新生成由用户决定。它与审片子智能体一样是只读的，frontmatter 的 `tools` 与 `AgentAccessPolicy.READ_ONLY_SUBAGENT_TOOLS` 两份名单都只开放 Read、Glob、Grep 与 `inspect_images`。
 
 ## 12. 用量和费用 {#usage-and-cost}
 

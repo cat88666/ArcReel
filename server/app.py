@@ -7,6 +7,13 @@
 
 注意：必须用 --reload-dir 限定监视目录，否则 watchfiles 会扫描
 node_modules / .venv / .git / .worktrees 等十几万个文件，单核 CPU 50%+。
+
+Windows 原生环境不要加 --reload：uvicorn 启用 reload 时在 Windows 上改用
+SelectorEventLoop，它不支持子进程，内置 Agent 无法拉起 Claude Code。改用：
+    uv run uvicorn server.app:app --port 1241
+
+也可以 ``uv run python -m server.app``：监听地址取 LISTEN_HOST / LISTEN_PORT，
+Windows 上自动不开 reload，其他平台开启 reload 并只监视 server 与 lib。
 """
 
 import asyncio
@@ -15,6 +22,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -30,14 +38,18 @@ from starlette.middleware.gzip import GZipResponder, IdentityResponder
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from lib import PROJECT_ROOT
-from lib.agent.agent_session_store import session_store_enabled
+from lib.agent.agent_session_store import default_sdk_config_dir, session_store_enabled
 from lib.agent.agent_session_store.import_local import migrate_local_transcripts_to_store
+from lib.agent.agent_session_store.key_alignment import align_session_keys
 from lib.agent.agent_session_store.store import DbSessionStore
+from lib.asset_library.ingest import start_asset_ingest, stop_asset_ingest
+from lib.catalog.official_sync import start_official_sync, stop_official_sync
 from lib.config.env_keys import PROVIDER_SECRET_KEYS
 from lib.db import async_session_factory, close_db, init_db
 from lib.generation.generation_worker import GenerationWorker
 from lib.infra.data_root_layout import DataRootLayout, list_project_dirs
-from lib.infra.data_root_layout_migration import default_sdk_config_dir, migrate_data_root_layout
+from lib.infra.data_root_layout_migration import migrate_data_root_layout
+from lib.infra.env_init import warn_if_env_diverges_from_file
 from lib.infra.ffmpeg import log_ffmpeg_status
 from lib.infra.httpx_shared import shutdown_http_client, startup_http_client
 from lib.infra.logging_config import (
@@ -48,9 +60,10 @@ from lib.infra.logging_config import (
 )
 from lib.infra.loop_stall_probe import start_loop_stall_probe, stop_loop_stall_probe
 from lib.infra.path_safety import try_safe_join
+from lib.material.maintenance import start_material_maintenance
 from lib.project.project_migrations import cleanup_stale_backups, run_project_migrations
-from lib.script.source_loader.migration import migrate_project_source_encoding
-from server.auth import ensure_auth_password, get_current_user, warn_if_auth_disabled
+from lib.script.source_loader.migration import migrate_project_source_encoding, migrate_project_source_encoding_once
+from server.auth import ensure_auth_password, ensure_token_secret, get_current_user, warn_if_auth_disabled
 from server.cors_config import resolve_cors_policy
 from server.dependencies import require_project_migration_ok, require_valid_project_name
 from server.error_handlers import register_error_handlers
@@ -60,6 +73,7 @@ from server.routers import (
     agent_config,
     agent_memory,
     api_keys,
+    asset_library,
     asset_sheets,
     assets,
     assistant,
@@ -68,27 +82,32 @@ from server.routers import (
     cost_estimation,
     custom_endpoints,
     custom_providers,
+    derivative_uploads,
     edit_timelines,
     end_frames,
     episode_drafts,
     episode_management,
     episode_planning,
     episodes_view,
+    file_view,
     files,
     generate,
     grids,
     market,
     market_submissions,
+    object_storage,
     official_service,
     onboarding,
     presentations,
     products,
     project_events,
     project_migration,
+    project_trash,
     projects,
     prompt_authoring,
     prompt_templates,
     props,
+    provider_asset_links,
     provider_models,
     providers,
     reference_videos,
@@ -328,41 +347,10 @@ async def _migrate_source_encoding_on_startup(
     if not projects_dir.exists():  # noqa: ASYNC240 -- 启动期一次性存在性检查，本地元数据
         return summary
 
-    def _run_one(project_dir: Path) -> dict:
-        marker_dir = project_dir / ".arcreel"
-        marker = marker_dir / "source_encoding_migrated"
-        if marker.exists():
-            return {"skipped": True}
-        try:
-            result = migrate(project_dir)
-            marker_dir.mkdir(exist_ok=True)
-            marker.touch()
-            if result.failed:
-                err_log = marker_dir / "migration_errors.log"
-                err_log.write_text(
-                    "\n".join(f"FAILED: {name}" for name in result.failed) + "\n",
-                    encoding="utf-8",
-                )
-            return {
-                "migrated": result.migrated,
-                "skipped": result.skipped,
-                "failed": result.failed,
-            }
-        except Exception as exc:
-            logger.exception(
-                "源文件编码迁移失败 project=%s，已跳过，server 继续启动",
-                project_dir.name,
-            )
-            try:
-                marker_dir.mkdir(exist_ok=True)
-                (marker_dir / "migration_errors.log").write_text(f"FATAL: {exc}\n", encoding="utf-8")
-                marker.touch()
-            except Exception:
-                pass
-            return {"error": str(exc)}
-
     for project_dir in list_project_dirs(projects_dir):
-        summary[project_dir.name] = await asyncio.to_thread(_run_one, project_dir)
+        summary[project_dir.name] = await asyncio.to_thread(
+            migrate_project_source_encoding_once, project_dir, migrate=migrate
+        )
     return summary
 
 
@@ -389,6 +377,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(migrate_legacy_log_dir)
     attach_file_handler()
     warn_if_log_dir_env_set()
+    warn_if_env_diverges_from_file()
 
     ensure_auth_password()
     warn_if_auth_disabled()
@@ -404,6 +393,9 @@ async def lifespan(app: FastAPI):
         session_factory=async_session_factory,
         sdk_config_dir=default_sdk_config_dir(),
     )
+    # 签名密钥可能落在数据根的 runtime/ 下，须在布局迁移之后解析：旧布局里名为 runtime 的项目
+    # 会被搬进 projects/，提前写入的密钥文件会随它进入项目目录。
+    await asyncio.to_thread(ensure_token_secret)
 
     # 源文件编码迁移（幂等；失败不阻塞启动）。先于 schema 迁移跑：源文一律先归到 UTF-8，
     # 之后所有按 UTF-8 读源文的链路（分集规划、派生文件对账）才有统一的输入。
@@ -435,6 +427,20 @@ async def lifespan(app: FastAPI):
         )
     await asyncio.to_thread(cleanup_stale_backups, layout.projects_dir, 7)
 
+    # 会话存储键对齐（幂等；失败不阻塞启动）：数据根换了绝对路径后，会话的 Agent 上下文改到当前项目目录派生的键下。
+    # 排在数据根布局迁移之后：布局迁移把旧布局的键改到 projects/ 下的目录，这里才按当前布局重算。
+    # 排在本地 transcript 导入之前：导入按当前键列本地会话、按当前键判断是否已导入，键没对齐时会在新键下
+    # 再导入一份，同一会话两个键下都有记录，对齐就不再改它。
+    try:
+        await align_session_keys(
+            async_session_factory,
+            projects_dir=layout.projects_dir,
+            sdk_config_dir=default_sdk_config_dir(),
+            store_enabled=session_store_enabled(),
+        )
+    except Exception:
+        logger.exception("会话存储键对齐失败（不阻塞启动）")
+
     # Migrate any pre-existing local SDK jsonl transcripts into the DbSessionStore.
     # Runs once (marker-gated); failures are non-fatal and logged.
     if session_store_enabled():
@@ -462,15 +468,6 @@ async def lifespan(app: FastAPI):
             await migrate_text_tier_settings(session)
     except Exception as exc:
         logger.warning("text tier settings migration failed (non-fatal): %s", exc)
-
-    # 设置里已改名的模型改写为后继模型（退役模型映射）。放在档位迁移之后：旧任务级键收编进档位键后一并改写
-    try:
-        from lib.config.migration import migrate_retired_model_settings
-
-        async with async_session_factory() as session:
-            await migrate_retired_model_settings(session)
-    except Exception as exc:
-        logger.warning("retired model settings migration failed (non-fatal): %s", exc)
 
     # 官方市场源 seed：不存在则插入，地址常量变了就同步；不抓取
     try:
@@ -540,15 +537,26 @@ async def lifespan(app: FastAPI):
     # 卡顿探针放在启动步骤之后：迁移等启动期同步工作不算线上卡顿，避免误报。
     stall_probe = start_loop_stall_probe()
     # 模型目录的官方同步：启动时检查一次，之后每天一次；随应用关停取消
-    from lib.catalog.official_sync import start_official_sync, stop_official_sync
-
     catalog_sync = start_official_sync(async_session_factory)
+    # 项目回收站与已删除项目的过期清理：启动时清一次，之后定期清理；随应用关停取消
+    from server.services.project.trash_expiry import start_trash_expiry, stop_trash_expiry
+
+    trash_expiry = start_trash_expiry(layout)
+    # 供应商素材库入库任务：启动时恢复中断的提交，之后推进中转上传、状态查询与中转副本清理；随应用关停取消
+    asset_ingest = start_asset_ingest(async_session_factory)
+    # 远端素材：启动时结算中断的正式提交，之后重试删除待删除的正式对象、重算对象引用、清理闲置的本地工作文件（项目与全局资产库）；随应用关停取消
+    material_maintenance = start_material_maintenance(
+        async_session_factory, layout.projects_dir, layout.deleted_projects_dir, data_root=layout.root
+    )
     try:
         async with remote_mcp_host.run():
             yield
     finally:
+        await material_maintenance.stop()
+        await stop_asset_ingest(asset_ingest)
+        await stop_trash_expiry(trash_expiry)
         await stop_official_sync(catalog_sync)
-        # 运行期异常或关停被取消时同样撤销延时转储，免得收尾阶段误写调用栈。
+        # 运行期异常或关停被取消时同样停掉探针，免得收尾阶段把关停工作误报成卡顿。
         await stop_loop_stall_probe(stall_probe)
 
     # Shutdown
@@ -678,6 +686,18 @@ app.include_router(
     edit_timelines.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["剪辑时间线"]
 )
 app.include_router(files.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["文件管理"])
+app.include_router(
+    file_view.router,
+    prefix="/api/v1",
+    dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
+    tags=["文件视图"],
+)
+app.include_router(
+    project_trash.router,
+    prefix="/api/v1",
+    dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
+    tags=["项目回收站"],
+)
 app.include_router(episodes_view.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["分集视图"])
 app.include_router(
     episode_management.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["集管理"]
@@ -743,6 +763,12 @@ app.include_router(
     tags=["分镜上传"],
 )
 app.include_router(
+    derivative_uploads.router,
+    prefix="/api/v1",
+    dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
+    tags=["衍生资产图上传"],
+)
+app.include_router(
     end_frames.router,
     prefix="/api/v1",
     dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
@@ -769,6 +795,13 @@ app.include_router(
     provider_models.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["供应商管理"]
 )
 app.include_router(catalog.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["模型目录"])
+app.include_router(object_storage.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["对象存储"])
+app.include_router(
+    asset_library.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["供应商素材库"]
+)
+app.include_router(
+    provider_asset_links.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["供应商素材库"]
+)
 app.include_router(system_config.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["系统配置"])
 app.include_router(system.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["系统"])
 app.include_router(api_keys.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["API Key 管理"])
@@ -833,8 +866,12 @@ def create_generation_worker() -> GenerationWorker:
 
 @app.get("/health")
 async def health_check():
-    """健康检查"""
-    return {"status": "ok", "message": "视频项目管理 WebUI 运行正常"}
+    """健康检查；commit 为镜像构建时注入的 commit sha，源码运行时为 null。"""
+    return {
+        "status": "ok",
+        "message": "视频项目管理 WebUI 运行正常",
+        "commit": os.environ.get("ARCREEL_BUILD_COMMIT") or None,
+    }
 
 
 @app.get("/agent-installation-guide.md", include_in_schema=False)
@@ -909,36 +946,12 @@ class FrontendCacheHeadersMiddleware:
 app.add_middleware(FrontendCacheHeadersMiddleware)
 
 
-class _IdentityResponder(IdentityResponder):
-    """内容类型不压缩（事件流、已压缩的媒体）的响应，响应头到达即放行。
-
-    Starlette 的 responder 要等到第一个 body 块才放行响应头，以便决定是否改写编码相关的头；
-    不压缩的类型无需改写，事件流却会因此在首个事件前一直收不到响应头。按响应的
-    Content-Type 判断，不依赖请求是否声明 ``Accept: text/event-stream``。
-    """
-
-    async def send_with_compression(self, message: Message) -> None:
-        if message["type"] == "http.response.start":
-            await super().send_with_compression(message)
-            if self.content_type_is_excluded:
-                self.started = True
-                await self.send(self.initial_message)
-        elif message["type"] == "http.response.pathsend" and self.started:
-            await self.send(message)
-        else:
-            await super().send_with_compression(message)
-
-
-class _GZipResponder(_IdentityResponder, GZipResponder):
-    """在 :class:`_IdentityResponder` 的响应头放行之上做 gzip 压缩。"""
-
-
 class ResponseCompressionMiddleware:
     """JSON / JS / CSS / HTML 等文本响应的 gzip 压缩。
 
     沿用 Starlette GZip 的默认排除清单（text/event-stream 与 image/audio/video 等已压缩的
     媒体类型），206 分段响应原样透传；流式响应按块 Z_SYNC_FLUSH，不攒批。排除类型的响应头
-    即时放行，见 :class:`_IdentityResponder`。compresslevel 取 zlib 默认档 6：
+    由 Starlette（>= 1.8）即时放行，事件流在首个事件前就能收到响应头。compresslevel 取 zlib 默认档 6：
     JSON/JS 的体积收益与 9 相差无几，CPU 开销低得多。
     """
 
@@ -951,9 +964,9 @@ class ResponseCompressionMiddleware:
             return
         responder: ASGIApp
         if "gzip" in Headers(scope=scope).get("accept-encoding", ""):
-            responder = _GZipResponder(self.app, minimum_size=500, compresslevel=6)
+            responder = GZipResponder(self.app, minimum_size=500, compresslevel=6)
         else:
-            responder = _IdentityResponder(self.app, minimum_size=500)
+            responder = IdentityResponder(self.app, minimum_size=500)
         await responder(scope, receive, send)
 
 
@@ -990,8 +1003,20 @@ else:
     logger.warning("frontend/dist/index.html 不存在，跳过前端页面挂载（API 不受影响）")
 
 
+def _main_uvicorn_args(platform_name: str = sys.platform) -> tuple[str | FastAPI, dict[str, Any]]:
+    """``__main__`` 交给 ``uvicorn.run`` 的应用与参数。
+
+    reload 只接受导入字符串。Windows 上 uvicorn 一旦启用 reload 就改用不支持子进程的
+    SelectorEventLoop，内置 Agent 拉不起 Claude Code CLI，因此 Windows 不开 reload。
+    """
+    host, port = _resolve_listen_addr()
+    if platform_name == "win32":
+        return app, {"host": host, "port": port, "reload": False}
+    return "server.app:app", {"host": host, "port": port, "reload": True, "reload_dirs": ["server", "lib"]}
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    _host, _port = _resolve_listen_addr()
-    uvicorn.run(app, host=_host, port=_port, reload=True)
+    _target, _options = _main_uvicorn_args()
+    uvicorn.run(_target, **_options)

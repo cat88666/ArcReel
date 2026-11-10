@@ -19,16 +19,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import unicodedata
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from lib.artifacts.artifact_manifest import ArtifactKey, ArtifactManifestError, ArtifactStatus
-from lib.project.asset_derivatives import derivative_table, find_derivative_name
+from lib.artifacts.artifact_manifest import ArtifactKey, ArtifactKind, ArtifactManifestError, ArtifactStatus
+from lib.project.asset_derivatives import derivative_sheet_relative_path, derivative_table, find_derivative_name
+from lib.project.asset_rename import asset_files_named
 from lib.project.asset_types import ALIASES_FIELD, ASSET_SPECS, asset_name_comparison_key, resolve_asset_key
-from lib.references.reference_catalog import derivative_reference, split_derivative_reference
-from lib.script.reference_video.text_parser import extract_mentions, remap_mentions
+from lib.prompts.reference_image_numbering import reference_image_label
+from lib.references.reference_catalog import build_reference_catalog, derivative_reference, split_derivative_reference
+from lib.script.reference_video.text_parser import extract_mentions, remap_mentions, render_matched_mentions
 from lib.script.script_editor import ScriptEditError, resolve_items
 from lib.script.script_references import iter_reference_lists, iter_reference_sites
 from lib.speech.speech_artifact_provenance import build_video_speech_basis
@@ -132,6 +135,18 @@ class DerivativeMergePlan:
     def kept_derivative(self, derivative: str) -> str:
         """被并方名下的衍生（比对坐标）合并后在保留方名下叫什么；不是被并方的衍生时原样返回。"""
         return self.derivative_names.get(derivative, derivative)
+
+    def carried_references(self, source: str, target: str) -> dict[str, str]:
+        """迁到保留方名下的衍生：合并后的引用名 → 合并前的引用名（比对坐标）。
+
+        迁移的衍生连图带过来，引用只是换了名字；并入已有衍生的换成了另一张图，不在其列。
+        """
+        return {
+            derivative_reference(asset_name_comparison_key(target), asset_name_comparison_key(name)): (
+                derivative_reference(asset_name_comparison_key(source), asset_name_comparison_key(name))
+            )
+            for name in self.moved
+        }
 
 
 def merged_reference(
@@ -267,14 +282,85 @@ def visual_reference_signature(item: Mapping[str, Any], asset_type: str) -> tupl
     return (lists, scene if isinstance(scene, str) else None, text_mentions)
 
 
-#: 问「这件产物此刻是现行的吗」：``(清单键, 产物路径字段值) → bool``。
+def storyboard_reference_signature(
+    item: Mapping[str, Any], asset_type: str, identities: Mapping[str, str]
+) -> tuple[object, ...]:
+    """一个条目里决定其分镜图的引用，按引用到的图比较。
+
+    分镜图依据不记资产名、只记参考图内容（``without_asset_names``）：可用参考图的名字换成
+    *identities* 中的内容身份；缺图仍按名字区分缺口。正文只替换引用数组里实际选中的参考图。
+    """
+    remapped = dict(item)
+    spec = ASSET_SPECS[asset_type]
+    selected: dict[str, str] = {}
+    for name in spec.reference_list_fields:
+        names = item.get(name)
+        if isinstance(names, list):
+            selected.update(
+                (key, identities[key])
+                for value in names
+                if isinstance(value, str) and (key := asset_name_comparison_key(value)) in identities
+            )
+            remapped[name] = [
+                identities.get(asset_name_comparison_key(value), value) if isinstance(value, str) else value
+                for value in names
+            ]
+    image_prompt = item.get("image_prompt")
+    scene = image_prompt.get("scene") if isinstance(image_prompt, Mapping) else image_prompt
+    if isinstance(scene, str):
+        remapped["image_prompt"] = remap_mentions(
+            scene, lambda name, _speaker: f"@[{selected[name]}]" if name in selected else None
+        )
+    return visual_reference_signature(remapped, asset_type)
+
+
+def storyboard_reference_identities(project_dir: Path, project: dict[str, Any], asset_type: str) -> dict[str, str]:
+    """已登记且可用的资产参考图：引用名 → 内容身份；没有图的引用不在映射里。"""
+    # 生成输入经规划器依赖 ProjectManager，惰性导入避免环。
+    from lib.artifacts.generation_input import project_input_observation
+    from lib.artifacts.visual_artifact_provenance import visual_file_digest
+
+    observation = project_input_observation(project_dir)
+    catalog = build_reference_catalog(project)
+    identities: dict[str, str] = {}
+    for name in catalog.reference_names(asset_type):
+        reference = catalog.lookup(asset_type, name)
+        if reference is None or not isinstance(reference.asset, Mapping):
+            continue
+        sheet = reference.asset.get(reference.spec.sheet_field)
+        registered = observation.registered(ArtifactKey.asset_sheet(asset_type, name))
+        if not isinstance(sheet, str) or registered is None or registered.artifact_path != sheet:
+            continue
+        observed = observation.observe(sheet)
+        if observed is not None:
+            try:
+                identities[name] = f"sha256:{visual_file_digest(observed.path)}"
+            except OSError:
+                continue
+    return identities
+
+
+#: 问「这件产物此刻是现行的、且依据会随剧本引用变化吗」：``(清单键, 产物路径字段值) → bool``。
 CurrentArtifactProbe = Callable[[ArtifactKey, object], bool]
 
 
 def current_artifact_probe(project_dir: Path) -> CurrentArtifactProbe:
-    """按产物清单判定现行与否的探针；项目没有可用的清单（未升级、清单损坏）时一律答「否」。"""
+    """按产物清单判定现行与否的探针；项目没有可用的清单（未升级、清单损坏）时一律答「否」。
+
+    选中手动上传的分镜图或视频按上传字节判定时效，剧本引用、说话人与宫格参考图都不是它的输入，
+    合并不会让它过期，同样答「否」。上传依据由规划器判定（选中版本是上传且字节与正式文件一致），这里不另行推断。
+    """
     # artifact_currency 经产物规划依赖 project_manager，模块级导入会成环。
     from lib.artifacts.artifact_currency import ArtifactCurrencyResolver
+    from lib.artifacts.visual_artifact_provenance import (
+        UPLOADED_STORYBOARD_BASIS_KIND,
+        UPLOADED_VIDEO_BASIS_KIND,
+    )
+
+    uploaded_basis_kinds = {
+        ArtifactKind.EPISODE_STORYBOARD: UPLOADED_STORYBOARD_BASIS_KIND,
+        ArtifactKind.EPISODE_VIDEO: UPLOADED_VIDEO_BASIS_KIND,
+    }
 
     try:
         resolver = ArtifactCurrencyResolver(project_dir)
@@ -285,7 +371,13 @@ def current_artifact_probe(project_dir: Path) -> CurrentArtifactProbe:
         if not isinstance(artifact_path, str) or not artifact_path:
             return False
         try:
-            return resolver.compare(key, artifact_path=artifact_path).status is ArtifactStatus.CURRENT
+            if resolver.compare(key, artifact_path=artifact_path).status is not ArtifactStatus.CURRENT:
+                return False
+            uploaded_kind = uploaded_basis_kinds.get(key.kind)
+            if uploaded_kind is not None:
+                basis = resolver.resolve_basis(key)
+                return basis is None or basis.kind != uploaded_kind
+            return True
         except (ArtifactManifestError, OSError, RuntimeError, TypeError, ValueError):
             return False
 
@@ -306,18 +398,74 @@ def speech_signature(kind: str, item: Mapping[str, Any]) -> str | None:
         return None
 
 
+def grid_merge_references(
+    project_dir: Path, asset_type: str, source: str, folded_derivatives: Sequence[str]
+) -> tuple[set[str], dict[str, tuple[str, ...]]]:
+    """会丢失共享参考图的宫格 ID，以及每张宫格当前可用的冻结参考图名字。"""
+    from lib.artifacts.artifact_planner import TargetStatePlanner
+
+    removed = [
+        *asset_files_named(project_dir, ASSET_SPECS[asset_type], source),
+        *(project_dir / derivative_sheet_relative_path(source, name) for name in folded_derivatives),
+    ]
+    removed_paths = {
+        unicodedata.normalize("NFC", path.relative_to(project_dir).as_posix())
+        for path in removed
+        if path.is_file() and not path.is_symlink()
+    }
+    try:
+        grids = TargetStatePlanner(project_dir).load_grid_records()
+    except (ArtifactManifestError, OSError, ValueError):
+        # 同 current_artifact_probe：无法读取依据的产物不计为从现行转成过期。
+        return set(), {}
+    outdated = {
+        grid.id
+        for grid in grids
+        if any(
+            unicodedata.normalize("NFC", reference.path) in removed_paths for reference in grid.reference_images or []
+        )
+    }
+    names = {
+        grid.id: tuple(
+            reference.name for reference in grid.reference_images or [] if (project_dir / reference.path).is_file()
+        )
+        for grid in grids
+    }
+    return outdated, names
+
+
+def grid_storyboard_reference_signature(item: Mapping[str, Any], reference_names: Sequence[str]) -> str | None:
+    """合并只改写本格画面提示词中的 mention；它按整组冻结参考图编号，不按本格引用数组编号。"""
+    image_prompt = item.get("image_prompt")
+    scene = image_prompt.get("scene") if isinstance(image_prompt, Mapping) else image_prompt
+    if not isinstance(scene, str):
+        return None
+    labels: dict[str, str] = {}
+    for position, name in enumerate(reference_names):
+        labels.setdefault(asset_name_comparison_key(name), reference_image_label(position))
+    return render_matched_mentions(scene, labels.get)
+
+
 def count_outdated_artifacts(
     before: dict[str, Any],
     after: dict[str, Any],
     asset_type: str,
     episode: int,
     is_current: CurrentArtifactProbe,
+    *,
+    storyboard_identities: Mapping[str, str],
+    carried_references: Mapping[str, str],
+    outdated_grid_ids: Collection[str],
+    grid_reference_names: Mapping[str, Sequence[str]],
 ) -> tuple[int, int]:
     """一份正式剧本经合并改写后，将从现行转为过期的 ``(分镜图数, 视频数)``。
 
-    只数此刻是现行的产物，判据取各自登记依据里与引用有关的部分：
+    只数此刻是现行、且依据随引用变化的产物（选中手动上传的分镜图不计，见 :func:`current_artifact_probe`），
+    判据取各自登记依据里与引用有关的部分：
 
-    - 分镜图：画面引用变了（:func:`visual_reference_signature`）。
+    - 分镜图：引用到的图变了（:func:`storyboard_reference_signature`）；随图迁来的衍生只换了名字，不算。
+      切格分镜的依据取宫格记录冻结的参考图，合并只把随图迁来的衍生（*carried_references*，
+      合并后的引用名 → 合并前的引用名）在记录里改名改路径；共享参考图丢失时整组切格分镜计入。
     - 参考生视频：画面引用变了，或角色台词的说话人变了（:func:`speech_signature`）。
     - 分镜图生视频：说话人变了。它的画面输入是分镜图本身，分镜图重新生成之前不受画面引用影响。
     """
@@ -326,6 +474,7 @@ def count_outdated_artifacts(
         after_items, _id_field, _kind = resolve_items(after)
     except ScriptEditError:
         return 0, 0
+    grid_renames = {previous: current for current, previous in carried_references.items()}
     storyboards = videos = 0
     for old, new in zip(before_items, after_items, strict=True):
         if not isinstance(old, dict) or not isinstance(new, dict):
@@ -337,7 +486,18 @@ def count_outdated_artifacts(
         speech_changed = speech_signature(kind, old) != speech_signature(kind, new)
         generated = old.get("generated_assets")
         generated = generated if isinstance(generated, Mapping) else {}
-        if kind != "video_units" and visual_changed:
+        if generated.get("grid_id") is not None or generated.get("grid_cell_index") is not None:
+            grid_id = generated.get("grid_id")
+            names = grid_reference_names.get(grid_id, ()) if isinstance(grid_id, str) else ()
+            renamed = tuple(grid_renames.get(asset_name_comparison_key(name), name) for name in names)
+            storyboard_changed = (
+                isinstance(grid_id, str) and grid_id in outdated_grid_ids
+            ) or grid_storyboard_reference_signature(old, names) != grid_storyboard_reference_signature(new, renamed)
+        else:
+            storyboard_changed = storyboard_reference_signature(
+                old, asset_type, storyboard_identities
+            ) != storyboard_reference_signature(new, asset_type, storyboard_identities)
+        if kind != "video_units" and storyboard_changed:
             storyboard_key = ArtifactKey.episode_storyboard(episode, resource_id)
             storyboards += is_current(storyboard_key, generated.get("storyboard_image"))
         if speech_changed or (kind == "video_units" and visual_changed):
@@ -402,9 +562,13 @@ __all__ = [
     "ReferenceChanges",
     "count_outdated_artifacts",
     "current_artifact_probe",
+    "grid_merge_references",
+    "grid_storyboard_reference_signature",
     "merge_payload_references",
     "merged_reference",
     "plan_derivative_merge",
     "speech_signature",
+    "storyboard_reference_identities",
+    "storyboard_reference_signature",
     "visual_reference_signature",
 ]

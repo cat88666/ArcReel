@@ -313,13 +313,16 @@ describe("ModelConfigSection", () => {
           t2i: ["gemini/nano-banana"],
           i2i: ["gemini/nano-banana", "openai/gpt-image-edit"],
         },
+        filtered: {},
       },
       video: {
         default: ["gemini/veo-3", "ark/seedance"],
         buckets: { i2v: ["gemini/veo-3"], r2v: ["ark/seedance"] },
+        filtered: {},
       },
       provider_names: {},
       model_names: {},
+      lifecycle: {},
     };
 
     function renderWithCandidates(
@@ -371,6 +374,102 @@ describe("ModelConfigSection", () => {
       await user.click(screen.getByRole("combobox", { name: "图生视频" }));
       expect(await screen.findByRole("option", { name: /veo-3/ })).toBeInTheDocument();
       expect(screen.queryByRole("option", { name: /seedance/ })).not.toBeInTheDocument();
+    });
+
+    it("switches only the bucket reference whose model is retiring, to the successor that qualifies for that bucket", async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      renderWithCandidates({
+        value: { ...EMPTY_VALUE, videoBackend: "ark/seedance", videoProviderR2V: "ark/seedance" },
+        onChange,
+        candidates: {
+          ...CANDIDATES,
+          lifecycle: {
+            "ark/seedance": {
+              status: "retiring",
+              shutdown_date: "2026-11-24",
+              successor: "bytedance/seedance-2",
+              successor_name: "Seedance 2",
+              // 后继只够格参考生视频这一处
+              switch_targets: { default: null, i2v: null, r2v: "ark/seedance-2" },
+            },
+          },
+        },
+      });
+
+      expect(screen.getAllByText(/即将下线（2026-11-24），官方建议改用/)).toHaveLength(2);
+      await user.click(screen.getByRole("button", { name: "切换到 seedance-2" }));
+
+      expect(onChange).toHaveBeenLastCalledWith(
+        expect.objectContaining({ videoBackend: "ark/seedance", videoProviderR2V: "ark/seedance-2" }),
+      );
+    });
+
+    describe("所选视频模型已下线", () => {
+      const DISCONTINUED_ERROR = "Ark/seedance：该模型已于 2026-11-01 下线，官方建议改用 Seedance 2；请在设置中重新选择模型";
+      const discontinued = (status: "discontinued" | "retiring" = "discontinued") => ({
+        ...CANDIDATES,
+        lifecycle: {
+          "ark/seedance": {
+            status,
+            shutdown_date: "2026-11-01",
+            successor: "bytedance/seedance-2",
+            successor_name: "Seedance 2",
+            switch_targets: { default: null, i2v: null, r2v: null },
+          },
+        },
+      });
+
+      beforeEach(() => {
+        vi.spyOn(API, "getVideoCapabilities").mockRejectedValue(new ApiRequestError(DISCONTINUED_ERROR, undefined, 400));
+      });
+
+      it.each([
+        ["the project default", { videoBackend: "ark/seedance" }],
+        ["a generation-path override", { videoBackend: "gemini/veo-3", videoProviderI2V: "ark/seedance" }],
+      ])("shows only the discontinued notice when %s references it", async (_where, value) => {
+        renderWithCandidates({ projectName: "demo", value: { ...EMPTY_VALUE, ...value }, candidates: discontinued() });
+
+        expect(await screen.findByText("已下线（2026-11-01），无法继续生成，官方建议改用 Seedance 2")).toBeInTheDocument();
+        await waitFor(() => expect(API.getVideoCapabilities).toHaveBeenCalled());
+        await waitFor(() => expect(screen.getAllByRole("alert")).toHaveLength(1));
+        expect(screen.queryByText(DISCONTINUED_ERROR)).not.toBeInTheDocument();
+      });
+
+      it("keeps the capability error when the model is executed without a notice here", async () => {
+        // 项目跟随全局默认：本页引用处为空、不显示下线提示，报错是唯一的说明
+        renderWithCandidates({
+          projectName: "demo",
+          globalDefaults: { ...EMPTY_GLOBALS, video: "ark/seedance" },
+          candidates: discontinued(),
+        });
+
+        expect(await screen.findByText(DISCONTINUED_ERROR)).toBeInTheDocument();
+      });
+
+      it("keeps the capability error when only another generation path references the model", async () => {
+        // 图生视频跟随全局默认执行该模型，本页只有参考生视频显式引用它：那条提示说的不是这条路径
+        renderWithCandidates({
+          projectName: "demo",
+          value: { ...EMPTY_VALUE, videoProviderR2V: "ark/seedance" },
+          globalDefaults: { ...EMPTY_GLOBALS, video: "ark/seedance" },
+          candidates: discontinued(),
+        });
+
+        expect(await screen.findByText(DISCONTINUED_ERROR)).toBeInTheDocument();
+      });
+
+      it("keeps the capability error next to a notice that only announces the shutdown", async () => {
+        // 即将下线的模型仍可调用，能力查询报的是别的问题，不与提示重复
+        renderWithCandidates({
+          projectName: "demo",
+          value: { ...EMPTY_VALUE, videoBackend: "ark/seedance" },
+          candidates: discontinued("retiring"),
+        });
+
+        expect(await screen.findByText(DISCONTINUED_ERROR)).toBeInTheDocument();
+        expect(screen.getByText(/即将下线（2026-11-01）/)).toBeInTheDocument();
+      });
     });
 
     it("lets the project default model win over every global layer in the placeholder", async () => {
@@ -687,6 +786,71 @@ describe("ModelConfigSection", () => {
     expect(screen.queryByRole("radio", { name: "6 秒" })).not.toBeInTheDocument();
     expect(screen.queryByRole("radio", { name: "8 秒" })).not.toBeInTheDocument();
     expect(API.getModelVideoCapabilities).not.toHaveBeenCalled();
+  });
+
+  describe("各层全空时的自动选择", () => {
+    const AUTO = { t2i: "gemini/veo-3", i2i: "gemini/veo-3", i2v: "ark/seedance", r2v: "gemini/veo-3", text: "gemini/veo-3" };
+
+    it("shows the auto-selected model and asks its capabilities for durations", async () => {
+      render(
+        <ModelConfigSection
+          value={EMPTY_VALUE}
+          onChange={() => {}}
+          providers={PROVIDERS}
+          options={OPTIONS}
+          globalDefaults={{ ...EMPTY_GLOBALS, auto: AUTO }}
+        />,
+      );
+      expect(screen.getByRole("combobox", { name: "默认视频模型" })).toHaveTextContent("自动选择（当前：Ark · seedance）");
+      expect(screen.getByRole("combobox", { name: "默认模型" })).toHaveTextContent("自动选择（当前：Gemini · veo-3）");
+      expect(await screen.findByRole("radio", { name: "5 秒" })).toBeInTheDocument();
+      expect(screen.getByRole("radio", { name: "10 秒" })).toBeInTheDocument();
+      expect(screen.queryByRole("radio", { name: "4 秒" })).not.toBeInTheDocument();
+    });
+
+    it("follows the bucket of the reference-video path", async () => {
+      render(
+        <ModelConfigSection
+          value={EMPTY_VALUE}
+          onChange={() => {}}
+          providers={PROVIDERS}
+          options={OPTIONS}
+          globalDefaults={{ ...EMPTY_GLOBALS, auto: { ...AUTO, i2v: "gemini/veo-3", r2v: "ark/seedance" } }}
+          usesReferenceImages
+        />,
+      );
+      expect(screen.getByRole("combobox", { name: "默认视频模型" })).toHaveTextContent("自动选择（当前：Ark · seedance）");
+      expect(await screen.findByRole("radio", { name: "5 秒" })).toBeInTheDocument();
+    });
+
+    it("prefers a configured global bucket over the auto-selected model", async () => {
+      render(
+        <ModelConfigSection
+          value={EMPTY_VALUE}
+          onChange={() => {}}
+          providers={PROVIDERS}
+          options={OPTIONS}
+          globalDefaults={{ ...EMPTY_GLOBALS, videoI2V: "gemini/veo-3", auto: AUTO }}
+        />,
+      );
+      expect(screen.getByRole("combobox", { name: "默认视频模型" })).not.toHaveTextContent("自动选择");
+      expect(await screen.findByRole("radio", { name: "4 秒" })).toBeInTheDocument();
+      expect(screen.queryByRole("radio", { name: "5 秒" })).not.toBeInTheDocument();
+    });
+
+    it("says no provider is available when nothing can be auto-selected", () => {
+      render(
+        <ModelConfigSection
+          value={EMPTY_VALUE}
+          onChange={() => {}}
+          providers={PROVIDERS}
+          options={OPTIONS}
+          globalDefaults={{ ...EMPTY_GLOBALS, auto: { ...AUTO, i2v: null } }}
+        />,
+      );
+      expect(screen.getByRole("combobox", { name: "默认视频模型" })).toHaveTextContent("自动选择（没有可用的供应商）");
+      expect(screen.queryByRole("radio", { name: "5 秒" })).not.toBeInTheDocument();
+    });
   });
 
   it("renders slider when supported_durations is continuous integer range ≥ 5", async () => {
@@ -1245,13 +1409,16 @@ describe("音频开关的模型可控性", () => {
       image: {
         default: ["kling/v3-omni"],
         buckets: { t2i: ["kling/v3-omni"], i2i: ["kling/v3-omni"] },
+        filtered: {},
       },
       video: {
         default: ["kling/v3-omni"],
         buckets: { i2v: ["kling/v3-omni"], r2v: ["kling/v3-omni"] },
+        filtered: {},
       },
       provider_names: {},
       model_names: {},
+      lifecycle: {},
     };
 
     function renderDropdowns(usesReferenceImages: boolean) {
@@ -1367,7 +1534,6 @@ describe("dimensions a ComfyUI workflow fixes", () => {
         matched_entry: null,
         system_capabilities: null,
         capability_overrides: null,
-        global_bucket_refs: [],
         path_overrides: null,
         requests: [],
       },
@@ -1425,7 +1591,7 @@ describe("dimensions a ComfyUI workflow fixes", () => {
     expect(picker).toBeDisabled();
     expect(picker).toHaveAttribute("placeholder", "workflow 原生（480p）");
     // 禁用原因要有一行可见说明，不能只靠 title。
-    expect(screen.getByText(/此 workflow 尺寸固定：宽高没有绑定到节点/)).toBeInTheDocument();
+    expect(screen.getByText(/此 workflow 的像素分辨率固定：宽高没有同时绑定到节点/)).toBeInTheDocument();
   });
 
   it("says the workflow decides the size when there is no literal to name", async () => {

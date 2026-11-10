@@ -19,7 +19,7 @@ import logging
 import os
 import tempfile
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -28,6 +28,7 @@ from PIL import Image
 
 if TYPE_CHECKING:
     from arcreel_market_core.video_backend_contract import VideoGenerationResult
+    from lib.asset_library.generation_inputs import ReferenceAssetChoice, ReferenceImageSource
     from lib.backends.audio_backends.base import AudioBackend
     from lib.backends.image_backends.base import ImageBackend
     from lib.config.resolver import ConfigResolver
@@ -39,6 +40,7 @@ from lib.backends.providers import CallPurpose, CallType, require_provider_pair
 from lib.billing.ledger import Ledger
 from lib.config.service import DEFAULT_VIDEO_POLL_TIMEOUT_SECONDS
 from lib.db.base import DEFAULT_USER_ID
+from lib.generation.deleted_target import trash_result_if_target_deleted
 from lib.generation.video_request_facts import DEFAULT_PLANNED_DURATION_SECONDS
 from lib.infra.async_thread import run_noninterruptible_sync, run_sync_transaction
 from lib.infra.path_safety import PathTraversalError, safe_join
@@ -78,13 +80,13 @@ def _remove_task_staging_path(path: Path) -> None:
     """Remove a task-owned staging entry without traversing links or arbitrary directories."""
 
     if path.is_symlink():
-        path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)  # hard-delete: temp -- 生成任务的暂存输出
     elif _is_junction(path):
-        path.rmdir()
+        path.rmdir()  # hard-delete: temp -- 生成任务的暂存目录
     elif os.path.lexists(path):
         if not path.is_file():
             raise ValueError("formal media staging path is not a regular file")
-        path.unlink()
+        path.unlink()  # hard-delete: temp -- 生成任务的暂存输出
 
 
 _remove_task_video_staging_path = _remove_task_staging_path
@@ -109,7 +111,7 @@ async def _discard_staged_output(path: Path | None) -> None:
     """
 
     if path is not None:
-        await run_noninterruptible_sync(path.unlink, missing_ok=True)
+        await run_noninterruptible_sync(path.unlink, missing_ok=True)  # hard-delete: temp -- 生成任务的暂存输出
 
 
 @asynccontextmanager
@@ -196,6 +198,28 @@ def _ledger_inputs(**sections: object) -> dict[str, Any] | None:
     return kept or None
 
 
+def _aligned_reference_asset_uris(
+    backend: object,
+    reference_images: list[Path] | None,
+    asset_uris: list[str | None] | None,
+    *,
+    model: str,
+) -> list[str | None] | None:
+    """校验与参考图对齐的素材引用；没有任何一项时返回 None，请求照常只发图片内容。
+
+    素材引用只能交给对参考图槽位声明了素材引用的 backend：其余 backend 不读这个字段，会悄悄改发图片内容。
+    """
+    from lib.backends.provider_assets import REFERENCE_IMAGE_ROLE, provider_asset_roles
+
+    if asset_uris is None or not any(asset_uris):
+        return None
+    if len(asset_uris) != len(reference_images or []):
+        raise ValueError("reference_image_asset_uris must align with reference_images")
+    if REFERENCE_IMAGE_ROLE not in provider_asset_roles(backend):
+        raise ValueError(f"video backend model {model} does not accept provider asset references")
+    return list(asset_uris)
+
+
 def _merge_result_provenance(version_metadata: dict[str, Any], result: "VideoGenerationResult") -> None:
     """把只有生成过一次才知道的事实并进版本元数据，在落盘之前。
 
@@ -235,7 +259,7 @@ def _commit_formal_image_output(
     new_version = commit_formal_output(staged_output_path, output_path, metadata)
     if type(new_version) is not int or new_version < 1:
         raise RuntimeError("formal image commit did not return a positive version")
-    staged_output_path.unlink(missing_ok=True)
+    staged_output_path.unlink(missing_ok=True)  # hard-delete: temp -- 提交后的暂存输出
     return new_version
 
 
@@ -394,7 +418,7 @@ class MediaGenerator:
         )
         os.close(fd)
         staged_path = Path(staged_name)
-        staged_path.unlink()
+        staged_path.unlink()  # hard-delete: temp -- mkstemp 占位文件
         return output_path, staged_path
 
     def _commit_video_output_version_sync(
@@ -443,7 +467,7 @@ class MediaGenerator:
             )
             raise RuntimeError("formal video output requires an artifact commit callback")
         finally:
-            staged_output_path.unlink(missing_ok=True)
+            staged_output_path.unlink(missing_ok=True)  # hard-delete: temp -- 提交后的暂存输出
 
     async def _commit_video_output_version(
         self,
@@ -512,6 +536,30 @@ class MediaGenerator:
             except (Exception, asyncio.CancelledError) as archive_failure:
                 failure.add_note(f"paid video history archival also failed: {archive_failure}")
             raise
+
+    async def _trash_if_target_deleted(
+        self,
+        *,
+        resource_type: str,
+        resource_id: str,
+        staged_file: Path | None,
+        task_id: str | None,
+        target: tuple[str, str] | None = None,
+    ) -> None:
+        """队列任务的产物在费用结算后、正式提交前复核目标仍在项目中，已删除时进回收站并抛出。
+
+        见 :mod:`lib.generation.deleted_target`。没有任务身份或暂存文件的直接调用不复核。
+        """
+        if task_id is None or staged_file is None:
+            return
+        await run_noninterruptible_sync(
+            trash_result_if_target_deleted,
+            self.project_path,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            staged_file=staged_file,
+            target=target,
+        )
 
     def _get_output_path(self, resource_type: str, resource_id: str) -> Path:
         """
@@ -668,8 +716,6 @@ class MediaGenerator:
         # 先归一化 reference_images，PIL 等不支持的类型在此被丢弃，
         # 因此 capability 判定要基于归一化后的结果，避免「传了无效引用图」被
         # 误判为 I2I 后又落到 T2I 调用，造成 image_capability_missing_i2i 误报。
-        from lib.backends.image_backends.base import ImageCapability, ImageCapabilityError
-
         ref_images: list[ReferenceImage] = []
         if reference_images:
             for ref in reference_images:
@@ -679,32 +725,15 @@ class MediaGenerator:
                     ref_images.append(ReferenceImage(path=str(ref)))
                 # PIL Image 等不支持的类型忽略
 
-        # Capability gating：调用通道实现了、且模型条目接受的才放行，与任务类型桶的候选同一个结果
-        # （lib.backends.image_capabilities）。上层 resolver 选桶时已按同一口径筛过，这里按实际请求形态把关。
-        from lib.backends.image_capabilities import effective_image_capabilities
-        from lib.custom_provider import is_custom_provider
-        from lib.custom_provider.backends import CustomImageBackend
+        # Capability gating：调用通道实现了、且模型条目接受的才放行，与任务类型桶的候选同一个结果；参考图上限与
+        # 编排层裁剪读同一个生效值（lib.backends.image_capabilities）。上层 resolver 选桶时已按同一口径筛过，
+        # 这里按实际请求形态把关。
+        from lib.backends.image_capabilities import gate_image_request
 
         # 成对不变量保证 backend 非 None 时 provider_id 亦非 None。
-        provider_id = cast(str, self._image_provider_id)
-        if isinstance(self._image_backend, CustomImageBackend):
-            # 自定义供应商：工厂已按模型行注入模型事实一侧（条目 ⊕ 能力覆盖，ComfyUI 端点不加约束）。
-            available = self._image_backend.effective_capabilities
-        else:
-            available = effective_image_capabilities(
-                self._image_backend.capabilities,
-                model_id=self._image_backend.model,
-                builtin_provider=None if is_custom_provider(provider_id) else provider_id,
-            )
-        needed = ImageCapability.IMAGE_TO_IMAGE if ref_images else ImageCapability.TEXT_TO_IMAGE
-        if needed not in available:
-            raise ImageCapabilityError(
-                "image_capability_missing_i2i"
-                if needed == ImageCapability.IMAGE_TO_IMAGE
-                else "image_capability_missing_t2i",
-                provider=self._image_backend.name,
-                model=self._image_backend.model,
-            )
+        await gate_image_request(
+            self._image_backend, provider_id=cast(str, self._image_provider_id), reference_count=len(ref_images)
+        )
 
         # 2. 记账括号：进入落 pending，成功以 call.success(result) 递交 backend 结果对象，
         #    Exception 自动翻 failed 后重抛，CancelledError 结算 cancelled 后重抛。
@@ -757,6 +786,12 @@ class MediaGenerator:
                 )
                 call.success(result)
 
+            await self._trash_if_target_deleted(
+                resource_type=resource_type,
+                resource_id=resource_id,
+                staged_file=staged_output_path,
+                task_id=task_id,
+            )
             metadata: dict[str, Any] = {"aspect_ratio": aspect_ratio, **version_metadata}
             if staged_output_path is None:
                 new_version = await run_noninterruptible_sync(
@@ -790,6 +825,7 @@ class MediaGenerator:
         before_submit: Callable[[], Awaitable[None]] | None = None,
         before_commit: Callable[[Path], Awaitable[None]] | None = None,
         commit_staged: Callable[[Path, Path], int | PaidVersionCommit] | None = None,
+        target_resource: tuple[str, str] | None = None,
         **version_metadata,
     ) -> tuple[Path, int]:
         """
@@ -805,6 +841,7 @@ class MediaGenerator:
             speed: 语速预留（同步模型忽略）
             task_id: 本次合成所属的生成任务；记账据此回指任务，直接调用（无队列任务）留空
             before_submit: 首次 provider 提交紧前执行一次的异步准入钩子
+            target_resource: 产物所属的资源（资源类型, 资源 ID），缺省为产物自身；它已被删除时产物进回收站
             **version_metadata: 额外元数据
 
         Returns:
@@ -855,6 +892,13 @@ class MediaGenerator:
                     raise RuntimeError("audio backend completed without a regular output file")
                 call.success(result)
 
+            await self._trash_if_target_deleted(
+                resource_type=resource_type,
+                resource_id=resource_id,
+                staged_file=staged_path,
+                task_id=task_id,
+                target=target_resource,
+            )
             if before_commit is not None:
                 await before_commit(staged_path)
             commit = commit_staged
@@ -882,6 +926,27 @@ class MediaGenerator:
         finally:
             await _discard_staged_output(staged_path)
 
+    async def choose_reference_image_assets(
+        self, sources: "Sequence[ReferenceImageSource]"
+    ) -> "tuple[ReferenceAssetChoice | None, ...]":
+        """按视频 backend 实际使用的推理凭证，为将要发出的参考图选用供应商素材关联。
+
+        与 ``sources`` 等长同序；可用关联给出素材引用，没有适用关联为 None。适用关联尚未可用或入库失败时抛
+        :class:`~lib.asset_library.generation_inputs.ProviderAssetLinkUnavailableError`，不改发图片内容。
+        """
+        from lib.asset_library.generation_inputs import choose_reference_image_assets
+        from lib.db import async_session_factory
+
+        if self._video_backend is None:
+            raise RuntimeError("video_backend not configured")
+        return await choose_reference_image_assets(
+            async_session_factory,
+            backend=self._video_backend,
+            project_name=self.project_name,
+            project_path=self.project_path,
+            sources=sources,
+        )
+
     async def generate_video_async(
         self,
         prompt: str,
@@ -890,6 +955,7 @@ class MediaGenerator:
         start_image: str | Path | Image.Image | None = None,
         end_image: Path | None = None,
         reference_images: list[Path] | None = None,
+        reference_image_asset_uris: list[str | None] | None = None,
         reference_audio_files: list[Path] | None = None,
         reference_audio_targets: list[int] | None = None,
         aspect_ratio: str = "9:16",
@@ -914,6 +980,8 @@ class MediaGenerator:
             start_image: 起始帧图片（image-to-video 模式）
             end_image: 结束帧图片（first_last 模式）
             reference_images: 参考图片列表（multi-reference 模式）
+            reference_image_asset_uris: 与 reference_images 等长同序；第 i 项非 None 时第 i 张参考图以该供应商
+                素材引用发出，不上传图片内容，也不进压缩与字节预检。只能交给对参考图槽位声明了素材引用的 backend
             reference_audio_files: 参考音频列表（音色复刻），顺序即 prompt 中「音频N」的指认顺序
             reference_audio_targets: 与 reference_audio_files 等长同序，第 i 项是该段音频对应
                 reference_images 的下标（0-based）；仅 backend 声明 reference_audio_per_image
@@ -963,7 +1031,7 @@ class MediaGenerator:
 
         # 能力校验与槽位组装先于记账括号：能力不被支持时硬失败要"不扣费"，
         # 在括号内抛虽也不结算，却会留一条 failed ApiCall 行；两者均无副作用，前置最干净。
-        from lib.backends.backend_assembly.specs import apply_user_added_video_overrides
+        from lib.backends.backend_assembly.specs import effective_builtin_video_capabilities
         from lib.backends.video_frame_slots import (
             gate_video_request,
             plan_frame_slots,
@@ -979,10 +1047,10 @@ class MediaGenerator:
             service_tier=version_metadata.get("service_tier", "default"),
             resolution=resolution,
         )
-        # 内置供应商下用户添加的模型：在档位感知基底上叠加通道事实覆盖，与规划层同一口径（docs/adr/0104）。
-        # 自定义供应商的覆盖已由 CustomVideoBackend 自己叠加。
+        # 内置供应商：档位感知的通道声明与模型条目两侧求值，用户添加的模型再叠加能力覆盖，与规划层同一口径
+        # （docs/adr/0104）。自定义供应商的生效能力已由 CustomVideoBackend 按同一规则求得。
         if self._video_provider_id is not None and not is_custom_provider(self._video_provider_id):
-            video_caps = apply_user_added_video_overrides(video_caps, self._video_provider_id, model_name)
+            video_caps = effective_builtin_video_capabilities(video_caps, self._video_provider_id, model_name)
         # 总时长校验需要读音频元数据，只能在这层（拿得到文件路径）探测好再传给纯函数的
         # gate_video_request；探测失败（随包 ffmpeg 不可用等）按 None 传入，由其按既有降级口径跳过
         # 该项校验，不阻断请求。仅当 caps 声明了总时长约束才探测——未声明该约束的后端
@@ -992,11 +1060,18 @@ class MediaGenerator:
             if reference_audio_files and video_caps.max_reference_audio_total_seconds is not None
             else None
         )
+        asset_uris = _aligned_reference_asset_uris(
+            self._video_backend, reference_images, reference_image_asset_uris, model=model_name
+        )
         slot_plan = plan_frame_slots(
             start_image=start_image,
             end_image=end_image,
             reference_images=reference_images,
         )
+        if asset_uris is not None and slot_plan.reference_start_index is not None:
+            for offset, uri in enumerate(asset_uris):
+                if uri is not None:
+                    slot_plan.specs[slot_plan.reference_start_index + offset].provider_asset = True
         gate_video_request(
             caps=video_caps,
             provider=self._video_backend.name,
@@ -1059,7 +1134,10 @@ class MediaGenerator:
                 inputs=_ledger_inputs(
                     reference_images=[
                         {"path": rel, "label": None, "role": "array"}
-                        for ref in (reference_images or [])
+                        | ({"provider_asset": uri} if uri is not None else {})
+                        for ref, uri in zip(
+                            reference_images or [], asset_uris or [None] * len(reference_images or []), strict=True
+                        )
                         if (rel := _project_relative_path(self.project_path, ref)) is not None
                     ],
                     start_image=_project_relative_path(self.project_path, start_image),
@@ -1108,6 +1186,8 @@ class MediaGenerator:
                     start_image=start_arg,
                     end_image=end_arg,
                     reference_images=ref_arg,
+                    # 压缩保序保数，素材引用项按原路径透传，按 reference_images 下标对齐的引用对 ref_arg 同样有效。
+                    reference_image_asset_uris=asset_uris,
                     # 音频不进压缩器（specs 只收图片），故直接透传原列表：顺序即 prompt
                     # 「音频N」的指认顺序，任何重排都会把 A 角色的音色安到 B 角色头上。
                     reference_audio_files=reference_audio_files,
@@ -1151,6 +1231,12 @@ class MediaGenerator:
             _collect_result_warnings(warnings, result)
             call.success(result, usage=backend_metered_usage(video_backend, sent_request[0], result))
 
+        await self._trash_if_target_deleted(
+            resource_type=resource_type,
+            resource_id=resource_id,
+            staged_file=staged_output_path,
+            task_id=task_id,
+        )
         await self._prepare_formal_video_commit(
             resource_type=resource_type,
             resource_id=resource_id,
@@ -1319,6 +1405,12 @@ class MediaGenerator:
 
         # backend.resume_video 已将付费结果下载到请求路径。正式媒体请求写入 staging，随后由
         # commit callback 在一个受控事务内保存历史并决定是否选中；非正式请求直接追加版本。
+        await self._trash_if_target_deleted(
+            resource_type=resource_type,
+            resource_id=resource_id,
+            staged_file=staged_output_path,
+            task_id=task_id,
+        )
         await self._prepare_formal_video_commit(
             resource_type=resource_type,
             resource_id=resource_id,

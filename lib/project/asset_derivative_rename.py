@@ -8,7 +8,7 @@
 （旧本体名 → 新本体名）与一组（旧衍生名 → 新衍生名），本模块把全部动作算齐再交还，
 让「零写入的预检」与「按序落盘」落在调用方的同一把锁与同一次正式事务里。
 
-与 :mod:`lib.project.asset_derivative_cleanup` 是一对：那边是登记消失时三样一起清，这边是登记
+与 :mod:`lib.project.asset_trash` 是一对：那边是登记消失时三样一起进项目回收站，这边是登记
 改名时三样一起搬。
 """
 
@@ -65,7 +65,7 @@ class DerivativeSheetRelocation:
         for directory in self.retired_dirs:
             # 非空、不存在或无权限都不是错误：目录只是收纳，留着不影响任何登记。
             with contextlib.suppress(OSError):
-                directory.rmdir()
+                directory.rmdir()  # hard-delete: infra -- 衍生图搬走后的空目录
 
     def commit_manifest(self) -> None:
         """把每个衍生的清单条目重键到新 id。各计划的键互不相交，逐个 CAS 提交安全。"""

@@ -1,9 +1,7 @@
 import { useId, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { AlertTriangle, Bot, CheckCircle2, Loader2, OctagonAlert, RotateCcw, Save, Sparkles } from "lucide-react";
-import type { DraftDocType, DraftSoftViolation, ScriptReviewViolation } from "@/types";
-import { useAppStore } from "@/stores/app-store";
-import { useAssistantStore } from "@/stores/assistant-store";
+import type { DraftSoftViolation, ScriptReviewViolation } from "@/types";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -27,35 +25,7 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { itemIdsInEpisodeText } from "@/utils/episode-display";
-
-/** 把一段指令预填进 Agent 输入框并打开面板；只填不发送，用户核对后自行发送。 */
-export function prefillAssistant(text: string): void {
-  useAssistantStore.getState().setInput(text);
-  useAppStore.getState().setAssistantPanelOpen(true);
-}
-
-/**
- * 待修复草稿交给 Agent 时的预填：列出违约，或在违约已清零时请它直接采用。
- * `episodeRef` 是集名连同集 ID 的指称（`episodeAgentRef`）。
- */
-export function draftFixRequestText(
-  t: (key: string, options?: Record<string, unknown>) => string,
-  episodeRef: string,
-  docType: DraftDocType,
-  violations: ScriptReviewViolation[],
-): string {
-  const draftName = t(
-    docType === "reference_prompt_authoring" ? "dashboard:draft_name_prompt_authoring" : "dashboard:draft_name_script_plan",
-  );
-  if (violations.length === 0) {
-    return t("dashboard:draft_fix_request_promote_prefill", { episodeRef, docType, draftName });
-  }
-  return [
-    t("dashboard:draft_fix_request_prefill_header", { episodeRef, count: violations.length, docType, draftName }),
-    ...violations.map((v, i) => `${i + 1}. ${v.message}`),
-  ].join("\n");
-}
+import { draftViolationMessage } from "@/utils/draft-violations";
 
 export interface DraftItemJump {
   index: number;
@@ -342,14 +312,16 @@ export function DraftEpisodeViolations({
 }
 
 /** 逐条违约（红）。 */
-export function DraftViolationList({ violations }: { violations: ScriptReviewViolation[] }) {
+export function DraftViolationList({ violations, position }: { violations: ScriptReviewViolation[]; position?: number | null }) {
+  const { t } = useTranslation();
   if (violations.length === 0) return null;
   return (
     <ul className="mt-1.5 flex flex-col gap-1">
       {violations.map((v, i) => (
+        // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 校验结果的只读列表，条目没有唯一标识、不带状态，界面不重排也不筛选，整份随校验结果替换
         <li key={`${v.code}-${i}`} className="flex items-start gap-1.5 text-xs leading-snug text-destructive">
           <OctagonAlert className="mt-px size-3 shrink-0" aria-hidden="true" />
-          <span>{itemIdsInEpisodeText(v.message)}</span>
+          <span>{draftViolationMessage(v, t, position)}</span>
         </li>
       ))}
     </ul>
@@ -357,14 +329,16 @@ export function DraftViolationList({ violations }: { violations: ScriptReviewVio
 }
 
 /** 逐条降级提示（琥珀）：只提示、不阻断。 */
-export function DraftSoftViolationList({ softViolations }: { softViolations: DraftSoftViolation[] }) {
+export function DraftSoftViolationList({ softViolations, position }: { softViolations: DraftSoftViolation[]; position?: number | null }) {
+  const { t } = useTranslation();
   if (softViolations.length === 0) return null;
   return (
     <ul className="mt-1.5 flex flex-col gap-1">
       {softViolations.map((soft, i) => (
+        // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 校验结果的只读列表，条目没有唯一标识、不带状态，界面不重排也不筛选，整份随校验结果替换
         <li key={`${soft.code}-${i}`} className="flex items-start gap-1.5 text-xs leading-snug text-warn">
           <AlertTriangle className="mt-px size-3 shrink-0" aria-hidden="true" />
-          <span>{itemIdsInEpisodeText(soft.message)}</span>
+          <span>{draftViolationMessage(soft, t, position)}</span>
         </li>
       ))}
     </ul>
@@ -410,16 +384,4 @@ export function DiscardDraftDialog({ open, agentOwned, fallbackText, loading, on
       </AlertDialogContent>
     </AlertDialog>
   );
-}
-
-/** 丢弃后回到哪份内容：按草稿对应的文档与正式内容是否存在给出说明。 */
-export function draftFallbackText(
-  t: (key: string, options?: Record<string, unknown>) => string,
-  docType: DraftDocType,
-  formalExists: boolean,
-): string {
-  if (docType === "reference_prompt_authoring") return t("dashboard:draft_discard_to_formal_script");
-  return formalExists
-    ? t("dashboard:draft_discard_to_formal_script_plan")
-    : t("dashboard:draft_discard_to_empty_script_plan");
 }

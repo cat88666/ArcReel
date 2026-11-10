@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -38,6 +39,7 @@ from lib.config.repository import SystemSettingRepository
 from lib.db.base import utc_now
 from lib.db.models.catalog_official_sync import CatalogOfficialSync
 from lib.infra.httpx_shared import get_http_client
+from lib.infra.task_cancel import raise_if_cancel_absorbed
 from lib.market.sources import PROXY_PREFIX_SETTING
 
 logger = logging.getLogger(__name__)
@@ -117,6 +119,7 @@ async def _fetch(client: httpx.AsyncClient, url: str, max_bytes: int, proxy_pref
     response = await fetch_bytes(
         client, url, max_bytes=max_bytes, proxy_prefix=proxy_prefix, deadline_seconds=_FETCH_DEADLINE_SECONDS
     )
+    raise_if_cancel_absorbed()
     if response.status_code == 304:
         raise MarketTransportError("HTTP 304 without If-None-Match")
     return response.content
@@ -165,23 +168,38 @@ async def sync_once(
     logger.info("官方同步已应用数据集 %s", data.dataset_version)
 
 
-async def _sync_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:
+async def _sync_loop(
+    session_factory: async_sessionmaker[AsyncSession], http_client: Callable[[], httpx.AsyncClient]
+) -> None:
     while True:
         try:
-            await sync_once(session_factory)
+            await sync_once(session_factory, http_client)
         except Exception as exc:
             logger.warning("官方同步异常，等下一轮", exc_info=True)
             # 只更新进程内状态：异常可能就出在数据库上。诊断信息照样能看到这次失败
             _status[0] = replace(_status[0], last_error=(str(exc) or type(exc).__name__)[:_ERROR_MAX_CHARS])
+        # 抓取建立连接时，关停的取消可能被 anyio 吞掉、这一轮照常跑完；在这里生效，免得带着取消请求睡满一整天
+        raise_if_cancel_absorbed()
         await asyncio.sleep(SYNC_INTERVAL_SECONDS)
 
 
-def start_official_sync(session_factory: async_sessionmaker[AsyncSession]) -> asyncio.Task[None]:
-    """启动后台同步循环：立即检查一次，之后每天一次。"""
-    return asyncio.get_running_loop().create_task(_sync_loop(session_factory), name="catalog-official-sync")
+def start_official_sync(
+    session_factory: async_sessionmaker[AsyncSession],
+    http_client: Callable[[], httpx.AsyncClient] = get_http_client,
+) -> asyncio.Task[None] | None:
+    """立即检查一次，之后每天一次；离线录制设 ARCREEL_SKIP_CATALOG_SYNC=1 跳过网络同步。"""
+    if os.getenv("ARCREEL_SKIP_CATALOG_SYNC") == "1":
+        logger.info("ARCREEL_SKIP_CATALOG_SYNC=1，跳过官方目录同步")
+        return None
+    return asyncio.get_running_loop().create_task(
+        _sync_loop(session_factory, http_client), name="catalog-official-sync"
+    )
 
 
-async def stop_official_sync(task: asyncio.Task[None]) -> None:
+async def stop_official_sync(task: asyncio.Task[None] | None) -> None:
+    """取消同步循环，等它连同被打断的数据库会话一起收尾完再返回。"""
+    if task is None:
+        return
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task

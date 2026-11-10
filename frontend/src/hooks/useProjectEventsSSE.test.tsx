@@ -376,6 +376,42 @@ describe("useProjectEventsSSE", () => {
     expect(useAppStore.getState().workspaceNotifications.map((n) => n.text).join("\n")).not.toContain("未命名集");
   });
 
+  it("does not announce changes from a stale script when the refresh fails", async () => {
+    // 新建的分镜还不在旧剧本里；刷新失败时按旧剧本成文会把它写成「已删除」，此时只留同步失败告警。
+    vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+    const stream = mockProjectEventStream();
+
+    renderHarness("/");
+    act(() => {
+      stream.options?.onChanges?.({
+        project_name: "demo",
+        batch_id: "batch-created-segment",
+        fingerprint: "fp-created-segment",
+        generated_at: "2026-03-01T00:00:00Z",
+        source: "filesystem",
+        changes: [
+          {
+            entity_type: "segment",
+            action: "created",
+            entity_id: "E1S07",
+            label: "分镜「E1S07」",
+            label_key: "segment",
+            label_params: { id: "E1S07" },
+            episode: 1,
+            focus: null,
+            important: true,
+          },
+        ],
+      });
+    });
+
+    await waitFor(() => {
+      expect(useAppStore.getState().toast?.tone).toBe("warning");
+    });
+    expect(useAppStore.getState().toast?.text).toContain("network down");
+    expect(useAppStore.getState().workspaceNotifications.map((n) => n.text).join("\n")).not.toContain("已删除");
+  });
+
   it("shows a toast without navigation for generation completion batches", async () => {
     const stream = mockProjectEventStream();
 
@@ -659,6 +695,63 @@ describe("useProjectEventsSSE", () => {
     });
     expect(screen.getByTestId("location")).toHaveTextContent("/props");
     expect(useAppStore.getState().scrollTarget).toBeNull();
+    expect(useAppStore.getState().workspaceNotifications).toHaveLength(0);
+  });
+
+  // 草稿新建是唯一会自动导航的变更：Agent 写出的新草稿跳到对应集，用户自己在 Web 端保存的草稿留在原页。
+  function emitDraftCreated(stream: ReturnType<typeof mockProjectEventStream>, source: "webui" | "worker") {
+    act(() => {
+      stream.options?.onChanges?.({
+        project_name: "demo",
+        batch_id: `batch-draft-${source}`,
+        fingerprint: `fp-draft-${source}`,
+        generated_at: "2026-03-01T00:00:00Z",
+        source,
+        changes: [
+          {
+            entity_type: "draft",
+            action: "created",
+            entity_id: "episode_1_script_plan",
+            label: "第 1 集的剧本",
+            label_key: "draft_normalized_script",
+            label_params: { episode: 1 },
+            episode: 1,
+            focus: { pane: "episode", episode: 1 },
+            important: true,
+          },
+        ],
+      });
+    });
+  }
+
+  it("navigates to the episode when another writer creates a draft", async () => {
+    const stream = mockProjectEventStream();
+    renderHarness("/characters");
+
+    emitDraftCreated(stream, "worker");
+
+    await waitFor(() => {
+      expect(screen.getByTestId("location")).toHaveTextContent("/episodes/1");
+    });
+    await waitFor(() => {
+      expect(useAppStore.getState().toast).not.toBeNull();
+    });
+  });
+
+  it("stays put without notifications when the user's own draft save creates a draft", async () => {
+    const stream = mockProjectEventStream();
+    renderHarness("/characters");
+
+    emitDraftCreated(stream, "webui");
+
+    await waitFor(() => {
+      expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId("location")).toHaveTextContent("/characters");
+    expect(useAppStore.getState().toast).toBeNull();
     expect(useAppStore.getState().workspaceNotifications).toHaveLength(0);
   });
 

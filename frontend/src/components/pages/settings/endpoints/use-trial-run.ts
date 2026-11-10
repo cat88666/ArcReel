@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { API, ApiRequestError } from "@/api";
 import { errMsg } from "@/utils/async";
 import type {
@@ -52,6 +52,8 @@ export function useTrialRun(): TrialRunHandle {
   // 轮询放弃态：连续失败达上限后只停读回，不动 run——服务端名额仍被占用，
   // runId 与取消入口必须保留，否则重新创建会撞 trial_run_already_running。
   const [pollStopped, setPollStopped] = useState(false);
+  // 每次开始测试加一：取消与回读期间旧 run 可能已终结、用户又开了新的一次，晚到的结果不能改写新 run。
+  const generation = useRef(0);
 
   const runId = run?.id ?? null;
   const finished = run !== null && (run.status === "succeeded" || run.status === "failed");
@@ -79,6 +81,7 @@ export function useTrialRun(): TrialRunHandle {
 
   // 试跑是进程内异步 run：创建后轮询读回，终态即停。递归 setTimeout 保证上一次
   // 读回落地后才排下一次，响应慢于间隔时不会堆积并发请求。
+  // react-doctor-disable-next-line react-doctor/effect-needs-cleanup -- 每轮的定时器号写进同一个 timer，cleanup 统一 clearTimeout 并 abort；abort 后的回调不再排下一轮
   useEffect(() => {
     if (!runId || finished || pollStopped) return;
     const controller = new AbortController();
@@ -120,6 +123,7 @@ export function useTrialRun(): TrialRunHandle {
   }, [runId, finished, pollStopped]);
 
   const start = useCallback(async (request: TrialRunRequest, assets: EndpointTestAssets = {}) => {
+    generation.current += 1;
     setError(null);
     setCancelled(false);
     setPollStopped(false);
@@ -138,15 +142,34 @@ export function useTrialRun(): TrialRunHandle {
   // 让「开始测试」重新可用。远端任务不受影响，已经发生的费用照算。
   const cancel = useCallback(async () => {
     if (!runId) return;
+    const started = generation.current;
+    const superseded = () => generation.current !== started;
     try {
       await API.cancelTrialRun(runId);
     } catch (e) {
-      // 404 即 run 已不在服务端，无可取消——照常清理本地状态解除锁定。
+      if (superseded()) return;
       if (!(e instanceof ApiRequestError && e.status === 404)) {
         setError(errMsg(e));
         return;
       }
+      // 404 有两种：供应商已经返回、取消来晚了，服务端保留着结果；或 run 已过期不在。
+      // 先回读一次，读到就展示（未到终态时轮询照常接手），回读也 404 才当作已取消清空。
+      try {
+        const kept = await API.getTrialRun(runId);
+        if (superseded()) return;
+        setRun(kept);
+        setPollStopped(false);
+        setError(null);
+        return;
+      } catch (readError) {
+        if (superseded()) return;
+        if (!(readError instanceof ApiRequestError && readError.status === 404)) {
+          setError(errMsg(readError));
+          return;
+        }
+      }
     }
+    if (superseded()) return;
     setRun(null);
     setError(null);
     setPollStopped(false);

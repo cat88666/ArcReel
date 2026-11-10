@@ -18,7 +18,7 @@ from lib.artifacts.artifact_activation import resolve_artifact_episode
 from lib.artifacts.version_manager import VersionManager
 from lib.config.resolver import ConfigResolver
 from lib.db import async_session_factory
-from lib.generation.batch_admission import BatchAdmissionDecision, refused_ticket
+from lib.generation.batch_admission import BatchAdmission, BatchAdmissionDecision, refused_ticket
 from lib.generation.generation_queue import get_generation_queue
 from lib.generation.generation_queue_client import (
     TaskSpec,
@@ -59,6 +59,7 @@ from server.i18n import DisplayNamesCatalog, Translator
 from server.routers._batch_admission import enqueue_failure_payload, localized_admission_payload
 from server.routers._script_edits import execute_current_episode_edit, require_script_edit_result
 from server.routers._validators import reject_retired_query_params
+from server.services.admission.cost_estimation import BatchCostEstimate
 from server.services.admission.reference_prompt_preview import render_reference_prompt_preview
 from server.services.admission.video_batch_admission import (
     admit_reference_video_batch,
@@ -138,7 +139,9 @@ class GenerateUnitsBatchRequest(BaseModel):
 # ============ 辅助 ============
 
 
-def _load_episode_script(project_name: str, episode: int, _t: Translator) -> tuple[dict, dict, str]:
+def _load_episode_script(
+    project_name: str, episode: int, _t: Translator, *, readonly: bool = False
+) -> tuple[dict, dict, str]:
     """加载 project.json + 指定集的剧本。返回 (project, script, script_file)。"""
     try:
         project = get_project_manager().load_project(project_name)
@@ -150,7 +153,9 @@ def _load_episode_script(project_name: str, episode: int, _t: Translator) -> tup
         raise HTTPException(status_code=404, detail=_t("ref_episode_not_found", episode=episode))
     script_file = meta["script_file"]
     try:
-        script = get_project_manager().load_script(project_name, script_file)
+        pm = get_project_manager()
+        load = pm.load_script_readonly if readonly else pm.load_script
+        script = load(project_name, script_file)
     except FileNotFoundError as exc:
         raise NotFoundError("script_not_found", name=script_file) from exc
     if not is_reference_video_project(project):
@@ -184,17 +189,19 @@ async def _commit_episode_edit(
 ) -> ScriptBatchEditResult:
     """在工作线程里执行一次剧本编辑：等项目文件锁、写回剧本都不占事件循环。
 
-    编辑一旦开始就跑完再传播取消，调用方拿到的结论与落盘结果一致。
+    编辑一旦开始就跑完再传播取消，调用方拿到的结论与落盘结果一致。写入按 ``webui`` 广播，
+    删除单元时移入回收站的产物也记为用户删除。
     """
-    return await run_sync_transaction(
-        execute_current_episode_edit,
-        get_project_manager(),
-        project_name,
-        episode,
-        script_file,
-        current,
-        operations,
-    )
+    with project_change_source("webui"):
+        return await run_sync_transaction(
+            execute_current_episode_edit,
+            get_project_manager(),
+            project_name,
+            episode,
+            script_file,
+            current,
+            operations,
+        )
 
 
 def _problem_payload(
@@ -316,6 +323,7 @@ async def add_unit(
     units = current.get("video_units") if isinstance(current.get("video_units"), list) else []
     if req.after_unit_id is not None:
         _find_unit(current, req.after_unit_id, _t)
+    # 编号只是占位：批量编辑提交时由服务端另发本集从没用过的编号，回读按结果里的编号取。
     unit = _build_unit_dict(
         unit_id=new_item_id(current),
         prompt=req.prompt,
@@ -337,7 +345,7 @@ async def add_unit(
     )
     require_script_edit_result(result)
     saved = await _read_script(project_name, result.script)
-    inserted = _find_unit(saved, unit["unit_id"], _t)
+    inserted = _find_unit(saved, result.affected_ids[0], _t)
     return {
         "unit": inserted,
         "unit_capability": await _unit_capability(project_name, project, inserted, request_facts),
@@ -632,27 +640,22 @@ async def generate_unit(
     }
 
 
-@router.post("/episodes/{episode}/units/generate-batch")
-async def generate_units_batch(
+async def _admit_units_batch(
     project_name: str,
     episode: int,
-    user: CurrentUser,
+    user_id: str,
+    body: GenerateUnitsBatchRequest,
     _t: Translator,
-    names: DisplayNamesCatalog,
-    req: GenerateUnitsBatchRequest,
-) -> dict[str, Any]:
-    """Admit a whole batch of reference units, then create their tasks.
+) -> tuple[BatchAdmission, GenerationSelection, list[dict[str, Any]], str]:
+    """Resolve one batch request's targets and admit them, without creating anything.
 
-    The verdict is returned with HTTP 200 in all three outcomes: an evaluation
-    that refuses the request is a successful evaluation, and collapsing it into a
-    generic 4xx would hide every gap after the first one. Callers branch on
-    ``decision``. An admitted batch whose enqueue is interrupted is likewise a
-    200: the tasks already created run on, and ``enqueue_failures`` names the
-    targets that never reached the queue.
+    The preview and the submission both go through here, so the units a confirmation
+    lists are the units the submission would request.
     """
 
-    project, script, script_file = await _read_episode_script(project_name, episode, _t)
-    body = req
+    project, script, script_file = await asyncio.to_thread(
+        _load_episode_script, project_name, episode, _t, readonly=True
+    )
     try:
         requested_ids = normalize_requested_ids(body.unit_ids, field="unit_ids")
     except ValueError as exc:
@@ -690,7 +693,6 @@ async def generate_units_batch(
         )
         for unit_id in selection.unmatched_ids
     ]
-    queue = get_generation_queue()
     admission = await admit_reference_video_batch(
         project_name=project_name,
         project=project,
@@ -708,11 +710,62 @@ async def generate_units_batch(
         # 产物状态不可读的 unit 被选目标环节排除在外，但它属于这次请求：不带进准入，
         # 同批健康的 unit 会照常入队，剩下这一个被无声略过。
         extra_tickets=[*unmatched, *malformed, *artifact_state_tickets(selection.unavailable)],
-        user_id=user.id,
-        queue=queue,
+        user_id=user_id,
+        queue=get_generation_queue(),
     )
+    return admission, selection, targets, script_file
+
+
+def _skipped_unit_ids(selection: GenerationSelection) -> list[str]:
+    return sorted(state.unit_id for state in selection.skipped)
+
+
+@router.post("/episodes/{episode}/units/generate-batch/preview")
+async def preview_units_batch(
+    project_name: str,
+    episode: int,
+    user: CurrentUser,
+    _t: Translator,
+    names: DisplayNamesCatalog,
+    req: GenerateUnitsBatchRequest,
+) -> dict[str, Any]:
+    """Admit a batch of reference units without creating tasks, for the confirmation dialog.
+
+    Returns the same verdict the submission would, the units skipped for already having
+    a clip, and the quoted cost of the priced units together with how many have no quote.
+    """
+
+    admission, selection, _targets, _script_file = await _admit_units_batch(project_name, episode, user.id, req, _t)
+    total, unpriced = admission.quoted_total()
+    return {
+        **localized_admission_payload(admission, _t, names),
+        "skipped_unit_ids": _skipped_unit_ids(selection),
+        **BatchCostEstimate(total=total, unpriced_count=unpriced).to_payload(),
+    }
+
+
+@router.post("/episodes/{episode}/units/generate-batch")
+async def generate_units_batch(
+    project_name: str,
+    episode: int,
+    user: CurrentUser,
+    _t: Translator,
+    names: DisplayNamesCatalog,
+    req: GenerateUnitsBatchRequest,
+) -> dict[str, Any]:
+    """Admit a whole batch of reference units, then create their tasks.
+
+    The verdict is returned with HTTP 200 in all three outcomes: an evaluation
+    that refuses the request is a successful evaluation, and collapsing it into a
+    generic 4xx would hide every gap after the first one. Callers branch on
+    ``decision``. An admitted batch whose enqueue is interrupted is likewise a
+    200: the tasks already created run on, and ``enqueue_failures`` names the
+    targets that never reached the queue.
+    """
+
+    admission, selection, targets, script_file = await _admit_units_batch(project_name, episode, user.id, req, _t)
     payload = localized_admission_payload(admission, _t, names)
-    payload["skipped_unit_ids"] = sorted(state.unit_id for state in selection.skipped)
+    payload["skipped_unit_ids"] = _skipped_unit_ids(selection)
     if admission.decision is not BatchAdmissionDecision.ADMITTED:
         payload["task_ids"] = []
         payload["task_ids_by_unit"] = {}
@@ -728,7 +781,7 @@ async def generate_units_batch(
         options = request_options_for_unit(
             ReferenceRequestOptions(),
             spec.resource_id,
-            body.confirmed_request_durations,
+            req.confirmed_request_durations,
         )
         spec.payload = {
             **(spec.payload or {}),
@@ -738,7 +791,7 @@ async def generate_units_batch(
         project_name=project_name,
         specs=specs,
         user_id=user.id,
-        queue=queue,
+        queue=get_generation_queue(),
     )
     # 入队中断不撤销已创建的任务：它们是准入通过的完整付费单元，照常执行。没轮到的目标
     # 逐 ID 报出来，界面据此释放乐观占用标记，下次「缺失即生成」只补这些。
@@ -820,7 +873,7 @@ async def upload_unit_video(
                     commit_metadata=_commit_metadata,
                 )
             finally:
-                await asyncio.to_thread(staged_video.unlink, missing_ok=True)
+                await asyncio.to_thread(staged_video.unlink, missing_ok=True)  # hard-delete: temp -- 上传暂存文件
             # emit 内部会读剧本解析 episode 并计算指纹，放线程池避免阻塞事件循环；
             # 返回的指纹直接复用进响应体，免二次计算
             fingerprints = await run_sync_transaction(

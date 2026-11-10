@@ -19,9 +19,11 @@ from unittest.mock import AsyncMock
 import pytest
 from mcp import types
 from mcp.server import Server
+from PIL import Image
 
 from lib.artifacts.artifact_activation import register_current_artifact
 from lib.artifacts.artifact_manifest import ArtifactKey
+from lib.artifacts.version_manager import VersionManager
 from lib.config.resolver import ConfigResolver
 from lib.db import async_session_factory
 from lib.generation.generation_queue import GenerationQueue
@@ -34,6 +36,12 @@ from lib.project.project_migration_failure import (
 )
 from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
 from server.agent_runtime.arcreel_mcp import build_arcreel_mcp_server
+from server.agent_toolset.asset_library import (
+    LIST_PROVIDER_LIBRARY_ASSETS,
+    RELEASE_PROVIDER_ASSET_LINK,
+    SELECT_PROVIDER_LIBRARY_ASSET,
+    UPLOAD_TO_PROVIDER_ASSET_LIBRARY,
+)
 from server.agent_toolset.declaration import (
     BLOCKED,
     MIGRATION_REFUSAL_NOTE,
@@ -55,8 +63,10 @@ from server.agent_toolset.embedded import embedded_server
 from server.agent_toolset.envelope import json_value
 from server.agent_toolset.generation_batches import CANCEL_GENERATION_BATCH, GET_GENERATION_BATCH
 from server.agent_toolset.grid_storyboards import GENERATE_GRID, SPLIT_GRIDS
+from server.agent_toolset.image_review import INSPECT_IMAGES
 from server.agent_toolset.orientation import GET_PROMPT_PREVIEW, GET_VIDEO_CAPABILITIES
 from server.agent_toolset.project_entry import CREATE_PROJECT, EDIT_SOURCE_TEXT
+from server.agent_toolset.project_trash import DELETE_PROJECT_FILE, RESTORE_TRASH_RECORD
 from server.agent_toolset.remote import LONG_TASK_NOTE, remote_tool
 from server.agent_toolset.repair_channel import MERGE_ASSET
 from server.agent_toolset.script_authoring import (
@@ -140,6 +150,22 @@ SAMPLE_ARGUMENTS: dict[str, dict[str, Any]] = {
     "generate_videos": {"script": "episode_1.json", "target": {"scope": "all"}},
     "select_video_version": {"unit_id": "E1S01", "version": 1},
     "inspect_video_units": {"unit_ids": ["E1S01"]},
+    "inspect_images": {"resource_type": "character", "ids": ["甲"]},
+    "get_provider_asset_links": {"resource_type": "character", "resource_id": "甲"},
+    "list_provider_library_assets": {"account_id": 1},
+    "upload_to_provider_asset_library": {
+        "resource_type": "character",
+        "resource_id": "甲",
+        "account_id": 1,
+        "user_requested": True,
+    },
+    "select_provider_library_asset": {
+        "resource_type": "character",
+        "resource_id": "甲",
+        "account_id": 1,
+        "asset_id": "asset-absent",
+    },
+    "release_provider_asset_link": {"link_id": 1},
     "create_timeline": {"from": "script", "episode": 1, "name": "完整版"},
     "list_timelines": {"episode": 1},
     "read_timeline": {"timeline": "tl-0000abcd"},
@@ -155,6 +181,9 @@ SAMPLE_ARGUMENTS: dict[str, dict[str, Any]] = {
     "restore_revision": {"timeline": "tl-0000abcd", "revision": 1},
     "render_final_cut": {"timeline": "tl-0000abcd"},
     "export_jianying_draft": {"timeline": "tl-0000abcd"},
+    "delete_project_file": {"path": "notes.txt"},
+    "list_trash_records": {},
+    "restore_trash_record": {"record_id": "20261025T000000Z-0000abcd"},
 }
 
 _DECLARATIONS = pytest.mark.parametrize("declaration", AGENT_TOOLSET, ids=lambda declaration: declaration.name)
@@ -553,6 +582,14 @@ _PROBLEM_ON_SAMPLE = frozenset(
         MERGE_ASSET.name,
         # 测试项目没有登记整本源文的文件。
         EDIT_SOURCE_TEXT.name,
+        # 测试项目里没有样例路径的文件，回收站里也没有删除记录。
+        DELETE_PROJECT_FILE.name,
+        RESTORE_TRASH_RECORD.name,
+        # 测试库里没有素材库账号与关联：上传、浏览、选择与解除都找不到对象。
+        LIST_PROVIDER_LIBRARY_ASSETS.name,
+        UPLOAD_TO_PROVIDER_ASSET_LIBRARY.name,
+        SELECT_PROVIDER_LIBRARY_ASSET.name,
+        RELEASE_PROVIDER_ASSET_LINK.name,
     }
 )
 
@@ -610,6 +647,31 @@ async def test_contact_sheets_reach_both_hosts_as_the_same_image_blocks(
         (image.mimeType, image.data) for image in remote_images
     ]
     assert embedded_images[0].mimeType == "image/jpeg"
+    assert base64.b64decode(embedded_images[0].data).startswith(b"\xff\xd8")
+    assert isinstance(embedded.content[-1], types.ImageContent)
+
+
+async def test_inspected_images_reach_both_hosts_as_the_same_image_blocks(
+    seeded_projects: ProjectManager, services: Services
+) -> None:
+    project_path = seeded_projects.get_project_path("demo")
+    sheet = project_path / ".staging" / "甲.png"
+    sheet.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (160, 90), "red").save(sheet)
+    VersionManager(project_path).add_version("characters", "甲", "主角", source_file=sheet)
+    arguments = {"resource_type": "character", "ids": ["甲"]}
+
+    embedded = await _call_embedded(INSPECT_IMAGES, arguments, services)
+    remote = await _call_remote(INSPECT_IMAGES, {"project": "demo", **arguments}, services)
+
+    assert embedded.isError is remote.isError is False
+    assert _embedded_json(embedded) == remote.structuredContent
+    embedded_images = [block for block in embedded.content if isinstance(block, types.ImageContent)]
+    remote_images = [block for block in remote.content if isinstance(block, types.ImageContent)]
+    assert len(embedded_images) == 1
+    assert [(image.mimeType, image.data) for image in embedded_images] == [
+        (image.mimeType, image.data) for image in remote_images
+    ]
     assert base64.b64decode(embedded_images[0].data).startswith(b"\xff\xd8")
     assert isinstance(embedded.content[-1], types.ImageContent)
 
@@ -767,3 +829,131 @@ async def test_a_text_generation_dry_run_returns_the_same_prompt_in_both_hosts(
     assert "DRY RUN" in remote.structuredContent["text_generation"]["message"]
     assert _embedded_json(embedded) == remote.structuredContent
     assert _texts(embedded) == _texts(remote)
+
+
+@pytest.fixture
+def reference_preview_project(seeded_projects):
+    from tests.factories import activate_reference_project
+
+    project_path = seeded_projects.get_project_path("demo")
+    (project_path / "characters").mkdir(exist_ok=True)
+    (project_path / "characters" / "甲.png").write_bytes(b"image")
+    (project_path / "scenes").mkdir(exist_ok=True)
+    (project_path / "scenes" / "庭院.png").write_bytes(b"image")
+    script = {
+        "episode": 1,
+        "content_mode": "drama",
+        "generation_mode": "reference_video",
+        "video_units": [
+            {"unit_id": "E1U01", "text": "@[甲] 走进 @[庭院]。@[甲]{你好。}", "duration_seconds": 8},
+            {"unit_id": "E1U02", "text": "   ", "duration_seconds": 8},
+            {"unit_id": "E1U03", "text": "@[未登记] 走来。", "duration_seconds": 8},
+        ],
+    }
+    script["video_units"].append({**script["video_units"][0], "unit_id": "E1U04", "duration_seconds": 7})
+    script["video_units"].append({"unit_id": "E1U05", "text": 123, "duration_seconds": 8})
+    script["video_units"].append({**script["video_units"][0], "unit_id": "E1U06", "duration_seconds": "x"})
+    (project_path / "scripts" / "episode_1.json").write_text(json.dumps(script, ensure_ascii=False))
+    activate_reference_project(
+        project_path,
+        {
+            "content_mode": "drama",
+            "characters": {
+                "甲": {"description": "主角", "character_sheet": "characters/甲.png", "voice_style": "低沉"}
+            },
+            "scenes": {"庭院": {"description": "院子", "scene_sheet": "scenes/庭院.png"}},
+        },
+    )
+    return project_path
+
+
+@pytest.mark.parametrize(
+    ("unit_id", "unavailable"),
+    [
+        ("E1U01", None),
+        ("E1U01", "reference_capability_unavailable"),
+        ("E1U04", None),
+        ("E1U02", "reference_prompt_preview_missing"),
+        ("E1U03", "reference_asset_unregistered"),
+        ("E1U05", "prompt_preview_invalid"),
+        ("E1U06", "prompt_preview_invalid"),
+        ("E1U99", "item_not_found"),
+    ],
+)
+async def test_reference_prompt_preview_reaches_both_hosts(
+    reference_preview_project,
+    services,
+    set_video_request_facts,
+    respx_mock,
+    unit_id,
+    unavailable,
+):
+    import asyncio
+
+    from lib.generation.video_request_facts import VideoRequestFactsFailure
+    from lib.script.reference_video.request_projection import project_reference_unit_request
+    from server.services.admission.reference_prompt_preview import render_reference_prompt_preview
+    from tests.factories import make_display_names, make_video_request_facts
+
+    set_video_request_facts(
+        VideoRequestFactsFailure("reference_capability_unavailable", (("capability", "r2v"),))
+        if unavailable == "reference_capability_unavailable"
+        else make_video_request_facts(route="reference_video", generation_type="r2v", max_reference_images=1)
+    )
+
+    def snapshot():
+        return {
+            p.relative_to(reference_preview_project): p.read_bytes()
+            for p in reference_preview_project.rglob("*")
+            if p.is_file()
+        }
+
+    before = await asyncio.to_thread(snapshot)
+    arguments = {"script": "episode_1.json", "item_id": unit_id}
+    embedded = await _call_embedded(GET_PROMPT_PREVIEW, arguments, services)
+    remote = await _call_remote(GET_PROMPT_PREVIEW, {"project": "demo", **arguments}, services)
+    payload = _embedded_json(embedded)
+    assert payload == remote.structuredContent
+    assert embedded.isError is remote.isError is (unavailable == "item_not_found")
+    if unavailable == "item_not_found":
+        assert payload["problem"]["code"] == unavailable
+    else:
+        video = payload["prompt_preview"]["video"]
+        assert video["unavailable"] == unavailable
+        if unavailable:
+            if unavailable == "reference_capability_unavailable":
+                assert video["unavailable_params"] == {"capability": "r2v"}
+            assert video["text"] is None
+            assert video["warnings"] == []
+        else:
+            assert "<甲>@图片1" in video["text"]
+            assert "@图片2" not in video["text"]
+            assert "你好。" in video["text"]
+            assert "低沉" in video["text"]
+            assert video["warnings"][0]["key"] == "reference_images_clamped"
+            if unit_id == "E1U04":
+                assert any(
+                    warning["key"] == "reference_duration_confirmation_required" for warning in video["warnings"]
+                )
+            project = await asyncio.to_thread(services.projects.load_project, "demo")
+            script = await asyncio.to_thread(services.projects.load_script, "demo", "episode_1.json")
+            unit = next(unit for unit in script["video_units"] if unit["unit_id"] == unit_id)
+            projection = await project_reference_unit_request(
+                project=project,
+                script=script,
+                unit=unit,
+                project_path=reference_preview_project,
+            )
+            shared = await asyncio.to_thread(
+                render_reference_prompt_preview,
+                project=project,
+                unit=unit,
+                project_path=reference_preview_project,
+                projection=projection,
+                translate=lambda key, **params: key,
+                names=make_display_names(),
+            )
+            assert video["text"] == shared["text"]
+            assert [warning["key"] for warning in video["warnings"]] == shared["warnings"]
+    assert await asyncio.to_thread(snapshot) == before
+    assert not respx_mock.calls

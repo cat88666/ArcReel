@@ -388,7 +388,7 @@ describe("StudioCanvasRouter", () => {
 
   it("shows loading state when currentProjectName is missing", () => {
     renderAt("/");
-    expect(screen.getByText("加载中...")).toBeInTheDocument();
+    expect(screen.getByText("加载中…")).toBeInTheDocument();
   });
 
   it("keeps showing loading state on a deep link while the project detail request is still in flight", () => {
@@ -403,7 +403,7 @@ describe("StudioCanvasRouter", () => {
 
     renderAt("/characters");
 
-    expect(screen.getByText("加载中...")).toBeInTheDocument();
+    expect(screen.getByText("加载中…")).toBeInTheDocument();
     expect(screen.queryByTestId("character-gallery")).not.toBeInTheDocument();
   });
 
@@ -438,7 +438,7 @@ describe("StudioCanvasRouter", () => {
     viewEpisodes.unmount();
 
     await waitFor(() => {
-      expect(screen.queryByText("加载中...")).not.toBeInTheDocument();
+      expect(screen.queryByText("加载中…")).not.toBeInTheDocument();
     });
   });
 
@@ -752,7 +752,7 @@ describe("StudioCanvasRouter", () => {
     await user.click(screen.getByRole("button", { name: "这一集的更多操作" }));
     await user.click(await screen.findByRole("menuitem", { name: "删除这一集" }));
     const dialog = await screen.findByRole("alertdialog", { name: "删除「EP1」" });
-    await user.click(within(dialog).getByRole("button", { name: "删除" }));
+    await user.click(within(dialog).getByRole("button", { name: "移入项目回收站" }));
 
     // 删掉的是正在看的这一集，回到分集列表
     await waitFor(() => expect(history.at(-1)).toBe("/episodes"));

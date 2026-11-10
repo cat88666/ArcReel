@@ -1,52 +1,13 @@
-import { useEffect, useId, useState } from "react";
+import { useId } from "react";
 import { useTranslation } from "react-i18next";
-import { API } from "@/api";
 import { cn } from "cn";
 
 import { Input } from "@/components/ui/input";
+import { ModelLifecycleNotice, type ModelLifecycleNotices } from "@/components/shared/ModelLifecycleNotice";
+import { NarrationVoiceInput } from "@/components/shared/NarrationVoiceInput";
 import { ProviderModelSelect } from "@/components/shared/ProviderModelSelect";
-import type { NarrationDelivery } from "@/types";
-import { voidCall } from "@/utils/async";
-
-/** 项目的旁白交付配置（docs/adr/0089）：交付方式 + TTS 快照。 */
-export interface NarrationDeliveryValue {
-  delivery: NarrationDelivery;
-  /** "provider/model"；空串表示未选。 */
-  audioBackend: string;
-  narrationVoice: string;
-  /** null 表示不向供应商传语速。 */
-  narrationSpeed: number | null;
-}
-
-export type NarrationDeliveryProblem = "model" | "voice";
-
-/** TTS 配音项目必须带模型与音色；后期配音项目没有要求。 */
-export function narrationDeliveryProblem(value: NarrationDeliveryValue): NarrationDeliveryProblem | null {
-  if (value.delivery !== "use_tts") return null;
-  if (!value.audioBackend) return "model";
-  if (!value.narrationVoice.trim()) return "voice";
-  return null;
-}
-
-/** 所选 TTS 模型是否支持配音语速；查询中、查询失败或未选模型时为 null。 */
-function useTtsSpeedSupport(backend: string): boolean | null {
-  const [answer, setAnswer] = useState<{ backend: string; supportsSpeed: boolean } | null>(null);
-  useEffect(() => {
-    if (!backend) return;
-    const controller = new AbortController();
-    voidCall((async () => {
-      try {
-        const res = await API.getTtsModelCapabilities(backend, { signal: controller.signal });
-        if (controller.signal.aborted) return;
-        setAnswer({ backend, supportsSpeed: res.supports_speed });
-      } catch {
-        // 查不到能力时不置灰：语速仍由供应商自行决定是否生效
-      }
-    })());
-    return () => controller.abort();
-  }, [backend]);
-  return answer?.backend === backend ? answer.supportsSpeed : null;
-}
+import { useTtsModelCapabilities } from "@/hooks/useTtsModelCapabilities";
+import { narrationDeliveryProblem, type NarrationDeliveryValue } from "./narration-delivery";
 
 const FIELD_LABEL_CLS = "text-xs font-medium text-muted-foreground";
 
@@ -64,15 +25,18 @@ interface Props {
   audioBackends: string[];
   providerNames: Record<string, string>;
   modelNames: Record<string, string>;
+  /** 下线提示（候选接口的 `lifecycle`）；所选配音模型即将下线或已下线时在下拉下方提示。 */
+  lifecycle?: ModelLifecycleNotices;
 }
 
-export function NarrationDeliveryFields({ value, onChange, audioBackends, providerNames, modelNames }: Props) {
+export function NarrationDeliveryFields({ value, onChange, audioBackends, providerNames, modelNames, lifecycle }: Props) {
   const { t } = useTranslation("dashboard");
   const idBase = useId();
   const voiceId = `${idBase}-voice`;
   const speedId = `${idBase}-speed`;
-  const supportsSpeed = useTtsSpeedSupport(value.delivery === "use_tts" ? value.audioBackend : "");
-  const speedDisabled = supportsSpeed === false;
+  const capabilities = useTtsModelCapabilities(value.delivery === "use_tts" ? value.audioBackend : "");
+  const speedDisabled = capabilities?.supportsSpeed === false;
+  const voices = capabilities?.voices ?? [];
   const problem = narrationDeliveryProblem(value);
 
   return (
@@ -118,6 +82,12 @@ export function NarrationDeliveryFields({ value, onChange, audioBackends, provid
               onChange={(audioBackend) => onChange({ ...value, audioBackend })}
               aria-label={t("project_tts_model_label")}
             />
+            <ModelLifecycleNotice
+              value={value.audioBackend}
+              notices={lifecycle}
+              modelNames={modelNames}
+              onSwitch={(audioBackend) => onChange({ ...value, audioBackend })}
+            />
             {audioBackends.length === 0 ? (
               <p className="text-xs text-warn">{t("project_tts_no_models")}</p>
             ) : problem === "model" ? (
@@ -128,15 +98,19 @@ export function NarrationDeliveryFields({ value, onChange, audioBackends, provid
             <label htmlFor={voiceId} className={FIELD_LABEL_CLS}>
               {t("narration_voice_label")}
             </label>
-            <Input
+            <NarrationVoiceInput
               id={voiceId}
-              type="text"
               value={value.narrationVoice}
-              onChange={(e) => onChange({ ...value, narrationVoice: e.target.value })}
+              onChange={(narrationVoice) => onChange({ ...value, narrationVoice })}
+              voices={voices}
               aria-invalid={problem === "voice"}
             />
             <p className={cn("text-xs", problem === "voice" ? "text-warn" : "text-muted-foreground")}>
-              {problem === "voice" ? t("project_narration_voice_required") : t("project_narration_voice_hint")}
+              {problem === "voice"
+                ? t("project_narration_voice_required")
+                : voices.length > 0
+                  ? t("project_narration_voice_hint_with_voices")
+                  : t("project_narration_voice_hint")}
             </p>
           </div>
           <div className="flex flex-col gap-1.5">

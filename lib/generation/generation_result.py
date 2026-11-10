@@ -111,6 +111,7 @@ class GenerationProblemCode(StrEnum):
     TASK_CANCELLED = "generation_task_cancelled"
     TASK_INTERRUPTED = "generation_task_interrupted"
     POST_PROCESSING_FAILED = "generation_post_processing_failed"
+    TARGET_DELETED = "generation_target_deleted"
 
 
 class GenerationAction(StrEnum):
@@ -161,14 +162,24 @@ _TASK_FAILURE_ACTIONS: dict[str, GenerationAction] = {
     "image_capability_missing_t2i": GenerationAction.CONFIGURE_PROVIDER,
     "image_endpoint_mismatch_no_i2i": GenerationAction.CONFIGURE_PROVIDER,
     "image_endpoint_mismatch_no_t2i": GenerationAction.CONFIGURE_PROVIDER,
+    # Seedream 挂在 OpenAI 图片端点上：改选方舟 Seedream 端点即可。
+    "image_seedream_edits_unavailable": GenerationAction.CONFIGURE_PROVIDER,
     "provider_unsupported_media": GenerationAction.CONFIGURE_PROVIDER,
+    "narration_tts_speed_out_of_range": GenerationAction.FIX_INPUT,
     "model_not_in_provider_catalog": GenerationAction.CONFIGURE_PROVIDER,
+    "model_discontinued": GenerationAction.CONFIGURE_PROVIDER,
     # 上游按确定性 4xx 拒了这个请求：原样重发只会被同样拒绝，还要再付一次。
     "provider_rejected": GenerationAction.FIX_INPUT,
+    # 多为内容安全过滤命中：调整提示词或参考图后再生成。
+    "image_output_missing": GenerationAction.FIX_INPUT,
+    # 模型只出矢量等非位图格式：换一个模型。
+    "image_output_format_unsupported": GenerationAction.CONFIGURE_PROVIDER,
     "declarative_template_render_failed": GenerationAction.CONFIGURE_PROVIDER,
     "declarative_response_extract_failed": GenerationAction.CONFIGURE_PROVIDER,
     # 图片已出但没取回：图片不续跑，「重试下载」接不回原任务，重新生成是唯一的一步。
     "declarative_image_save_failed": GenerationAction.RETRY,
+    "comfyui_reference_audio_invalid": GenerationAction.CONFIGURE_PROVIDER,
+    "comfyui_aspect_ratio_unmapped": GenerationAction.CONFIGURE_PROVIDER,
     "comfyui_image_drop_unsupported": GenerationAction.CONFIGURE_PROVIDER,
     # 传不上去多半是地址、凭据或磁盘的一次性问题，重发同一请求可能就好了。
     "comfyui_upload_failed": GenerationAction.RETRY,
@@ -212,6 +223,8 @@ _TASK_FAILURE_ACTIONS: dict[str, GenerationAction] = {
     "video_aspect_ratio_not_supported": GenerationAction.FIX_INPUT,
     "video_resolution_not_supported": GenerationAction.FIX_INPUT,
     "video_reference_resolution_unsupported": GenerationAction.FIX_INPUT,
+    # 提交前才发现参考图多于模型上限（两次读到的模型目录不一致）：重新生成会按最新上限重新裁剪编号。
+    "image_reference_images_exceeded": GenerationAction.RETRY,
     "video_reference_images_exceeded": GenerationAction.FIX_INPUT,
     "video_reference_audio_duration_exceeded": GenerationAction.FIX_INPUT,
     "video_reference_audio_exceeded": GenerationAction.FIX_INPUT,
@@ -225,6 +238,14 @@ _TASK_FAILURE_ACTIONS: dict[str, GenerationAction] = {
     "video_reference_images_required": GenerationAction.GENERATE_DEPENDENCY,
     "video_reference_images_unreadable": GenerationAction.GENERATE_DEPENDENCY,
     "video_reference_audio_unreadable": GenerationAction.GENERATE_DEPENDENCY,
+    # 素材库入库仍在处理：等入库有结果后重新生成，或解除关联改发普通图片。
+    "provider_asset_link_processing": GenerationAction.FIX_INPUT,
+    # 入库失败：解除关联后重新上传，或解除关联改发普通图片。
+    "provider_asset_link_failed": GenerationAction.FIX_INPUT,
+    # 供应商审核拒绝了输入图片：换图或上传到供应商素材库后再生成，原样重试只会被同样拒绝。
+    "provider_input_image_rejected": GenerationAction.FIX_INPUT,
+    "provider_input_image_rejected_at": GenerationAction.FIX_INPUT,
+    "provider_input_asset_rejected_at": GenerationAction.FIX_INPUT,
     # 项目已删除，产物无处可落，也没有可重试的对象。
     "project_deleted_during_task": GenerationAction.NONE,
     # 进程重启 / 恢复失败：任务本身没有内在缺陷，重试即可。
@@ -277,7 +298,7 @@ def decode_generation_problem(error_message: str | None) -> GenerationProblem | 
 def migration_problem(record: MigrationFailureRecord) -> GenerationProblem:
     """The single blocking problem every consumer reports for a broken project.
 
-    ``detail`` is the migration failure message exactly as raised, so the user
+    ``detail`` is the recorded migration failure message (project-relative paths), so the user
     reads the same sentence in the project banner, in the production plan and in
     any refused generation call. ``params`` carries the structured locations the
     agent needs to navigate straight to the offending episode or file.

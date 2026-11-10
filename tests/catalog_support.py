@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+from datetime import date
 from typing import Any
 
 import pytest
@@ -11,12 +12,17 @@ import pytest
 from arcreel_catalog_core import BuiltinProviderListing, BuiltinProviderModel, CatalogData, CatalogEntry
 from lib.billing.catalog_pricing import price_builtin_call
 from lib.billing.metering import Priced, Usage
-from lib.catalog import query
+from lib.catalog import lifecycle, query
 
 
 def install_catalog(monkeypatch: pytest.MonkeyPatch, data: CatalogData) -> None:
     """让目录查询在本用例内读 ``data``，代替出厂快照。"""
     monkeypatch.setattr(query, "factory_snapshot", lambda: data)
+
+
+def set_catalog_today(monkeypatch: pytest.MonkeyPatch, day: date) -> None:
+    """让目录读模型在本用例内把 ``day`` 当作今天（UTC 日期），判定生命周期用；可在用例中途再次调用跨日。"""
+    monkeypatch.setattr(lifecycle, "utc_today", lambda: day)
 
 
 def with_entry_changes(data: CatalogData, provider_id: str, api_model_name: str, **changes: Any) -> CatalogData:
@@ -27,6 +33,17 @@ def with_entry_changes(data: CatalogData, provider_id: str, api_model_name: str,
     assert target is not None
     entries = tuple(replace(entry, **changes) if entry.key == target.key else entry for entry in data.entries)
     return replace(data, entries=entries)
+
+
+def with_min_app_version(data: CatalogData, provider_id: str, api_model_name: str, version: str) -> CatalogData:
+    """给内置供应商的一个官方收录模型标上最低应用版本。"""
+    listing = data.builtin_providers[provider_id]
+    models = tuple(
+        replace(model, min_app_version=version) if model.api_model_name == api_model_name else model
+        for model in listing.models
+    )
+    providers = {**data.builtin_providers, provider_id: replace(listing, models=models)}
+    return replace(data, builtin_providers=providers)
 
 
 def with_entry_facts(data: CatalogData, provider_id: str, api_model_name: str, **changes: Any) -> CatalogData:

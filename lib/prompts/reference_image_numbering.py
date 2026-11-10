@@ -62,7 +62,8 @@ class ReferenceImageSlot(Protocol):
     def logical_id(self) -> str | None: ...
 
 
-def _image_label(position: int) -> str:
+def reference_image_label(position: int) -> str:
+    """参考图在请求数组中的位置（从 0 起）对应的「图N」。"""
     return f"图{position + 1}"
 
 
@@ -78,7 +79,7 @@ def reference_images_declaration(references: Sequence[ReferenceImageSlot]) -> st
     """``Reference_Images`` 行的值：按类型分组的编号声明；无参考图时为空串。"""
     groups: dict[str, list[str]] = {}
     for position, slot in enumerate(references):
-        groups.setdefault(_describe(slot), []).append(_image_label(position))
+        groups.setdefault(_describe(slot), []).append(reference_image_label(position))
     if not groups:
         return ""
     return "；".join(f"{'、'.join(labels)}为{description}" for description, labels in groups.items()) + "。"
@@ -94,7 +95,7 @@ class ReferenceImageClamp:
 
     total: int
     kept: int
-    max_reference_images: int
+    max_reference_images: int | None
     model: str
     dropped: tuple[str, ...] = ()
 
@@ -115,19 +116,20 @@ class ReferenceImageClamp:
 
 def clamp_reference_images(
     references: Sequence[ReferenceImageSlot],
-    max_reference_images: int,
+    max_reference_images: int | None,
     *,
     model: str,
 ) -> ReferenceImageClamp:
     """按图像后端的参考图上限判定应保留的张数：保留前 N 张、去尾。
 
-    ``max_reference_images`` 为 0 表示后端不按数量裁剪，全量保留。调用方用 ``kept`` 同时截断
+    ``max_reference_images`` 是参考图上限生效值给出的裁剪上限（``InputLimit.clamp_bound``），``None`` 表示不裁剪、
+    全量保留。调用方用 ``kept`` 同时截断
     发给供应商的参考图与本模块编号所依据的 slot 序列，两者才继续等长同序——否则声明行会
     指认后端已经丢弃、并未随请求发出的图。裁剪信息经 :meth:`ReferenceImageClamp.warning`
     进任务结果与预览响应，日志只作排障对照。
     """
     total = len(references)
-    if max_reference_images <= 0 or total <= max_reference_images:
+    if max_reference_images is None or total <= max_reference_images:
         return ReferenceImageClamp(total=total, kept=total, max_reference_images=max_reference_images, model=model)
     dropped: list[str] = []
     for slot in references[max_reference_images:]:
@@ -156,7 +158,7 @@ def mention_replacements(references: Sequence[ReferenceImageSlot]) -> dict[str, 
     for position, slot in enumerate(references):
         if slot.role == PREVIOUS_STORYBOARD_ROLE or slot.logical_id is None:
             continue
-        replacements.setdefault(asset_name_comparison_key(slot.logical_id), _image_label(position))
+        replacements.setdefault(asset_name_comparison_key(slot.logical_id), reference_image_label(position))
     return replacements
 
 
@@ -175,6 +177,7 @@ __all__ = [
     "ReferenceImageSlot",
     "clamp_reference_images",
     "mention_replacements",
+    "reference_image_label",
     "reference_images_declaration",
     "render_reference_mentions",
 ]

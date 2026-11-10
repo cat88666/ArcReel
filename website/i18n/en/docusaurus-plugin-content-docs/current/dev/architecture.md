@@ -179,7 +179,8 @@ Each Subagent focuses on one task, such as:
 - splitting reference-to-video units;
 - producing a structured script for one episode;
 - generating assets;
-- reviewing footage.
+- reviewing footage;
+- reviewing images.
 
 The first three are script planning tasks, and they also identify the new assets in the episode.
 
@@ -331,7 +332,9 @@ While generation tasks and non-streaming requests are being processed, only two 
 
 These three things do not interrupt a running coroutine: during normal shutdown, `GenerationWorker.stop()` waits for in-flight tasks to finish; user cancellation only applies to queued tasks; a client disconnect only sets a flag.
 
-Outside this scope, some scenarios initiate cancellation themselves: SSE streaming responses cancel the event-producing coroutine when the client disconnects, `TrialRunManager.cancel()` cancels an in-progress provider trial run, and `SessionManager` cancels the inbox processing task when a session is evicted or fails to start. Before writing cancellation-sensitive code in these scenarios, find every cancellation source in the code first. For how thread calls guard against cancellation, see the [backend standards](https://github.com/ArcReel/ArcReel/blob/main/docs/standards/backend.md) entries "线程里写入正式文件或创建临时产物时，用 `run_sync_transaction`" (use `run_sync_transaction` when a thread writes official files or creates temporary artifacts) and "供应商返回之后的落账段不可中断" (the bookkeeping segment after a provider returns must not be interrupted).
+Outside this scope, some scenarios initiate cancellation themselves: SSE streaming responses cancel the event-producing coroutine when the client disconnects, `TrialRunManager.cancel()` cancels an in-progress provider trial run, `SessionManager` cancels the inbox processing task when a session is evicted or fails to start, and application shutdown cancels background loops such as the official model catalog sync and the trash expiry cleanup. Before writing cancellation-sensitive code in these scenarios, find every cancellation source in the code first.
+
+When you cancel a task that is sending a request through httpx, a single `Task.cancel()` can be absorbed by anyio: while establishing a connection, httpcore enters an anyio task group, and if anyio cancels its own scope in the same scheduling round, the two cancellations merge into one and vanish together at the scope exit, so the task keeps running. Do not compensate by cancelling repeatedly from outside: a re-sent cancellation interrupts the task's cleanup inside `asyncio.shield`, such as rolling back an SQLAlchemy session and returning its connection, and the waiter returns before that cleanup finishes. Instead, the task itself calls `raise_if_cancel_absorbed` from `lib/infra/task_cancel.py` at a checkpoint after the httpx call, and the waiter cancels only once and waits until the task ends. For how thread calls guard against cancellation, see the [backend standards](https://github.com/ArcReel/ArcReel/blob/main/docs/standards/backend.md) entries "线程里写入正式文件或创建临时产物时，用 `run_sync_transaction`" (use `run_sync_transaction` when a thread writes official files or creates temporary artifacts) and "供应商返回之后的落账段不可中断" (the bookkeeping segment after a provider returns must not be interrupted).
 
 ## 9. Project and Asset Model {#project-and-asset-model}
 
@@ -361,6 +364,7 @@ Layout of the data root ([ADR 0088](https://github.com/ArcReel/ArcReel/blob/main
 ```text
 <data root>/
 ├── projects/<project-name>/   projects and generated assets
+├── deleted_projects/          deleted projects (restorable during the retention period)
 ├── global_assets/             global asset library
 ├── users/<user_id>/memory/    Agent user memory
 ├── arcreel.db                 default SQLite database
@@ -414,6 +418,8 @@ Version history is used to:
 - provide complete context for project archives.
 
 The service layer should operate through a unified asset version interface rather than allowing each provider adapter to decide how files are overwritten.
+
+The Agent tool `inspect_images` lets an Agent look at asset sheets and storyboard images. It reads the version snapshot of the requested version (current by default) by ID. When the default current has no history, it reads the current image registered in metadata and returns `version: null` without creating a version record. It downscales the image in memory to a JPEG with a long edge of at most 2000 px, and returns it as an MCP image content block through the same `images` hook as the contact sheets in [Video Review](#video-review). The tool is read-only, free, and never triggers generation; one call returns at most 20 images. The review checkpoint after asset sheets and storyboard images are generated is delegated to the `review-images` Subagent: it compares the images with the asset descriptions and prompts and returns only a text report, and the user decides whether to regenerate. Like the footage reviewer it is read-only: both the `tools` frontmatter and `AgentAccessPolicy.READ_ONLY_SUBAGENT_TOOLS` expose only Read, Glob, Grep, and `inspect_images`.
 
 ## 12. Usage and Cost {#usage-and-cost}
 

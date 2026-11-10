@@ -21,7 +21,7 @@ export interface ProjectOverview {
 
 /**
  * 角色的一个衍生：本体之外的另一套持续外观（换装、变身、易容等）。与本体共享名字、声音
- * 与身份，只持有相对本体的变化描述与由本体资产图编辑生成的资产图，没有原图。
+ * 与身份，只持有相对本体的变化描述与资产图，没有原图。资产图由本体资产图编辑生成，也可以上传成品替换。
  */
 export interface CharacterDerivative {
   /** 相对本体的外观变化，采用图像编辑指令的口吻。 */
@@ -119,14 +119,20 @@ export interface ProjectStatus {
 }
 
 /**
- * 集页面之外指称条目所需的结构（后端 `episode_item_ref`）：条目 ID 里的集 ID 不给创作者看，
- * 界面拼成「标题 · S01」，标题为空时用播出位置。
+ * 集页面之外指称条目所需的结构（后端 `with_episode_item_refs`）：条目 ID 不给创作者看，
+ * 界面拼成「标题 · 5」，标题为空时用播出位置。
  */
 export interface EpisodeItemRef {
   episode_title: string;
   episode_position: number;
-  /** 集内 ID，如 S01 / U02。 */
+  /** 集内 ID，如 S01 / U02；只用于宫格这类不按位置指称的条目。 */
   item_id: string;
+  /** 分镜或视频单元在本集里的当前位置，从 1 起；条目已不在剧本里时为 null。 */
+  item_position: number | null;
+  /** 正文前十几个字；条目已不在剧本里时为空串。 */
+  item_excerpt: string;
+  /** 缩略图的项目内相对路径。 */
+  item_thumbnail: string | null;
 }
 
 export interface EpisodeMeta {
@@ -231,7 +237,7 @@ export interface ProjectData {
   audio_backend?: string | null;
   narration_voice?: string | null;
   narration_speed?: number | null;
-  /** 源文语言码（zh / en / vi），由内容分析写入；界面只读，用于口播语速的单位名词 */
+  /** 源文语言码（zh / en / vi / ru），由内容分析写入；界面只读，用于口播语速的单位名词 */
   source_language?: string | null;
   /** 口播语速估算（阅读单位 / 秒）项目级覆盖；留空即按项目语言的默认速度估算 */
   speech_rate_units_per_second?: number | null;
@@ -338,8 +344,9 @@ export interface VideoCapabilities {
   /** 型号声明的时长全集，不随约束上下文变化；收窄结果见 duration_constraints。 */
   supported_durations: number[];
   max_duration: number;
-  max_reference_images: number;
-  /** 生效值（系统判定 ⊕ 用户覆盖），与执行层注入 backend 的能力同源。 */
+  /** 参考图上限的生效值（模型条目与调用通道两侧求值 ⊕ 用户覆盖）：null 为未收录，0 为不接受参考图。 */
+  max_reference_images: number | null;
+  /** 生效值（模型条目与调用通道两侧求值 ⊕ 用户覆盖），与执行层注入 backend 的能力同源。 */
   first_frame: boolean;
   last_frame: boolean;
   source: "registry" | "custom";

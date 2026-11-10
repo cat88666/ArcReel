@@ -11,8 +11,9 @@ import type {
   ComfyuiInferResponse,
   ComfyuiKeyInference,
   CustomEndpointInfo,
+  EndpointInstallation,
 } from "@/types";
-import { ComfyuiEndpointDetail } from "./ComfyuiEndpointDetail";
+import { ComfyuiEndpointDetail, type ComfyuiEndpointDetailProps } from "./ComfyuiEndpointDetail";
 
 const WORKFLOW: Record<string, unknown> = {
   "6": { class_type: "CLIPTextEncode", inputs: { text: "a cat" }, _meta: { title: "Positive" } },
@@ -92,6 +93,8 @@ function renderDetail(
     onSaved?: (record: CustomEndpointInfo) => void;
     onReimport?: (current: ComfyuiEndpointDefinition) => void;
     onDiscard?: () => void;
+    onUpdateFromMarket?: ComfyuiEndpointDetailProps["onUpdateFromMarket"];
+    marketUpdatePending?: boolean;
   } = {},
 ) {
   return render(
@@ -106,9 +109,27 @@ function renderDetail(
       onSaved={options.onSaved ?? vi.fn()}
       onReimport={options.onReimport ?? vi.fn()}
       onDiscard={options.onDiscard ?? vi.fn()}
+      onUpdateFromMarket={options.onUpdateFromMarket ?? vi.fn()}
+      marketUpdatePending={options.marketUpdatePending ?? false}
       menuItems={() => null}
     />,
   );
+}
+
+const INSTALLATION: EndpointInstallation = {
+  source_key: "github:arcreel/arcreel-market@HEAD",
+  source_id: 1,
+  source_display_name: "ArcReel 官方市场",
+  source_enabled: true,
+  slug: "wan-i2v",
+  installed_version: "1.0.0",
+  installed_at: "2026-09-01T00:00:00+00:00",
+  state: "current",
+  modified: false,
+};
+
+function installedRecord(defn: ComfyuiEndpointDefinition, overrides?: Partial<EndpointInstallation>): CustomEndpointInfo {
+  return { ...savedRecord(defn), installation: { ...INSTALLATION, ...overrides } };
 }
 
 /** 一行的表头格：语义键的 mono id 与它的状态、目标、展开按钮同处一格，展开面板在格子外。 */
@@ -134,6 +155,77 @@ describe("ComfyuiEndpointDetail", () => {
     expect(screen.getByText("4 个节点")).toBeInTheDocument();
   });
 
+  it("shows where a market-installed endpoint came from and both status axes, without an update action", () => {
+    renderDetail({ record: installedRecord(definition(), { modified: true }) });
+
+    expect(screen.getByText("来自市场 ArcReel 官方市场")).toBeInTheDocument();
+    expect(screen.getByText("已安装")).toBeInTheDocument();
+    expect(screen.getByText("已修改")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "更新" })).not.toBeInTheDocument();
+  });
+
+  it("names a disabled source and falls back to the canonical key once the source is deleted", () => {
+    const { unmount } = renderDetail({
+      record: installedRecord(definition(), { state: "unavailable", source_enabled: false }),
+    });
+    expect(screen.getByText("来自市场 ArcReel 官方市场（来源已禁用）")).toBeInTheDocument();
+    expect(screen.getByText("市场中不可用")).toBeInTheDocument();
+    unmount();
+
+    renderDetail({
+      record: installedRecord(definition(), {
+        state: "unavailable",
+        source_id: null,
+        source_display_name: null,
+        source_enabled: null,
+      }),
+    });
+    expect(screen.getByText("来自市场 github:arcreel/arcreel-market@HEAD（来源已删除）")).toBeInTheDocument();
+  });
+
+  it("leaves a hand-made or freshly imported endpoint without market origin, badges or update", () => {
+    const { unmount } = renderDetail({ record: savedRecord(definition()) });
+    expect(screen.queryByText(/来自市场/)).not.toBeInTheDocument();
+    expect(screen.queryByText("已安装")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "更新" })).not.toBeInTheDocument();
+    unmount();
+
+    renderDetail({ record: null });
+    expect(screen.queryByText(/来自市场/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "更新" })).not.toBeInTheDocument();
+  });
+
+  it("hands the installation and the current draft, unsaved edits included, to the market update", async () => {
+    const onUpdateFromMarket = vi.fn();
+    const defn = definition({ bindings: { prompt: [PROMPT], output: [OUTPUT] } });
+    const record = installedRecord(defn, { state: "update_available" });
+    renderDetail({ record, definition: defn, onUpdateFromMarket });
+
+    await userEvent.click(screen.getByRole("button", { name: "更新" }));
+    expect(onUpdateFromMarket).toHaveBeenLastCalledWith(record.installation, defn, false);
+
+    await userEvent.type(screen.getByLabelText("端点名称"), "!");
+    await userEvent.click(screen.getByRole("button", { name: "更新" }));
+    expect(onUpdateFromMarket).toHaveBeenLastCalledWith(
+      record.installation,
+      { ...defn, meta: { ...defn.meta, name: "Wan 2.2 i2v!" } },
+      true,
+    );
+  });
+
+  it("holds editing and actions while the entry for an update is loading", () => {
+    renderDetail({
+      record: installedRecord(definition(), { state: "update_available" }),
+      marketUpdatePending: true,
+    });
+
+    expect(screen.getByRole("button", { name: "更新" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重新导入" })).toBeDisabled();
+    expect(screen.getByLabelText("端点名称")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "图片" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+  });
+
   it("gives each semantic its own row, with the six states each saying what to do next", () => {
     renderDetail({
       inference: inference({
@@ -154,8 +246,8 @@ describe("ComfyuiEndpointDetail", () => {
     expect(within(row("start_image")).getByText("未找到")).toBeInTheDocument();
     expect(within(row("end_image")).getByText("不支持")).toBeInTheDocument();
     expect(within(row("output")).getByText("必填未绑定")).toBeInTheDocument();
-    // 没被推断提到的语义键一并算未找到：reference_images、宽、高、帧数、帧率与 output 共 7 项。
-    expect(screen.getByText("已绑定 2 · 需选择 1 · 未找到 7 · 不支持 1")).toBeInTheDocument();
+    // 没被推断提到的语义键一并算未找到：reference_audio、reference_images、aspect_ratio、宽、高、帧数、帧率，连同 start_image 与 output 共 9 项。
+    expect(screen.getByText("已绑定 2 · 需选择 1 · 未找到 9 · 不支持 1")).toBeInTheDocument();
   });
 
   it("opens the tied row on arrival and leaves the settled ones folded", () => {
@@ -573,4 +665,59 @@ describe("ComfyuiEndpointDetail", () => {
     expect(await screen.findByRole("button", { name: "渲染 /prompt 请求体" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "真实提交一次" })).toBeDisabled();
   });
+});
+
+it("offers an inferred aspect input without selecting it, so definitions without one stay savable", async () => {
+  const aspect: ComfyuiBindingTarget = { node: "115", input: "aspect_ratio", class_type: "ResolutionSelector" };
+  const draft = definition({ workflow: {
+    ...WORKFLOW,
+    "115": { class_type: "ResolutionSelector", inputs: { aspect_ratio: "16:9 (Widescreen)" } },
+  } });
+  renderDetail({ definition: draft, inference: inference({ bindings: {
+    prompt: picked(PROMPT), output: picked(OUTPUT),
+    aspect_ratio: { state: "not_found", candidates: [candidate(aspect)], notes: [] },
+  } }) });
+  expect(screen.queryByText("画幅绑定需要至少一个有效的对应值")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "保存" })).toBeEnabled();
+
+  await userEvent.click(within(row("aspect_ratio")).getByRole("button"));
+  const group = screen.getByRole("group", { name: "候选落点" });
+  await userEvent.click(within(group).getAllByRole("checkbox")[0]);
+  expect(screen.getByText("画幅绑定需要至少一个有效的对应值")).toBeInTheDocument();
+});
+
+it("saves ordered audio and explicit aspect values, and passes both to reimport", async () => {
+  const audioA: ComfyuiBindingTarget = { node: "501", input: "audio", class_type: "LoadAudio" };
+  const audioB: ComfyuiBindingTarget = { node: "502", input: "audio", class_type: "LoadAudio" };
+  const aspect: ComfyuiBindingTarget = { node: "115", input: "aspect_ratio", class_type: "ResolutionSelector" };
+  const draft = definition({ workflow: {
+    ...WORKFLOW,
+    "501": { class_type: "LoadAudio", inputs: { audio: "a.wav" } },
+    "502": { class_type: "LoadAudio", inputs: { audio: "b.wav" } },
+    "115": { class_type: "ResolutionSelector", inputs: { aspect_ratio: "16:9 (Widescreen)" } },
+  } });
+  const create = vi.spyOn(API, "createCustomEndpoint").mockResolvedValue(savedRecord(draft));
+  const onReimport = vi.fn();
+  renderDetail({ definition: draft, onReimport, inference: inference({ bindings: {
+    prompt: picked(PROMPT), output: picked(OUTPUT),
+    reference_audio: { state: "auto_selected", candidates: [candidate(audioA, { selected: true }), candidate(audioB, { selected: true })], notes: [] },
+    aspect_ratio: picked(aspect),
+  } }) });
+  expect(screen.getByText("画幅绑定需要至少一个有效的对应值")).toBeInTheDocument();
+  await userEvent.click(within(row("aspect_ratio")).getByRole("button"));
+  await userEvent.type(screen.getByLabelText("16:9 对应值"), "16:9 (Widescreen)");
+  await userEvent.type(screen.getByLabelText("9:16 对应值"), "9:16 (Portrait)");
+  await userEvent.click(within(row("reference_audio")).getByRole("button"));
+  await userEvent.click(screen.getAllByRole("button", { name: "上移" })[1]);
+  await userEvent.click(screen.getByRole("button", { name: "保存" }));
+  await waitFor(() => expect(create).toHaveBeenCalled());
+  expect(create.mock.calls[0][0]).toMatchObject({ bindings: {
+    reference_audio: [audioB, audioA],
+    aspect_ratio: [{ ...aspect, values: { "16:9": "16:9 (Widescreen)", "9:16": "9:16 (Portrait)" } }],
+  } });
+  await userEvent.click(screen.getByRole("button", { name: "重新导入" }));
+  expect(onReimport).toHaveBeenCalledWith(expect.objectContaining({ bindings: expect.objectContaining({
+    reference_audio: [audioB, audioA],
+    aspect_ratio: [{ ...aspect, values: { "16:9": "16:9 (Widescreen)", "9:16": "9:16 (Portrait)" } }],
+  }) }));
 });

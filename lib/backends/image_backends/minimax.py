@@ -40,7 +40,7 @@ from lib.backends.minimax_shared import (
 from lib.backends.providers import PROVIDER_MINIMAX
 from lib.backends.transport_layer import TransportLayer
 from lib.billing.metering import Usage
-from lib.infra.async_thread import run_sync_transaction
+from lib.infra.async_thread import run_noninterruptible_sync
 from lib.infra.logging_utils import format_kwargs_for_log
 from lib.infra.retry import with_retry_async
 
@@ -59,7 +59,7 @@ _MAX_RATIO = 4.0
 # 缺 image_size 时的默认短边（2K 档），经 max_long_edge=2048 收口后竖屏得 1152*2048。
 _DEFAULT_SHORT = 1440
 
-# image-01 单脸参考：subject_reference 仅取首张参考图驱动角色一致性。
+# image-01 单脸参考：subject_reference 只支持一张参考图。
 _SUBJECT_REF_LIMIT = 1
 
 
@@ -72,6 +72,7 @@ class MiniMaxImageBackend:
     """MiniMax 图像后端（单步同步 image_generation 端点）。"""
 
     CHANNEL_CAPABILITIES: ClassVar[frozenset[ImageCapability]] = BOTH_IMAGE_CAPABILITIES
+    CHANNEL_REFERENCE_LIMIT: ClassVar[int | None] = _SUBJECT_REF_LIMIT
 
     def __init__(
         self,
@@ -101,15 +102,14 @@ class MiniMaxImageBackend:
         # 文生图 + 图生图（subject_reference）同一端点。
         return set(self.CHANNEL_CAPABILITIES)
 
-    @property
-    def max_reference_images(self) -> int:
-        return _SUBJECT_REF_LIMIT
+    async def reference_image_limit(self) -> int | None:
+        return self.CHANNEL_REFERENCE_LIMIT
 
     @staticmethod
     def estimate_usage(facts: ImageRequestFacts) -> Usage:
         """预估只报张数：image-01 按张统一价，尺寸不影响费用。"""
         refs = facts.reference_count
-        return per_image_usage(output_images=1, input_images=None if refs is None else min(refs, _SUBJECT_REF_LIMIT))
+        return per_image_usage(output_images=1, input_images=refs)
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         # 编排层不带重试：把非幂等的「建图 + 计费」submit 与幂等的结果下载隔离到各自的
@@ -195,17 +195,14 @@ class MiniMaxImageBackend:
         return _clamp_edge(w), _clamp_edge(h)
 
     def _build_subject_reference(self, request: ImageGenerationRequest) -> list[dict]:
-        """构建 subject_reference（单脸参考）。
-
-        image-01 仅取一张人脸参考；多张时截断为首张并告警。首张缺失 / 读取失败即 fail-loud，
-        报 image_reference_images_unreadable，让用户感知有图未被使用而非静默丢弃后照常计费。
-        """
+        """构建单脸参考；拒绝超量或不可读输入，避免丢图后照常计费。"""
         refs = request.reference_images
         if len(refs) > _SUBJECT_REF_LIMIT:
-            logger.warning(
-                "MiniMax subject_reference 仅支持 %d 张参考图，截断 %d 张取首张",
-                _SUBJECT_REF_LIMIT,
-                len(refs),
+            raise ImageCapabilityError(
+                "image_reference_images_exceeded",
+                model=self._model,
+                limit=self.CHANNEL_REFERENCE_LIMIT,
+                count=len(refs),
             )
         ref = refs[0]
         # 空路径无文件名可显示，用序号 #1 标识，避免中文占位漏进非中文报错模板。
@@ -270,4 +267,4 @@ async def _write_base64_image(b64: str, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(image_bytes)
 
-    await run_sync_transaction(_decode_and_save)
+    await run_noninterruptible_sync(_decode_and_save)

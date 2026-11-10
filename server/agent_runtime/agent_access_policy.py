@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
-from lib.agent.agent_memory_paths import is_valid_memory_user_id
+from lib.agent.agent_memory_paths import ARCREEL_DIRNAME, is_valid_memory_user_id
 from lib.episode.episode_paths import (
     AGENT_PROTECTED_SCRIPT_PLAN_FILENAMES,
     DRAMA_SCRIPT_PLAN_QUARANTINE_FILENAME,
@@ -27,9 +27,28 @@ from lib.episode.episode_paths import (
     REFERENCE_VIDEO_SCRIPT_PLAN_QUARANTINE_FILENAME,
 )
 from lib.infra.data_root_layout import DataRootLayout
+from lib.project.project_trash import TRASH_DIRNAME
 from lib.script.draft_quarantine import OPEN_DRAFT_TOOL_NAME, PROMOTE_TOOL_NAME
 
 logger = logging.getLogger(__name__)
+
+#: Agent 不可直接写入的媒体目录：生成产物、资产图、宫格、配乐与成片都在这里，只经主进程的工具写入。
+AGENT_PROTECTED_MEDIA_DIRS: tuple[str, ...] = (
+    "characters",
+    "scenes",
+    "props",
+    "products",
+    "grids",
+    "storyboards",
+    "end_frames",
+    "videos",
+    "reference_videos",
+    "audio",
+    "thumbnails",
+    "bgm",
+    "renders",
+)
+AGENT_PROTECTED_MEDIA_FILES: tuple[str, ...] = tuple(f"style_reference.{ext}" for ext in ("png", "jpg", "jpeg", "webp"))
 
 
 def _default_claude_projects_dir() -> Path:
@@ -247,7 +266,7 @@ class AgentAccessPolicy:
             resolved, project_cwd, user_id=user_id, is_search=tool_name in self._SEARCH_TOOLS
         )
 
-    def build_sandbox_settings(self, project_cwd: Path, *, user_id: str) -> dict[str, Any]:
+    def build_sandbox_settings(self, project_cwd: Path) -> dict[str, Any]:
         """构造 SandboxSettings dict（SDK Python TypedDict 未声明 filesystem
         子结构，但 CLI 运行时透传 JSON 接受）——内核沙箱层对同一份规则的编译投影。
 
@@ -257,14 +276,15 @@ class AgentAccessPolicy:
           bwrap profile），对 sandbox 内所有子进程生效。
         - ``filesystem.denyWrite``：内核级文件写拒绝，覆盖 ``PROTECTED_WRITE_RULES`` 各规则的
           ``sandbox_subpaths``（``scripts/``、``project.json``、``edit_timelines/``、``source/``、
-          ``drafts/``）——这几类文件的写入只能走 in-process MCP 工具（``patch_episode_script`` /
+          ``drafts/``、``.arcreel/trash/``、媒体目录与 ``versions/``）——这几类文件的写入只能走 in-process MCP 工具（``patch_episode_script`` /
           ``patch_project`` / ``upload_source`` / 参考拆分的取回与晋升等，跑在主进程不受 sandbox 约束），
           堵死 Bash（``echo>`` / ``sed`` / ``python -c``）旁路。OS 级对 sandbox 内所有子进程生效。
           sandbox 内已无合法 Bash 写这几类路径，故不误伤。
-        - ``filesystem.allowWrite``：用户记忆目录（``<数据根>/users/<user_id>/memory/``）
-          在 cwd 外，默认不可写；Agent 要用 Write/Edit 记跨项目笔记，须在内核层单独放行。
-          项目记忆在 cwd 内本已可写，不重复登记。``user_id`` 非法（不是单个路径段）时不
-          登记任何放行——fail-closed 优先于让记忆可写。
+        - 不写 ``filesystem.allowWrite``：用户记忆目录（``<数据根>/users/<user_id>/memory/``）
+          对 Bash 读写都关闭。内置 Read/Write/Edit/Glob/Grep 在主进程执行、不经内核沙箱，
+          由 hook 层放行记忆目录，用不着内核层放行；而给它加 ``allowWrite`` 会让两个平台各漏
+          一边：bwrap 把可写目录绑定挂载回来，盖掉 ``users/`` 的 ``denyRead``，Bash 可读可写；
+          Seatbelt 读拒写放，Bash 能盲写。项目记忆在 cwd 内，Bash 照常读写。
         - ``filesystem.denyRead`` 另含数据根下 ``projects/`` 以外的全部顶层条目（见
           ``_build_data_root_deny_read_abs_paths``）：hook 层的数据根默认拒只管内置 Read/Glob/Grep，
           Bash 不经该 hook（ADR 0026）。
@@ -282,10 +302,6 @@ class AgentAccessPolicy:
             "denyRead": self._build_sensitive_abs_paths() + self._build_data_root_deny_read_abs_paths(),
             "denyWrite": self._build_protected_write_abs_paths(project_cwd),
         }
-        # 无路径可放行时整键不写：``allowWrite`` 是加法放行，空列表不表达任何意图。
-        memory_allow_write = self._build_memory_allow_write_abs_paths(user_id)
-        if memory_allow_write:
-            filesystem["allowWrite"] = memory_allow_write
         return {
             "enabled": True,
             "autoAllowBashIfSandboxed": True,
@@ -329,11 +345,6 @@ class AgentAccessPolicy:
             logger.warning("数据根无法列出,sandbox deny 只含布局登记的系统目录: %s", self.data_root)
         entries.discard(layout.projects_dir)
         return sorted(str(entry) for entry in entries)
-
-    def _build_memory_allow_write_abs_paths(self, user_id: str) -> list[str]:
-        """内核沙箱层的记忆写放行清单：仅用户记忆目录（项目记忆在 cwd 内本已可写）。"""
-        user_dir = self._user_memory_dir_or_none(user_id)
-        return [] if user_dir is None else [str(user_dir)]
 
     def _user_memory_dir_or_none(self, user_id: str) -> Path | None:
         """当前用户的记忆目录；``user_id`` 不是单个路径段时返回 None。
@@ -526,6 +537,7 @@ class AgentAccessPolicy:
     # 定义被改宽或 CLI 未按 frontmatter 收窄时，子智能体照样碰不到写入工具。两处名单须一致。
     READ_ONLY_SUBAGENT_TOOLS: ClassVar[dict[str, frozenset[str]]] = {
         "review-footage": frozenset({"Read", "Glob", "Grep", "mcp__arcreel__inspect_video_units"}),
+        "review-images": frozenset({"Read", "Glob", "Grep", "mcp__arcreel__inspect_images"}),
     }
 
     def check_subagent_tool(self, agent_type: object, tool_name: str) -> str | None:
@@ -801,6 +813,39 @@ class AgentAccessPolicy:
         return False
 
     @classmethod
+    def _is_protected_trash(cls, target: Path, bases: list[Path]) -> bool:
+        """命中项目回收站（``.arcreel/trash/`` 整子树，含目录本身）。
+
+        删除记录只经回收站模块增删；直写能绕过「清空与彻底删除只属于创作者」。
+        ``bases`` 与 target 的 raw/resolved 双形式口径同 ``_is_protected_project_json``。
+        """
+        target_s = cls._normalize_path_for_protected_compare(target)
+        for base in bases:
+            trash_dir = cls._normalize_path_for_protected_compare(base / ARCREEL_DIRNAME / TRASH_DIRNAME)
+            if target_s == trash_dir or target_s.startswith(trash_dir + os.sep):
+                return True
+        return False
+
+    @classmethod
+    def _is_protected_media(cls, target: Path, bases: list[Path]) -> bool:
+        """命中媒体目录（``AGENT_PROTECTED_MEDIA_DIRS`` 各整子树，含目录本身）。
+
+        媒体只经生成与编辑工具写入；直写或删除会绕过项目回收站，误删无法找回（``docs/adr/0107``）。
+        """
+        return any(
+            cls._is_within_for_compare(target, base / name) for base in bases for name in AGENT_PROTECTED_MEDIA_DIRS
+        ) or any(
+            cls._normalize_path_for_protected_compare(target) == cls._normalize_path_for_protected_compare(base / name)
+            for base in bases
+            for name in AGENT_PROTECTED_MEDIA_FILES
+        )
+
+    @classmethod
+    def _is_protected_versions(cls, target: Path, bases: list[Path]) -> bool:
+        """命中版本历史目录（``versions/`` 整子树，含目录本身）：版本记录与快照只经版本管理维护。"""
+        return any(cls._is_within_for_compare(target, base / "versions") for base in bases)
+
+    @classmethod
     def _is_protected_formal_script_plan(cls, target: Path, bases: list[Path]) -> bool:
         """命中受写禁的正式 script_plan（``drafts/episode_N/`` 下 ``AGENT_PROTECTED_SCRIPT_PLAN_FILENAMES``）。
 
@@ -843,6 +888,8 @@ class AgentAccessPolicy:
 #:   工具；两层投影同覆盖面（``scripts/`` 整子树 + ``project.json``）。
 #: - ``edit_timeline``：「写入口收归」——剪辑时间线只能经剪辑时间线工具追加修订；两层同覆盖面。
 #: - ``source``：「写入口收归」——源文只能经上传与编辑源文的工具写入，改动按对齐重映射分集账本；两层同覆盖面。
+#: - ``trash``：项目回收站只经回收站模块增删，清空与彻底删除只开放给创作者；两层同覆盖面。
+#: - ``media`` / ``versions``：媒体与版本历史只经生成工具与版本管理写入，删除只经项目回收站；两层同覆盖面。
 #: - ``formal_script_plan``：「写入口持锁」——正式 script_plan 另有多条持同一把 per-path 锁的写入
 #:   路径，Write/Edit 取不到锁，直改即丢失更新窗口。两层刻意不对称：sandbox 按 ``drafts/``
 #:   整目录 deny（清单在会话装配期一次性构造，集是运行时增删的，逐文件枚举必然落空；Bash
@@ -878,6 +925,36 @@ AgentAccessPolicy.PROTECTED_WRITE_RULES = (
             "mcp__arcreel__edit_source_text。删除、调序整本源文的文件请用户在「分集」视图里操作。"
         ),
         sandbox_subpaths=("source",),
+    ),
+    ProtectedWriteRule(
+        name="trash",
+        matches=AgentAccessPolicy._is_protected_trash,
+        deny_message=(
+            "访问被拒绝：.arcreel/trash/ 是项目回收站，不可直接写入或删除。"
+            "回收站的清空与彻底删除只能由用户在文件视图里操作。"
+        ),
+        sandbox_subpaths=(f"{ARCREEL_DIRNAME}/{TRASH_DIRNAME}",),
+    ),
+    ProtectedWriteRule(
+        name="media",
+        matches=AgentAccessPolicy._is_protected_media,
+        deny_message=(
+            "访问被拒绝：媒体目录（"
+            + "、".join(f"{name}/" for name in AGENT_PROTECTED_MEDIA_DIRS)
+            + "）下的文件与根目录的 style_reference 风格参考图不可直接写入、覆盖或删除，媒体只经生成与编辑工具写入。"
+            "删除未引用文件走 mcp__arcreel__delete_project_file，文件移入项目回收站，可用 "
+            "mcp__arcreel__restore_trash_record 恢复。"
+        ),
+        sandbox_subpaths=(*AGENT_PROTECTED_MEDIA_DIRS, *AGENT_PROTECTED_MEDIA_FILES),
+    ),
+    ProtectedWriteRule(
+        name="versions",
+        matches=AgentAccessPolicy._is_protected_versions,
+        deny_message=(
+            "访问被拒绝：versions/ 是版本历史，不可直接写入、覆盖或删除；版本记录与快照只经版本管理维护。"
+            "切换视频版本走 mcp__arcreel__select_video_version。"
+        ),
+        sandbox_subpaths=("versions",),
     ),
     ProtectedWriteRule(
         name="formal_script_plan",

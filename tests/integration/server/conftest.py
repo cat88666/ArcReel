@@ -20,13 +20,21 @@ from lib.generation.generation_worker import CapacityTable, GenerationWorker
 from lib.project.project_change_hints import register_project_change_batch_listener
 from lib.project.project_manager import ProjectManager
 from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
+from lib.script.item_ids import (
+    ITEM_ID_LETTERS,
+    ItemIdIssuer,
+    episode_item_id_high_water,
+    max_item_number,
+    raise_item_id_high_water,
+)
+from lib.script.script_skeleton import SKELETONS
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import assets, usage
 from server.services.tasks.generation_tasks import execute_generation_task
 from server.services.tasks.resume_executor import execute_resume_video_task
 from tests.auth_deps import AUTH_DEPENDENCIES
-from tests.fakes import bind_session_factory
+from tests.fakes import bind_session_factory, use_assets_router_sessions
 from tests.integration.server.agent_tool_support import CLAIMED_BASIS_DIGEST, ToolHarness, fake_caps_resolver
 
 
@@ -186,13 +194,29 @@ class FakePM:
     def project_exists(self, _name: str) -> bool:
         return True
 
+    def reserve_item_ids(self, _name: str, episode: int, kind: str, count: int) -> list[str]:
+        """内存版的发号：与生产同口径，从本集记录的最大号与剧本现存编号之后取号并记下最大号。"""
+
+        entry = next((ep for ep in self.project_payload.get("episodes", []) if ep.get("episode") == episode), None)
+        items = self.script_payload.get(next((k for k in ITEM_ID_LETTERS if k in self.script_payload), ""), [])
+        ids = [item.get(SKELETONS[k].id_field) for k in ITEM_ID_LETTERS if k in self.script_payload for item in items]
+        issuer = ItemIdIssuer(
+            episode,
+            kind,
+            max(episode_item_id_high_water(self.project_payload, episode), max_item_number(ids, episode)),
+        )
+        issued = [issuer.issue() for _ in range(count)]
+        if entry is not None and issued:
+            raise_item_id_high_water(entry, issuer.last)
+        return issued
+
 
 @pytest.fixture
 def assets_env(db_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """全局资产库路由的测试客户端（``client``）与指向 ``tmp_path/projects`` 的 ``ProjectManager``（``pm``）。"""
 
     pm = ProjectManager(tmp_path / "projects")
-    monkeypatch.setattr(assets, "async_session_factory", db_factory)
+    use_assets_router_sessions(monkeypatch, db_factory)
     monkeypatch.setattr(assets, "get_project_manager", lambda: pm)
     app = FastAPI()
     register_error_handlers(app)

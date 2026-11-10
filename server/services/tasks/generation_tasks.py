@@ -46,11 +46,13 @@ from lib.artifacts.visual_artifact_provenance import (
     GridStoryboardVisual,
     build_grid_composite_visual_basis,
     build_storyboard_video_artifact_visual_basis,
+    project_basis_records_asset_names,
     project_basis_style_description,
 )
 from lib.config.resolver import video_bucket_for_generation_mode
 from lib.config.service import DEFAULT_VIDEO_POLL_TIMEOUT_SECONDS
 from lib.db.base import DEFAULT_USER_ID
+from lib.generation.deleted_target import GenerationTargetDeletedError
 from lib.generation.generation_queue import (
     DispatchProviderChanged,
     ensure_dispatch_provider,
@@ -67,6 +69,8 @@ from lib.generation.video_request_facts import (
 from lib.infra.async_thread import run_noninterruptible_sync, run_sync_transaction
 from lib.infra.path_safety import safe_join, try_safe_join
 from lib.infra.thumbnail import extract_video_thumbnail
+from lib.material.formal_objects import formal_commit
+from lib.material.work_files import local_work_files
 from lib.project.asset_derivatives import DERIVATIVE_ASSET_TYPE, DERIVATIVE_TASK_TYPE
 from lib.project.asset_types import (
     ASSET_SPECS,
@@ -515,7 +519,11 @@ async def execute_storyboard_task(
         )
 
     artifact_path = f"storyboards/scene_{resource_id}.png"
-    async with frozen_generation_input(_freeze) as frozen:
+    async with frozen_generation_input(
+        _freeze,
+        project_path=project_path,
+        sources=[reference.visual.path for reference in inputs.generation_input.references],
+    ) as frozen:
         # 剧本 claim 排在最前，其后是参考图按冻结字节绑定的 claims。
         formal_claims = (inputs.script_claim, *frozen.claims)
 
@@ -972,6 +980,8 @@ async def execute_character_voice_sample_task(
         voice=voice.strip(),
         speed=None,
         task_id=task_id,
+        # 试听样本属于角色：角色被删时样本进回收站。
+        target_resource=("characters", character_name),
     )
 
     audio_rel = resource_relative_path("audio", sample_id)
@@ -1323,27 +1333,29 @@ async def execute_video_task(
     warnings: list[dict[str, Any]] = []
     try:
         await asyncio.to_thread(assert_current_artifact_input_claims_usable, project_path, formal_input_claims)
-        _output_path, version, _, video_uri = await generator.generate_video_async(
-            prompt=prompt_text,
-            resource_type="videos",
-            resource_id=resource_id,
-            start_image=provider_start_image,
-            end_image=provider_end_image,
-            aspect_ratio=aspect_ratio,
-            duration_seconds=duration_seconds,
-            resolution=resolution,
-            task_id=task_id,
-            before_submit=checkpoint_hook,
-            formal_output=task_id is not None,
-            before_formal_commit=artifact_committer.prepare_selection if artifact_committer is not None else None,
-            commit_formal_output=artifact_committer,
-            seed=seed,
-            service_tier=service_tier,
-            visual_basis_digest=visual_basis_digest,
-            generate_audio=requested_generate_audio,
-            poll_timeout_seconds=poll_timeout_seconds,
-            warnings=warnings,
-        )
+        # 直接调用把项目里的分镜图交给供应商：缓存已清理的远端内容版本先取回，调用期间登记使用
+        async with local_work_files(project_path, [provider_start_image] if task_id is None else []):
+            _output_path, version, _, video_uri = await generator.generate_video_async(
+                prompt=prompt_text,
+                resource_type="videos",
+                resource_id=resource_id,
+                start_image=provider_start_image,
+                end_image=provider_end_image,
+                aspect_ratio=aspect_ratio,
+                duration_seconds=duration_seconds,
+                resolution=resolution,
+                task_id=task_id,
+                before_submit=checkpoint_hook,
+                formal_output=task_id is not None,
+                before_formal_commit=artifact_committer.prepare_selection if artifact_committer is not None else None,
+                commit_formal_output=artifact_committer,
+                seed=seed,
+                service_tier=service_tier,
+                visual_basis_digest=visual_basis_digest,
+                generate_audio=requested_generate_audio,
+                poll_timeout_seconds=poll_timeout_seconds,
+                warnings=warnings,
+            )
 
         async def _finalize() -> dict[str, Any]:
             return await finalize_video_task(
@@ -1422,6 +1434,7 @@ async def finalize_video_task(
             asset_path=f"thumbnails/scene_{resource_id}.jpg",
         )
     else:
+        # hard-delete: derived -- 抽取失败时清掉视频缩略图，可从视频重新生成
         await run_noninterruptible_sync(thumbnail_file.unlink, missing_ok=True)
 
     created_at = await run_noninterruptible_sync(
@@ -1485,7 +1498,11 @@ async def execute_asset_sheet_task(
             bind_claims=_originals_have_no_claims,
         )
 
-    async with frozen_generation_input(_freeze) as frozen:
+    async with frozen_generation_input(
+        _freeze,
+        project_path=project_path,
+        sources=[reference.visual.path for reference in generation_input.references],
+    ) as frozen:
         return await run_asset_sheet_image_task(
             asset_type=kind,
             project_name=project_name,
@@ -1704,7 +1721,8 @@ async def execute_grid_task(
             )
             return frozen_references
 
-        frozen_references = await run_sync_transaction(_freeze_references)
+        async with local_work_files(project_path, [reference.visual.path for reference in assembled]):
+            frozen_references = await run_sync_transaction(_freeze_references)
         # 剧本 claim 排在最前，其后是参考图按冻结字节绑定的 claims。
         formal_claims = list(
             await asyncio.to_thread(
@@ -1768,6 +1786,7 @@ async def execute_grid_task(
             style_description=project_basis_style_description(project),
             grid_aspect_ratio=grid_aspect_ratio,
             references=frozen_references.visual_references,
+            asset_names=project_basis_records_asset_names(project),
         )
         generator = ctx.generator
         aspect_ratio = grid_aspect_ratio
@@ -1790,28 +1809,30 @@ async def execute_grid_task(
         async def _before_submit() -> None:
             await asyncio.to_thread(assert_current_artifact_input_claims_usable, project_path, formal_claims)
 
-        await generator.generate_image_async(
-            prompt=prompt_text,
-            resource_type="grids",
-            resource_id=resource_id,
-            reference_images=reference_images,
-            aspect_ratio=aspect_ratio,
-            image_size=image_size,
-            before_submit=_before_submit,
-            formal_output=True,
-            task_id=task_id,
-            commit_formal_output=grid_formal_image_callback(
-                project_path=project_path,
-                grid_manager=grid_manager,
-                grid=grid,
+        # 新联合图按新内容版本的全局保存位置写入（缺省本地）
+        async with formal_commit(project_name):
+            await generator.generate_image_async(
+                prompt=prompt_text,
+                resource_type="grids",
                 resource_id=resource_id,
-                prompt=str(prompt_text),
-                versions=generator.versions,
+                reference_images=reference_images,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+                before_submit=_before_submit,
+                formal_output=True,
                 task_id=task_id,
-                basis=grid_basis,
-                outcome_box=formal_outcomes,
-            ),
-        )
+                commit_formal_output=grid_formal_image_callback(
+                    project_path=project_path,
+                    grid_manager=grid_manager,
+                    grid=grid,
+                    resource_id=resource_id,
+                    prompt=str(prompt_text),
+                    versions=generator.versions,
+                    task_id=task_id,
+                    basis=grid_basis,
+                    outcome_box=formal_outcomes,
+                ),
+            )
 
         # formal_output=True 时 generate_image_async 恒经活化回调提交，回调恰好记录一条结果。
         outcome = formal_outcomes[0]
@@ -1825,6 +1846,9 @@ async def execute_grid_task(
             grid_manager.save(restored)
 
         await run_sync_transaction(_restore_status_before_claim)
+        raise
+    except GenerationTargetDeletedError:
+        # 宫格已被删除：不再写回失败状态，免得重建出宫格记录。
         raise
     except Exception:
         import traceback
@@ -1904,26 +1928,30 @@ async def execute_generation_task(task: dict[str, Any], *, claimed_provider_id: 
         # 能力类异常（Image/VideoCapabilityError、ReferencePayloadFloorError）原样上抛：
         # worker 的 encode_task_failure_message 按 code + params 落库，渲染留到读侧
         # Translator，同一失败任务按 Accept-Language 显示 zh/en/vi。
-        if task_type in ("video", "reference_video"):
-            result = await executor(
-                project_name,
-                resource_id,
-                payload,
-                script_file=task.get("script_file"),
-                user_id=user_id,
-                task_id=queue_task_id,
-                claimed_provider_id=claimed_provider_id,
-                poll_timeout_seconds=video_poll_timeout_seconds,
-            )
-        else:
-            result = await executor(
-                project_name,
-                resource_id,
-                payload,
-                user_id=user_id,
-                task_id=queue_task_id,
-                claimed_provider_id=claimed_provider_id,
-            )
+        try:
+            if task_type in ("video", "reference_video"):
+                result = await executor(
+                    project_name,
+                    resource_id,
+                    payload,
+                    script_file=task.get("script_file"),
+                    user_id=user_id,
+                    task_id=queue_task_id,
+                    claimed_provider_id=claimed_provider_id,
+                    poll_timeout_seconds=video_poll_timeout_seconds,
+                )
+            else:
+                result = await executor(
+                    project_name,
+                    resource_id,
+                    payload,
+                    user_id=user_id,
+                    task_id=queue_task_id,
+                    claimed_provider_id=claimed_provider_id,
+                )
+        except GenerationTargetDeletedError as deleted:
+            # 结果已进项目回收站，任务照常成功；没有写回任何资源，不发生成成功事件。
+            return deleted.result
         # 成功事件发出失败时不回滚产物：已写入的产物保持有效，异常照常上抛。
         # 发事件要读剧本、算产物指纹，放进工作线程；to_thread 复制上下文，事件来源仍是 worker。
         # 产物已提交，发事件不可打断：取消不能把已付费成功的任务改判为中断。

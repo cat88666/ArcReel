@@ -75,7 +75,7 @@ class TestProperties:
         # xAI 官方上限：多图编辑单请求最多 5 张源图。
         from lib.backends.image_backends.grok import GrokImageBackend
 
-        assert GrokImageBackend(api_key="fake-xai-key", model=model).max_reference_images == 5
+        assert asyncio.run(GrokImageBackend(api_key="fake-xai-key", model=model).reference_image_limit()) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -124,12 +124,12 @@ class TestGenerateT2I:
             )
             result = await grok_backend.generate(request)
 
-        # 验证 SDK 调用参数（image_size 透传，不再做小写映射）
+        # 验证 SDK 调用参数（目录取值 "2K" 下发前转成 SDK 接受的小写 "2k"）
         grok_backend._client.image.sample.assert_awaited_once_with(
             prompt="A beautiful sunset",
             model="grok-imagine-image",
             aspect_ratio="16:9",
-            resolution="2K",
+            resolution="2k",
         )
         assert result.image_path == output
         assert result.provider == "grok"
@@ -202,8 +202,8 @@ class TestGenerateI2I:
         call_kwargs = grok_backend._client.image.sample.call_args.kwargs
         assert len(call_kwargs["image_urls"]) == 2
 
-    async def test_i2i_truncates_references_over_the_declared_limit(self, grok_backend, tmp_path):
-        """编排层未裁剪时的兜底：只发前 max_reference_images 张。"""
+    async def test_i2i_sends_every_reference_above_the_channel_limit(self, grok_backend, tmp_path):
+        """能力覆盖放行的参考图全部下发。"""
         refs = []
         for index in range(7):
             ref_path = tmp_path / f"ref{index}.png"
@@ -214,13 +214,23 @@ class TestGenerateI2I:
         mock_response.url = "https://example.com/merged.png"
         grok_backend._client.image.sample = AsyncMock(return_value=mock_response)
 
+        from lib.backends.image_capabilities import gate_image_request
+        from lib.custom_provider.backends import CustomImageBackend
+
+        wrapped = CustomImageBackend(
+            provider_id="custom-1",
+            delegate=grok_backend,
+            model=grok_backend.model,
+            reference_limit_override=7,
+        )
+        await gate_image_request(wrapped, provider_id="custom-1", reference_count=7)
         with _image_download(mock_response.url, b"\x89PNG\r\n\x1a\n" + b"\x00" * 50):
-            await grok_backend.generate(
+            await wrapped.generate(
                 ImageGenerationRequest(prompt="Merge", output_path=tmp_path / "out.png", reference_images=refs)
             )
 
         call_kwargs = grok_backend._client.image.sample.call_args.kwargs
-        assert len(call_kwargs["image_urls"]) == grok_backend.max_reference_images == 5
+        assert len(call_kwargs["image_urls"]) == 7
 
     async def test_i2i_reference_encoding_keeps_event_loop_running(self, grok_backend, tmp_path, monkeypatch):
         """参考图 base64 编码要读整张图，必须卸载到线程，否则事件循环被读堵住。"""
@@ -294,11 +304,11 @@ class TestModeration:
 
 
 # ---------------------------------------------------------------------------
-# resolution 透传测试
+# resolution 小写转换测试
 # ---------------------------------------------------------------------------
 
 
-class TestResolutionPassthrough:
+class TestResolutionLowercase:
     @pytest.mark.asyncio
     async def test_image_size_none_omits_resolution_kwarg(self, grok_backend, tmp_path):
         captured: dict = {}
@@ -320,7 +330,7 @@ class TestResolutionPassthrough:
         assert "resolution" not in captured
 
     @pytest.mark.asyncio
-    async def test_image_size_passed_as_is(self, grok_backend, tmp_path):
+    async def test_image_size_lowercased_for_sdk(self, grok_backend, tmp_path):
         captured: dict = {}
 
         async def fake_sample(**kwargs):
@@ -337,7 +347,7 @@ class TestResolutionPassthrough:
         with pytest.raises(RuntimeError):
             await grok_backend.generate(request)
 
-        assert captured["resolution"] == "2K"
+        assert captured["resolution"] == "2k"
 
 
 # ---------------------------------------------------------------------------

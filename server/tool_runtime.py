@@ -20,6 +20,7 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from lib.agent.profile_manifest import ContentMode
 from lib.artifacts.artifact_activation import ArtifactCurrencyResolver, active_artifact_currency_resolver
@@ -88,6 +89,7 @@ from lib.episode.source_file_changes import (
     replace_whole_source_file,
 )
 from lib.episode.source_kinds import SourceKind
+from lib.episode.source_trash import trash_source_file
 from lib.generation.generation_batch import (
     GenerationBatchReadModel,
     GenerationBatchRequestedItem,
@@ -114,6 +116,7 @@ from lib.generation.generation_result import (
     GenerationAction,
     GenerationBatchResult,
     GenerationProblem,
+    GenerationProblemCode,
     GenerationSelectionMode,
     GenerationTargetState,
     encode_generation_problem,
@@ -121,11 +124,12 @@ from lib.generation.generation_result import (
     migration_problem,
     problem_from_task_failure,
 )
+from lib.generation.task_failure_encoding import is_provider_refusal
 from lib.generation.video_request_facts import VideoRequestFactsError, VideoRequestFactsFailure
 from lib.i18n import _ as i18n_message
 from lib.infra.async_thread import run_sync_transaction
 from lib.infra.async_thread import run_sync_transaction as _run_sync_transaction
-from lib.infra.content_digest import prefixed, prefixed_canonical_json_digest
+from lib.infra.content_digest import prefixed, prefixed_canonical_json_digest, unprefixed
 from lib.infra.data_root_layout import DataRootLayout
 from lib.infra.path_safety import safe_join
 from lib.infra.schema_guards import is_str
@@ -225,11 +229,13 @@ from server.text_generation import (
     SCOPE_REMOVED_MESSAGE,
     AdScriptRejectedError,
     OperationNotAdmittedError,
+    PromptAuthoringInputError,
     PromptOverwriteRequiredError,
     ScriptOverwriteRequiredError,
     TextGenerationError,
     TextGenerationRequest,
     TextGenerationResult,
+    UnexpectedTextGenerationError,
     VideoRequestFactsUnavailableError,
     generate_drama_script_plan,
     generate_narration_script_plan,
@@ -285,10 +291,12 @@ class Services:
     workflow_planner: WorkflowPlanner
     capabilities: ConfigResolver
     queue: GenerationQueue = field(default_factory=get_generation_queue)
+    #: 读写数据库记录（如供应商素材关联）的会话工厂。
+    sessions: async_sessionmaker[AsyncSession] = field(default_factory=lambda: async_session_factory)
 
     @classmethod
     def defaults(cls, projects: ProjectManager) -> Services:
-        """生产缺省协作者：该项目管理器的工作流规划器、读数据库的配置解析器与全局生成队列。"""
+        """生产缺省协作者：该项目管理器的工作流规划器、读数据库的配置解析器、全局生成队列与会话工厂。"""
         return cls(
             projects=projects,
             workflow_planner=WorkflowPlanner(projects),
@@ -475,7 +483,9 @@ class PatchInsertOperation(BaseModel):
         min_length=1,
         description="新条目插在这个 id 之后；省略或为 null 时插到最前（空脚本的第一条即如此）",
     )
-    item: dict[str, Any] = Field(description="新条目的完整内容；id 由系统分配，取本集现有最大序号的下一个号")
+    item: dict[str, Any] = Field(
+        description="新条目的完整内容；id 由系统分配，取本集用过的最大序号之后的号，已删除条目的编号不会再发出"
+    )
 
 
 class PatchRemoveOperation(BaseModel):
@@ -501,7 +511,7 @@ class PatchSplitOperation(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     op: Literal["split"]
-    id: str = Field(min_length=1, description="要拆分的条目 id；第一段沿用该 id，其余段分配新 id")
+    id: str = Field(min_length=1, description="要拆分的条目 id；第一段沿用该 id，其余段按新增条目的规则分配新 id")
     parts: list[dict[str, Any]] = Field(min_length=2, description="拆分后的各段完整内容，按顺序排列，至少两段")
 
 
@@ -518,11 +528,17 @@ class PatchEpisodeScriptRequest(BaseModel):
         min_length=1, description="剧本纯文件名（不含目录），如 episode_1.json；单集单文件，多集编辑每集一次调用"
     )
     base_revision: str = Field(
-        pattern=r"^sha256-v1:[0-9a-f]{64}$", description="get_episode_script 返回的当前 revision"
+        pattern=r"^(?:sha256-v1:)?[0-9a-f]{64}$",
+        description="get_episode_script 返回的当前 revision；带 sha256-v1: 前缀与裸 hex 两种写法等价",
     )
     operations: list[PatchEpisodeScriptOperation] = Field(
         min_length=1, description="按顺序执行的编辑操作，整批原子提交：update / insert / move / remove / split"
     )
+
+    @field_validator("base_revision")
+    @classmethod
+    def _normalize_revision(cls, value: str) -> str:
+        return prefixed(unprefixed(value))
 
     @field_validator("script")
     @classmethod
@@ -681,12 +697,25 @@ async def _run_text_generation(
         return ToolOutcome(problem=truncation_problem(exc))
     except VideoRequestFactsUnavailableError as exc:
         return ToolOutcome(problem=video_facts_problem(exc.failure, str(exc)))
+    except PromptAuthoringInputError as exc:
+        return ToolOutcome(
+            problem=ToolProblem(exc.code, str(exc), action=GenerationAction.FIX_INPUT, params=dict(exc.params))
+        )
+    except UnexpectedTextGenerationError as exc:
+        return ToolOutcome(problem=_unexpected_text_failure_problem(str(exc), exc))
     except TextGenerationError as exc:
         return ToolOutcome(problem=ToolProblem("generation_refused", str(exc)))
     except ModelNotInCatalogError as exc:
         return ToolOutcome(problem=model_not_in_catalog_problem(exc))
     except Exception as exc:
-        return ToolOutcome(problem=ToolProblem("internal_error", f"{operation} 失败: {exc}"))
+        return ToolOutcome(problem=_unexpected_text_failure_problem(f"{operation} 失败: {exc}", exc))
+
+
+def _unexpected_text_failure_problem(detail: str, cause: BaseException) -> ToolProblem:
+    """生成中的意外异常：供应商真正拒绝了内容或输入时归为拒绝（修改输入），其余按任务失败重试，与图片任务一致。"""
+    if is_provider_refusal(cause):
+        return ToolProblem("generation_refused", detail)
+    return ToolProblem(GenerationProblemCode.TASK_FAILED.value, detail, action=GenerationAction.RETRY)
 
 
 _TEXT_EPISODE_SCRIPT = "text_episode_script"
@@ -873,7 +902,7 @@ class GenerateEpisodeScriptRequest(BaseModel):
         default=None,
         description=(
             "用户听完丢失清单并同意覆盖后，才传入的令牌：提示词重写取 prompt_overwrite.revision，"
-            "整份重做取 script_overwrite.revision；不覆盖已有内容时不必给"
+            "整份重做取 script_overwrite.revision；带 sha256-v1: 前缀与裸 hex 两种写法等价；不覆盖已有内容时不必给"
         ),
     )
     dry_run: bool = Field(default=False, description=_DRY_RUN_DESCRIPTION)
@@ -1013,7 +1042,7 @@ class ConfirmScriptReviewRequest(BaseModel):
     episode_id: PositiveEpisode = Field(description=EPISODE_ID_DESCRIPTION)
     overwrite_revision: str | SkipJsonSchema[None] = Field(
         default=None,
-        description="用户听完丢失清单并同意覆盖后，才传入的令牌，取自 script_overwrite.revision；尚无正式脚本时不必给",
+        description="用户听完丢失清单并同意覆盖后，才传入的令牌，取自 script_overwrite.revision；带 sha256-v1: 前缀与裸 hex 两种写法等价；尚无正式脚本时不必给",
     )
 
 
@@ -1315,7 +1344,7 @@ class PromptPreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     script: str = Field(min_length=1, description="剧本纯文件名（不含目录），如 episode_1.json")
-    item_id: str = Field(min_length=1, description="分镜条目 id（segment_id / scene_id / shot_id / unit_id），如 E1S01")
+    item_id: str = Field(min_length=1, description="条目 id（segment_id / scene_id / shot_id / unit_id），如 E1S01")
 
 
 async def get_prompt_preview(
@@ -1340,7 +1369,7 @@ async def get_prompt_preview(
             scope.project_name, filename, request.value.item_id, projects=services.projects
         )
     except ScriptItemNotFound:
-        return ToolOutcome(problem=ToolProblem("item_not_found", f"剧本中不存在分镜 {request.value.item_id}"))
+        return ToolOutcome(problem=ToolProblem("item_not_found", f"剧本中不存在条目 {request.value.item_id}"))
     except FileNotFoundError as exc:
         return ToolOutcome(problem=ToolProblem("file_not_found", str(exc)))
     except (TypeError, ValueError) as exc:
@@ -1467,12 +1496,21 @@ def _draft_workflow(scope: ProjectScope, services: Services) -> DraftWorkflow:
     )
 
 
-async def _run_draft(call: Awaitable[dict[str, Any]]) -> ToolOutcome[dict[str, Any]]:
+async def _run_draft(
+    call: Awaitable[dict[str, Any]], *, notice_as_problem: bool = False
+) -> ToolOutcome[dict[str, Any]]:
+    """``notice_as_problem`` 为真时，带文案 key 的草稿错误以该 key 为问题码、按修改输入呈现（任务失败原因用）。"""
     try:
         return ToolOutcome(value=await call)
     except DraftWorkflowError as exc:
         if exc.failure is not None:
             return ToolOutcome(problem=video_facts_problem(exc.failure, exc.detail))
+        if notice_as_problem and exc.notice_key is not None:
+            return ToolOutcome(
+                problem=ToolProblem(
+                    exc.notice_key, exc.detail, action=GenerationAction.FIX_INPUT, params=dict(exc.notice_params)
+                )
+            )
         return ToolOutcome(problem=ToolProblem(exc.code, exc.detail))
     except TextOutputTruncatedError as exc:
         return ToolOutcome(problem=truncation_problem(exc))
@@ -1546,7 +1584,9 @@ class RepairDraftRequest(BaseModel):
 
     episode_id: PositiveEpisode = Field(description=EPISODE_ID_DESCRIPTION)
     doc_type: DraftDocType = Field(description="待修复草稿对应的文档，取值同 open_draft")
-    base_revision: str = Field(description="读取草稿时拿到的 revision；修复写回前按它校验草稿未被改动")
+    base_revision: str = Field(
+        description="读取草稿时拿到的 revision；带 sha256-v1: 前缀与裸 hex 两种写法等价；修复写回前按它校验草稿未被改动"
+    )
     instructions: _TextInstructions | SkipJsonSchema[None] = None
 
 
@@ -1609,10 +1649,11 @@ async def _execute_draft_repair(
     outcome = await _run_draft(
         _draft_repair(scope, services).repair(
             request.episode_id, request.doc_type, request.base_revision, request.instructions
-        )
+        ),
+        notice_as_problem=True,
     )
     if outcome.problem is not None and outcome.problem.action is not None:
-        # 带修复指引的问题（输出截断、视频模型配置）原样透出：问题码即文案 key，失败原因按真实原因呈现。
+        # 带修复指引的问题（输出截断、视频模型配置、正式剧本单元没过晋升预判）原样透出：问题码即文案 key，失败原因按真实原因呈现。
         return ToolOutcome(problem=outcome.problem)
     if outcome.problem is not None:
         # 任务失败原因按问题码本地化呈现：换成草稿命令对应的错误文案 key，Agent 面向的 detail 只作诊断。
@@ -1935,7 +1976,7 @@ async def upload_source(
             yield source_path
         finally:
             if source_path is not None:
-                source_path.unlink(missing_ok=True)
+                source_path.unlink(missing_ok=True)  # hard-delete: temp -- Agent 上传源文件的临时文件
 
     def _upload_episode() -> dict[str, Any]:
         _validate()
@@ -1962,11 +2003,16 @@ async def upload_source(
         with _temporary_source() as source_path:
 
             def _write(source_dir: Path, undo: contextlib.ExitStack) -> str:
+                if value.on_conflict == "replace":
+                    # 被替换的旧文件连同原始上传件进项目回收站，事务失败时撤回原处。
+                    trash_source_file(source_dir.parent, f"source/{Path(value.filename).stem}.txt", undo)
                 result = SourceLoader.load(
                     source_path, source_dir, original_filename=value.filename, on_conflict=value.on_conflict
                 )
+                # hard-delete: rollback -- 源文件写入失败时撤销本次写入
                 undo.callback(result.normalized_path.unlink, missing_ok=True)
                 if result.raw_path is not None:
+                    # hard-delete: rollback -- 源文件写入失败时撤销本次写入
                     undo.callback(result.raw_path.unlink, missing_ok=True)
                 loaded["result"] = result
                 return f"source/{result.normalized_path.name}"
@@ -2449,7 +2495,7 @@ PROJECT_SETTINGS = (
 PROJECT_OVERVIEW_FIELDS = ("synopsis", "genre", "theme", "world_setting")
 EPISODE_META_FIELDS = ("title",)
 
-_SOURCE_LANGUAGE_VALUES = ("zh", "en", "vi")
+_SOURCE_LANGUAGE_VALUES = ("zh", "en", "vi", "ru")
 _POSITIVE_INT_SETTINGS = (EPISODE_TARGET_UNITS_FIELD,)
 
 
@@ -2681,7 +2727,7 @@ class CompleteScriptPlanRebuildRequest(BaseModel):
     expected_stale_script_plan_revision: str | None = Field(
         description=(
             "重建基线，原样取自制作计划 next_action.args.expected_stale_script_plan_revision（可能为 null，"
-            "null 也须显式传）；与项目记录不一致时拒绝"
+            "null 也须显式传；带 sha256-v1: 前缀与裸 hex 两种写法等价）；与项目记录不一致时拒绝"
         )
     )
 
@@ -3196,12 +3242,14 @@ async def stop_episode_planning(
 
 
 def _text_result_payload(value: TextGenerationResult) -> dict[str, Any]:
-    """任务结果里的文本回执：``warnings`` 与 ``new_assets`` 只在非空时写入，读侧按 ``result.warnings`` 渲染。"""
+    """任务结果里的文本回执：``warnings``、``new_assets`` 与 ``no_pending_authoring`` 只在非空时写入，读侧按 ``result.warnings`` 渲染。"""
     payload: dict[str, Any] = {"message": value.message}
     if value.warnings:
         payload["warnings"] = list(value.warnings)
     if value.new_assets:
         payload["new_assets"] = list(value.new_assets)
+    if value.no_pending_authoring:
+        payload["no_pending_authoring"] = True
     return payload
 
 
@@ -3636,9 +3684,9 @@ def _merge_asset_message(project: Mapping[str, Any], report: AssetMergeReport) -
     if report.derivatives_folded:
         lines.append("与保留方已有衍生同名、并入已有衍生：" + "、".join(report.derivatives_folded))
     lines.append(
-        "被并方的描述、资产图及版本历史、声音设置、原图与参考音频不保留。"
+        "被并方的描述、资产图及版本历史、声音设置、原图与参考音频不并入保留方，将移入项目回收站。"
         if report.dry_run
-        else "被并方的描述、资产图及版本历史、声音设置、原图与参考音频已删除。"
+        else "被并方的描述、资产图及版本历史、声音设置、原图与参考音频已移入项目回收站。"
     )
     return "\n".join(lines)
 
@@ -3797,7 +3845,7 @@ async def complete_script_plan_rebuild(
     except Exception as exc:
         return ToolOutcome(problem=_unexpected("complete_script_plan_rebuild", exc))
     return ToolOutcome(
-        value=CompleteScriptPlanRebuildResult(episode_id=value.episode_id, script_plan_revision=revision)
+        value=CompleteScriptPlanRebuildResult(episode_id=value.episode_id, script_plan_revision=prefixed(revision))
     )
 
 

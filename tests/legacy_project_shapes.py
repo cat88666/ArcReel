@@ -21,9 +21,12 @@ from lib.artifacts.artifact_manifest import (
     ProjectArtifactManifestAdapter,
     compose_video_artifact_basis,
 )
+from lib.artifacts.artifact_planner import TargetStatePlanner
+from lib.artifacts.artifact_version_provenance import IMAGE_ARTIFACT_BASIS_FIELD
 from lib.artifacts.version_manager import VERSION_CONTENT_DIGEST, VersionManager
 from lib.artifacts.video_artifact_facts import VideoArtifactCurrencyFacts
 from lib.artifacts.visual_artifact_provenance import build_storyboard_video_artifact_visual_basis
+from lib.project import project_trash
 from lib.project.project_migrations.runner import MIGRATORS
 from lib.project.source_revision import SourceScope, compute_source_revision
 from lib.script.grid.models import GridGeneration, build_frame_chain
@@ -197,7 +200,7 @@ def write_legacy_retired_flash_lite_project(root: Path, *, provider_id: str) -> 
 
 
 def write_legacy_retired_model_references_project(root: Path) -> Path:
-    """schema 17 项目的图片字段引用已改名的 Gemini 图片 preview ID，视频字段引用已下架而没有后继的模型。
+    """schema 17 项目的图片字段引用已改名的 Gemini 图片 preview ID，视频字段引用已下线而没有后继的模型。
 
     ``model_settings`` 按旧 ID 存了分辨率；其中一个后继 ID 下另有设置。
     """
@@ -256,6 +259,55 @@ def write_legacy_timeline_agent_turn_project(root: Path) -> Path:
                     "content": {"clips": [{**clip, "source_volume": 0.6}]},
                     "changed_clip_ids": ["c1"],
                 },
+            ],
+        },
+    )
+    return project_dir
+
+
+def write_legacy_item_id_reuse_project(root: Path, name: str = "legacy-item-id-reuse") -> Path:
+    """schema 18 项目：新增条目只避开剧本里现存的编号，删掉的条目在别处留下更大的编号。
+
+    剧本里是 E1S1、E1S2；删掉的 E1S5 只剩版本历史，E1S7 在项目回收站的删除记录里，剪辑时间线的片段还引用
+    已删掉的 E1S9。升级前在剧本末尾新增会取 E1S3，接上这些旧编号的历史。
+    """
+
+    project_dir = write_legacy_storyboard_project(root, name=name)
+    advance_project_schema(project_dir, to_version=18)
+    removed_image = project_dir / "storyboards" / "scene_E1S5.png"
+    removed_image.write_bytes(b"removed-E1S5")
+    VersionManager(project_dir).add_version("storyboards", "E1S5", "删掉的分镜", source_file=removed_image)
+    removed_image.unlink()
+    trashed_audio = project_dir / "audio" / "segment_E1S7.wav"
+    trashed_audio.parent.mkdir(parents=True, exist_ok=True)
+    trashed_audio.write_bytes(b"removed-E1S7")
+    project_trash.record_deletion(
+        project_dir,
+        {"kind": "script_entry", "id": "E1S7", "episode": 1, "script_file": "episode_1.json", "item_kind": "segments"},
+        ["audio/segment_E1S7.wav"],
+    )
+    _write_json(
+        project_dir / "edit_timelines" / "episode_1" / "tl-00000e19.json",
+        {
+            "schema_version": 1,
+            "id": "tl-00000e19",
+            "episode": 1,
+            "name": "初剪",
+            "created_at": "2026-09-01T00:00:00Z",
+            "next_clip_number": 3,
+            "revisions": [
+                {
+                    "number": 1,
+                    "author": {"kind": "creator", "user_id": "u1"},
+                    "summary": "按脚本新建",
+                    "created_at": "2026-09-01T00:00:00Z",
+                    "content": {
+                        "clips": [
+                            {"id": "c1", "unit_id": "E1S1", "source_volume": 1.0},
+                            {"id": "c2", "unit_id": "E1S9", "source_volume": 1.0},
+                        ]
+                    },
+                }
             ],
         },
     )
@@ -784,6 +836,56 @@ def write_legacy_style_project(
     return project_dir
 
 
+def write_legacy_named_reference_bases_project(root: Path, name: str = "legacy-named-references") -> Path:
+    """schema 18 项目：分镜图、宫格与切格分镜的依据记着资产名（v19 起不记）。
+
+    在 :func:`write_legacy_style_project` 上让三格分镜都引用角色「阿离」、画面描述用 ``@[阿离]`` 指认它，
+    宫格记录冻结同一张角色资产图；按迁移链推进到 v18，清单按那时记名的口径登记。再按 v18 口径给宫格与
+    E1S03 写一条选中的版本记录（冻结依据），给 E1S01 写两版、选中第 2 版。
+    """
+
+    project_dir = write_legacy_style_project(root, name, style="写实电影感")
+    script_path = project_dir / "scripts" / "episode_1.json"
+    script = json.loads(script_path.read_text(encoding="utf-8"))
+    for segment in script["segments"]:
+        segment["characters_in_segment"] = ["阿离"]
+        segment["image_prompt"]["scene"] = f"@[阿离]站在{segment['segment_id']}的雨巷里"
+    _write_json(script_path, script)
+    grid_path = next((project_dir / "grids").glob("grid_*.json"))
+    grid = json.loads(grid_path.read_text(encoding="utf-8"))
+    grid["reference_images"] = [{"path": "characters/阿离.png", "name": "阿离", "ref_type": "character"}]
+    _write_json(grid_path, grid)
+    advance_project_schema(project_dir, to_version=18)
+
+    project_bytes = (project_dir / "project.json").read_bytes()
+    planner = TargetStatePlanner(project_dir, project_bytes=project_bytes)
+    planner.plan()
+    versions_path = project_dir / "versions" / "versions.json"
+    versions = json.loads(versions_path.read_text(encoding="utf-8"))
+    for bucket, resource_id, key, source in (
+        ("grids", grid["id"], ArtifactKey.episode_grid(1, grid["id"]), f"grids/{grid['id']}.png"),
+        ("storyboards", "E1S03", ArtifactKey.episode_storyboard(1, "E1S03"), "storyboards/scene_E1S03.png"),
+        ("storyboards", "E1S01", ArtifactKey.episode_storyboard(1, "E1S01"), "storyboards/scene_E1S01.png"),
+    ):
+        records = []
+        for version in range(1, 3 if resource_id == "E1S01" else 2):
+            snapshot = f"versions/{bucket}/{resource_id}_v{version}_20260101T000000.png"
+            (project_dir / snapshot).parent.mkdir(parents=True, exist_ok=True)
+            (project_dir / snapshot).write_bytes((project_dir / source).read_bytes())
+            records.append(
+                {
+                    "version": version,
+                    "file": snapshot,
+                    "prompt": resource_id,
+                    "created_at": f"2026-01-0{version}T00:00:00Z",
+                    IMAGE_ARTIFACT_BASIS_FIELD: planner.bases[key].to_evidence_dict(),
+                }
+            )
+        versions[bucket][resource_id] = {"current_version": len(records), "versions": records}
+    _write_json(versions_path, versions)
+    return project_dir
+
+
 ScriptPlanVariantName = Literal["drama", "narration", "reference_video"]
 
 #: 退役的条目指纹与整集指纹：样本里只要求字段在场，取值无关紧要。
@@ -1106,6 +1208,159 @@ def add_asset_names_differing_only_in_case(project_dir: Path, bucket: str, sheet
         (project_dir / sheet).write_bytes(content)
     _write_json(project_path, project)
     return variant
+
+
+def write_legacy_shared_reference_project(root: Path, *, padded_names: bool = False) -> Path:
+    """schema 5 的跨资产共用：角色共用图与音频，同名商品也引用角色的图。"""
+    project_dir = root / "demo"
+    owner, borrower = (" Alice ", " Bob ") if padded_names else ("Alice", "Bob")
+    image, audio = f"characters/refs/{owner}.png", f"characters/refs_audio/{owner}.wav"
+    _write_json(
+        project_dir / "project.json",
+        {
+            "schema_version": 5,
+            "title": "旧共用参考文件项目",
+            "characters": {
+                owner: {"description": "owner", "reference_image": image, "reference_audio": audio},
+                borrower: {"description": "borrower", "reference_image": image, "reference_audio": audio},
+            },
+            "scenes": {},
+            "props": {},
+            "products": {borrower: {"description": "product", "reference_images": [image]}},
+            "episodes": [],
+        },
+    )
+    for rel, content in ((image, b"image"), (audio, b"audio")):
+        path = project_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    return project_dir
+
+
+def share_a_sheet_with_an_occupied_copy_target(project_dir: Path) -> None:
+    """Bob 的资产图借用 Alice，Bob 的原图仍引用将被资产图副本占用的落点。"""
+    project_path = project_dir / "project.json"
+    project = _load_json_object(project_path)
+    project["characters"] = {
+        "Alice": {"description": "Alice", "character_sheet": "characters/Alice.png"},
+        "Bob": {
+            "description": "Bob",
+            "character_sheet": "characters/Alice.png",
+            "reference_image": "characters/Bob.png",
+        },
+    }
+    for rel, content in (("characters/Alice.png", b"Alice-sheet"), ("characters/Bob.png", b"Bob-reference")):
+        path = project_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    _write_json(project_path, project)
+
+
+def share_a_sheet_with_a_missing_reference_and_occupied_target(project_dir: Path) -> None:
+    """缺失原图指向资产图副本落点，原图自己的规范落点又被孤立文件占用。"""
+    share_a_sheet_with_an_occupied_copy_target(project_dir)
+    (project_dir / "characters/Bob.png").unlink()
+    target = project_dir / "characters/refs/Bob.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"orphan-reference")
+
+
+def share_reference_files_with_occupied_targets(project_dir: Path, directory: str) -> None:
+    """参考图或音频副本的落点仍被资产图引用，音频落点还同时被原图引用。"""
+    project_path = project_dir / "project.json"
+    project = _load_json_object(project_path)
+    field = "reference_image" if directory == "refs" else "reference_audio"
+    source, target = f"characters/{directory}/Alice.png", f"characters/{directory}/Bob.png"
+    project["characters"] = {
+        "Alice": {"description": "Alice", field: source},
+        "Bob": {"description": "Bob", "character_sheet": target, field: source},
+    }
+    if directory == "refs_audio":
+        project["characters"]["Bob"]["reference_image"] = target
+    for rel, content in ((source, b"Alice-reference"), (target, b"Bob-sheet")):
+        path = project_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    _write_json(project_path, project)
+
+
+def share_reference_files(project_dir: Path) -> dict[str, bytes]:
+    """旧版资产 PATCH 接受任意路径，参考图与参考音频可以指向别的资产名下的文件。
+
+    角色「阿离」带自己名下的参考图与参考音频，新加的角色「阿青」两个字段都指着这两份；「阿青」名下另有
+    一张没被引用的参考图。商品「咖啡」带第 1 张原图，新加的商品「茶」的原图列表指着它。返回各份文件的内容。
+    """
+
+    project_path = project_dir / "project.json"
+    project = _load_json_object(project_path)
+    contents = {
+        "characters/refs/阿离.png": b"ali-image",
+        "characters/refs_audio/阿离.wav": b"ali-voice",
+        "characters/refs/阿青.png": b"qing-stray",
+        "products/refs/咖啡_1.png": b"coffee-1",
+    }
+    for rel, content in contents.items():
+        (project_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+        (project_dir / rel).write_bytes(content)
+    shared = {"reference_image": "characters/refs/阿离.png", "reference_audio": "characters/refs_audio/阿离.wav"}
+    project["characters"]["阿离"].update(shared)
+    project["characters"]["阿青"] = {"description": "青衣少年", "character_sheet": "", **shared}
+    project["products"]["咖啡"]["reference_images"] = ["products/refs/咖啡_1.png"]
+    project["products"]["茶"] = {
+        "description": "冷泡茶",
+        "product_sheet": "",
+        "reference_images": ["products/refs/咖啡_1.png"],
+    }
+    _write_json(project_path, project)
+    return contents
+
+
+def share_asset_sheets(project_dir: Path) -> dict[str, bytes]:
+    """旧版资产 PATCH 接受任意路径，资产图字段也可以指向别的资产名下的图。
+
+    角色「阿离」带自己名下的参考图，新加的角色「阿青」的资产图指着它，「阿青」名下另有一张没被引用的资产图。
+    在 v8 之前写下时，v7→v8 的整份激活按这个共用的路径登记「阿青」的资产图（同一路径没有别的登记）。
+    返回参考图的内容（样本取 ``write_legacy_storyboard_project`` 一类带角色「阿离」的项目）。
+    """
+
+    project_path = project_dir / "project.json"
+    project = _load_json_object(project_path)
+    reference = "characters/refs/阿离.png"
+    (project_dir / reference).parent.mkdir(parents=True, exist_ok=True)
+    (project_dir / reference).write_bytes(b"ali-image")
+    (project_dir / "characters/阿青.png").write_bytes(b"qing-stray")
+    project["characters"]["阿离"]["reference_image"] = reference
+    project["characters"]["阿青"] = {"description": "青衣少年", "character_sheet": reference}
+    _write_json(project_path, project)
+    return {reference: b"ali-image"}
+
+
+def share_derivative_sheet(project_dir: Path) -> str:
+    """旧版 PATCH 允许本体资产图指向另一个资产的衍生图。"""
+    project_path = project_dir / "project.json"
+    project = _load_json_object(project_path)
+    derivative = "characters/derivatives/阿离/雨衣.png"
+    project["characters"]["阿离"]["derivatives"] = {"雨衣": {"description": "穿雨衣", "character_sheet": derivative}}
+    project["characters"]["阿青"] = {"description": "青衣少年", "character_sheet": derivative}
+    _write_json(project_path, project)
+    (project_dir / derivative).parent.mkdir(parents=True, exist_ok=True)
+    (project_dir / derivative).write_bytes(b"raincoat")
+    return derivative
+
+
+def repoint_registered_asset_sheet(project_dir: Path) -> dict[str, bytes]:
+    """资产图登记之后才经 PATCH 改指别的资产名下的图：场景「雨巷」的资产图改指道具「伞」的资产图。
+
+    「雨巷」自己的图与登记留在原处，登记因路径对不上读作缺失；两个条目声明同一张图，改指前的规划器拒绝整个项目。
+    返回两张图改指前的内容（样本取带场景「雨巷」与道具「伞」、已有清单登记的项目）。
+    """
+
+    project_path = project_dir / "project.json"
+    project = _load_json_object(project_path)
+    contents = {rel: (project_dir / rel).read_bytes() for rel in ("scenes/雨巷.png", "props/伞.png")}
+    project["scenes"]["雨巷"]["scene_sheet"] = "props/伞.png"
+    _write_json(project_path, project)
+    return contents
 
 
 def refer_to_asset_in_episode(project_dir: Path, episode: int, field: str, name: str) -> None:
@@ -1477,10 +1732,15 @@ __all__ = [
     "bind_episode_script_to_filename",
     "legacy_transition_presentation_basis",
     "refer_to_asset_in_episode",
+    "repoint_registered_asset_sheet",
+    "share_asset_sheets",
+    "share_reference_files",
     "without_version_content_digests",
     "write_legacy_ad_reference_video_project",
     "write_legacy_drama_storyboard_project",
     "write_legacy_episode_id_remnants_project",
+    "write_legacy_item_id_reuse_project",
+    "write_legacy_named_reference_bases_project",
     "write_legacy_presentation_project",
     "write_legacy_reference_video_project",
     "write_legacy_retired_flash_lite_project",

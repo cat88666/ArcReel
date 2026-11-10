@@ -60,6 +60,7 @@ from lib.infra.async_thread import run_sync_transaction
 from lib.infra.content_digest import sha256_file
 from lib.infra.text_utils import strip_json_code_fences
 from lib.project.asset_types import asset_name_comparison_key
+from lib.project.item_id_history import issue_landing_item_ids
 from lib.project.project_manager import ProjectManager, ScriptWriteConflict
 from lib.prompts.prompt_builders_ad import (
     build_ad_prompt,
@@ -86,6 +87,7 @@ from lib.script.draft_quarantine import (
     read_quarantine,
 )
 from lib.script.draft_violation import locate_violations, locate_violations_by_id, schema_violations
+from lib.script.item_excerpt import find_item
 from lib.script.plan_new_assets import (
     NEW_ASSETS_FIELD,
     NewAssetResolution,
@@ -106,6 +108,7 @@ from lib.script.reference_video.draft_validation import (
     DraftViolations,
     assert_dialogue_preserved,
     dialogue_speakers,
+    dialogue_spoken_seconds,
     validate_dialogue_load,
     validate_unit_text,
     violation_items,
@@ -144,6 +147,7 @@ from lib.script.script_review import (
     ScriptPlanWriteConflict,
     content_fingerprint,
     content_fingerprint_of_data,
+    fingerprint_of_revision,
     formal_script_filename,
     formal_script_overwrite,
     formal_script_plan_lock,
@@ -201,6 +205,46 @@ _KIND_PARSE_SCHEMA: dict[str, type[BaseModel]] = {
 
 class PromptAuthoringTargetError(ValueError):
     """提示词编写的对象无效：该集尚无正式脚本，或 ``entry_ids`` 点名的条目不在正式脚本里。"""
+
+
+class PromptAuthoringUnitRejected(ValueError):
+    """提示词编写调用文本模型前，正式脚本里待编写单元的现值没有通过预判。
+
+    这是输入问题：编写会逐字保留单元台词，重试同一份输入必然再次失败，出路是在时间线上修改该单元。
+    ``code`` 与 ``params`` 是任务失败的问题码与参数，界面按问题码本地化；``params["position"]`` 是该单元
+    在本集视频单元里的位置（从 1 起），界面按位置称呼单元。消息面向 Agent，按单元 ID 定位。
+    """
+
+    def __init__(self, message: str, *, code: str, params: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.code = code
+        self.params = params
+
+
+#: 晋升前正式剧本单元预判的问题码 → 草稿晋升的文案 key。编写入口把同一份预判报成任务失败，
+#: 草稿晋升要说明的是「草稿未采用」，文案另起一套。
+_FORMAL_UNIT_PROMOTION_KEYS: dict[str, str] = {
+    "prompt_authoring_dialogue_overload": "draft_formal_unit_dialogue_overload",
+    "prompt_authoring_duration_off_tier": "draft_formal_unit_duration_off_tier",
+    "prompt_authoring_unit_invalid": "draft_formal_unit_invalid",
+}
+
+
+class UnitDurationOffTier(ValueError):
+    """待编写单元的现时长不在该单元所落参考桶的生效档位内（通常是模型、分辨率或参考图状态变化让档位收窄）。
+
+    ``unit_id`` / ``duration_seconds`` / ``tiers`` 供调用方按自己的口径转成面向用户的提示；消息面向 Agent。
+    ``position`` 是单元在所判那份内容里的界面位置（从 1 起）；判的是正式剧本时为 None，调用方按正式剧本自行定位。
+    """
+
+    def __init__(
+        self, message: str, *, unit_id: str, duration_seconds: int, tiers: list[int], position: int | None = None
+    ) -> None:
+        super().__init__(message)
+        self.unit_id = unit_id
+        self.duration_seconds = duration_seconds
+        self.tiers = tiers
+        self.position = position
 
 
 class AdScriptRejected(ValueError):
@@ -294,7 +338,7 @@ def _require_overwrite_acknowledged(
 ) -> None:
     """显式重写会替换已有视觉层内容时，覆盖令牌须与读取目标时的正式剧本指纹一致。"""
     overwritten = targets.selection.overwritten
-    if overwritten and (overwrite_revision is None or overwrite_revision != baseline):
+    if overwritten and (overwrite_revision is None or fingerprint_of_revision(overwrite_revision) != baseline):
         raise PromptOverwriteRequired(PromptOverwrite(fingerprint=baseline, entries=overwritten))
 
 
@@ -371,6 +415,11 @@ class ScriptGenerator:
         """该集正式剧本的文件名与写入基线指纹（文件不存在时指纹为 None）。"""
         filename = output_filename or formal_script_filename(self.project_path, self.project_json, episode)
         return filename, content_fingerprint(self.project_path / "scripts" / filename)
+
+    def _issue_landing_item_ids(self, script_data: dict[str, Any]) -> None:
+        """落盘前由服务端给生成产出的条目发号（见 ``item_id_history.issue_landing_item_ids``）；须在线程里调用。"""
+        pm = ProjectManager.for_project_dir(self.project_path)
+        issue_landing_item_ids(self.project_path, pm.load_project(self.project_path.name), script_data)
 
     def _save_script(self, script_data: dict[str, Any], filename: str, **kwargs: Any) -> Path:
         """经写盘统一入口保存剧本；ProjectManager 构造时会建目录，须在线程里调用。"""
@@ -489,7 +538,7 @@ class ScriptGenerator:
             if entry_ids or rewrite:
                 raise PromptAuthoringTargetError("整份重做不能与 entry_ids / rewrite 同时使用")
             overwrite = await asyncio.to_thread(formal_script_overwrite, self.project_path, self.project_json, episode)
-            if overwrite is not None and overwrite_revision != overwrite.fingerprint:
+            if overwrite is not None and fingerprint_of_revision(overwrite_revision) != overwrite.fingerprint:
                 raise AdScriptOverwriteRequired(overwrite)
             prompt, schema = await self._compose_ad(episode, gen_mode, instructions)
             return await self._generate_and_save(
@@ -724,10 +773,12 @@ class ScriptGenerator:
     ) -> ScriptPlanMaterializationReceipt:
         """内容确认时把脚本规划整份转为正式剧本：旧剧本（若有）整份被替换，不沿用任何条目。
 
+        条目编号在落盘时一律另发新号，编号只分配、不复用（``docs/adr/0090``）。
+
         投影见 ``lib.script.script_document.build_materialized_script``。``expected_plan_revision`` 是确认记录的脚本规划指纹，加载到的
         规划不是这份即抛 ``ScriptPlanWriteConflict``；``expected_script_fingerprint`` 是调用方认可覆盖时
-        看到的正式剧本指纹（无剧本为 None），落盘时不匹配抛 ``ScriptWriteConflict``。旧剧本的条目即使
-        与新条目同 id，名下产物也随本次写入撤登记，并清理其历史版本与当前媒体文件。``project_update`` 与剧本在同一写事务内修改
+        看到的正式剧本指纹（无剧本为 None），落盘时不匹配抛 ``ScriptWriteConflict``。旧剧本的条目名下产物
+        随本次写入撤登记，历史版本与当前媒体文件移进项目回收站。``project_update`` 与剧本在同一写事务内修改
         project.json，确认记录借此与正式剧本一起落盘。
         """
         self._script_plan_fingerprint = None
@@ -759,7 +810,6 @@ class ScriptGenerator:
         )
         items_key = plan_variant(plan_kind).skeleton_kind
         id_field = entry_id_field(plan_kind)
-        entry_ids = tuple(str(item[id_field]) for item in script_data[items_key])
         previous = await asyncio.to_thread(formal_script_overwrite, self.project_path, self.project_json, episode)
         previous_ids = tuple(entry.entry_id for entry in previous.entries) if previous is not None else ()
         plan_path = script_plan_path(self.project_path, self.project_json, episode)
@@ -778,16 +828,18 @@ class ScriptGenerator:
                     )
                 if claim is not None:
                     assert_current_artifact_input_claims_usable(self.project_path, (claim,))
+                # 规划只提供内容：正式身份另发新号，旧条目整份移进项目回收站。
+                self._issue_landing_item_ids(script_data)
                 self._save_script(
                     script_data,
                     filename,
                     validate=True,
                     expected_fingerprint=expected_script_fingerprint,
-                    replaced_resource_ids=tuple(entry_id for entry_id in previous_ids if entry_id in entry_ids),
                     project_update=update_project,
                 )
 
         await run_sync_transaction(_commit)
+        entry_ids = tuple(str(item[id_field]) for item in script_data[items_key])
         removed = tuple(entry_id for entry_id in previous_ids if entry_id not in entry_ids)
         logger.info(
             "第 %d 集已在内容确认时按脚本规划整份转为正式剧本（%d 条，移出旧条目 %d 条）",
@@ -870,7 +922,8 @@ class ScriptGenerator:
 
         产出违约（解析不出、结构不合、引用落不到资产上、新增资产的处理决定解析不出、条目为空）一律抛
         ``AdScriptRejected``：不写正式脚本、不登记资产、不落草稿。``needs_replan`` 单元照常写入。
-        ``previous`` 是用户认可覆盖的旧正式剧本：以它的指纹为写入基线，同 id 条目名下的旧产物随写入撤登记。
+        ``previous`` 是用户认可覆盖的旧正式剧本：以它的指纹为写入基线，旧条目名下的产物随写入撤登记。
+        条目编号在落盘时由服务端另发（编号只分配、不复用）。
         """
         assert self.generator is not None  # generate() 入口已检查
         if previous is None:
@@ -905,28 +958,24 @@ class ScriptGenerator:
             raise AdScriptRejected(structure.errors)
         # 依据含资产表：按登记本次新增资产后的项目冻结，写入后的正式剧本即为当前。
         self._freeze_ad_artifact_basis(episode, registered_project)
-        previous_ids = {entry.entry_id for entry in previous.entries} if previous is not None else set()
-        settled, _id_field, _kind = resolve_kind_items(script_data)
-        replaced_ids = tuple(
-            str(item[id_field]) for item in cast(list[dict[str, Any]], settled) if str(item[id_field]) in previous_ids
-        )
 
         # 经写盘统一入口保存：整集生成无「改前」，按严格结构校验（等价原 response_schema 的
         # Pydantic 校验），并继承 metadata 重算、加锁、filename↔episode 一致性与 project.json
         # 同步——消除「裸 json.dump 旁路」，使 _write_script_unlocked 成为剧本唯一写入点。
         # 本次新增资产与正式剧本在同一写事务里登记进项目。
-        output_path = await run_sync_transaction(
-            functools.partial(
-                self._save_script,
+        # 模型给出的编号只是占位：整份生成的条目一律由服务端发本集从没用过的新编号，旧剧本的条目整份移进项目回收站。
+        def _issue_and_save() -> Path:
+            self._issue_landing_item_ids(script_data)
+            return self._save_script(
                 script_data,
                 filename,
                 validate=True,
                 artifact_basis=self._artifact_basis,
                 expected_fingerprint=formal_baseline,
-                replaced_resource_ids=replaced_ids,
                 project_update=new_assets.apply_to_project,
             )
-        )
+
+        output_path = await run_sync_transaction(_issue_and_save)
         if registered_assets is not None:
             registered_assets[:] = new_assets.registered()
         self._quality_probe(script_data, episode)
@@ -1157,8 +1206,8 @@ class ScriptGenerator:
     def _resolve_max_refs(facts: PlanningVideoFacts) -> int | None:
         """带可用参考图的单元（r2v 桶）每请求可携带的参考图上限，取自该桶的视频请求事实。
 
-        语义约定：仅 None 视为「未声明上限」（上层不在 prompt 写硬性数量约束，且 executor 跳过裁剪）；
-        0 是显式上限（如不接受参考图的 endpoint），会原样下传触发裁剪为 0 张。r2v 桶解析不出时
+        语义约定：None 为「未收录」（条目与通道都没有声明，上层不在 prompt 写硬性数量约束，且 executor 跳过裁剪）；
+        0 为不接受参考图（这类模型进不了 r2v 桶），executor 同样不裁剪，交给执行时的校验拒绝。r2v 桶解析不出时
         按未声明处理——带图单元本身会在各检查点因事实缺失被拦下，不在此另起来源。
         """
         result = facts.result("r2v")
@@ -1235,8 +1284,8 @@ class ScriptGenerator:
 
         返回 unit dict 列表（unit_id / text / duration_seconds / source_text），供内容确认整份转为正式剧本。
         校验：结构合法（``ReferenceScriptPlanDraft``）、units 非空、unit_id 唯一、
-        有结构档位时校验 unit ``duration_seconds`` ∈ ``supported_durations``；i2v 未知时只做
-        结构收编，随后由逐单元事实校验阻断无图单元。仅存在结构化前的旧 ``script_plan_reference_units.md`` 时给
+        ``supported_durations`` 只用于存量结构收编，时长准入随后按逐单元事实校验。
+        仅存在结构化前的旧 ``script_plan_reference_units.md`` 时给
         明确的「重跑拆分」报错——不写 md→json 迁移器（旧 md 产于结构化中间态引入前，
         与 narration 同决策）。
         """
@@ -1313,12 +1362,6 @@ class ScriptGenerator:
             raise ValueError(
                 f"script_plan_reference_units.json unit_id 改写到 episode={episode} 后重复: {rewritten_dupes}"
             )
-
-        if supported_durations is not None:
-            allowed = {int(d) for d in supported_durations}
-            bad = sorted({u["duration_seconds"] for u in units if u["duration_seconds"] not in allowed})
-            if bad:
-                raise ValueError(f"script_plan_reference_units.json unit 时长非法（不在 {sorted(allowed)} 内）: {bad}")
 
         return units
 
@@ -1449,19 +1492,25 @@ class ScriptGenerator:
     ) -> None:
         """转为正式剧本前判脚本规划已确认的单元时长仍在当前生效档位内；正文由之后的提示词编写改写并校验。
 
-        单元按此刻可用的参考图定桶（无引用、引用缺图或图未被清单认领落 i2v），须有所落桶的事实。
+        单元按此刻可用的参考图定桶（无引用、引用缺图或图未被清单认领落 i2v），须有所落桶的事实。越档时抛
+        ``UnitDurationOffTier``，按脚本规划里的单元位置称呼（与内容确认面板的「视频单元 N」同口径），不带内部单元 ID。
         """
-        for unit, hydration in zip(script_plan_units, self._hydrate_reference_units(script_plan_units), strict=True):
+        hydrations = self._hydrate_reference_units(script_plan_units)
+        for position, (unit, hydration) in enumerate(zip(script_plan_units, hydrations, strict=True), start=1):
             bucket = hydration.hydrated_generation_type
             facts.require(bucket)
-            off_tiers = self._unit_duration_off_every_tier(
-                unit["duration_seconds"], facts=facts, generation_type=bucket
-            )
+            duration = int(unit["duration_seconds"])
+            off_tiers = self._unit_duration_off_every_tier(duration, facts=facts, generation_type=bucket)
             if off_tiers is not None:
-                raise ValueError(
-                    f"unit {unit['unit_id']} 已确认时长 {unit['duration_seconds']}s 不在当前生效档位 "
-                    f"{sorted(set(off_tiers))} 内；通常是模型或分辨率配置变化让档位收窄导致，"
-                    "请调整配置回原档位，或重新拆分该集 script_plan 并重新完成内容确认"
+                tiers = sorted(set(off_tiers))
+                raise UnitDurationOffTier(
+                    f"视频单元 {position} 已确认时长 {duration}s 不在当前生效档位 {tiers} 内；"
+                    "通常是模型或分辨率配置变化让档位收窄导致，请调整配置回原档位，"
+                    "或在脚本规划里把该单元时长改到档位内（也可重新拆分该集 script_plan）后重新完成内容确认",
+                    unit_id=str(unit["unit_id"]),
+                    duration_seconds=duration,
+                    tiers=tiers,
+                    position=position,
                 )
 
     def _assert_reference_units_authorable(self, units: list[dict], *, facts: PlanningVideoFacts) -> None:
@@ -1477,11 +1526,85 @@ class ScriptGenerator:
             # 必然失败的时长在付费调用之前拦下；放到 _add_metadata 才拦，TextBackend 的费用已经产生。
             off_tiers = self._unit_duration_off_every_tier(duration, facts=facts, generation_type=bucket)
             if off_tiers is not None:
-                raise ValueError(
-                    f"unit {unit['unit_id']} 时长 {duration}s 不在当前生效档位 {sorted(set(off_tiers))} 内；"
-                    "通常是模型或分辨率配置变化让档位收窄导致，请调整配置回原档位，或在时间线上把该单元时长改到档位内"
+                tiers = sorted(set(off_tiers))
+                raise UnitDurationOffTier(
+                    f"unit {unit['unit_id']} 时长 {duration}s 不在当前生效档位 {tiers} 内；"
+                    "通常是模型或分辨率配置变化让档位收窄导致，请调整配置回原档位，或在时间线上把该单元时长改到档位内",
+                    unit_id=str(unit["unit_id"]),
+                    duration_seconds=duration,
+                    tiers=tiers,
                 )
         self._assert_reference_unit_text_valid(units, max_refs=self._resolve_max_refs(facts))
+
+    def _unit_rejection(
+        self, targets: PromptAuthoringTargets, exc: DraftViolation
+    ) -> PromptAuthoringUnitRejected | None:
+        """把正式脚本单元的预判违约转成任务失败的问题码：台词念不完带上估算秒数，其余违约只指出单元。
+
+        违约定位不到正式脚本里的单元时返回 None。
+        """
+        first = violation_items(exc)[0]
+        found = find_item(targets.script, first.item_id) if first.item_id else None
+        if found is None:
+            return None
+        position, unit = found
+        params: dict[str, Any] = {"unit_id": first.item_id, "position": position}
+        if first.code == "dialogue_overload":
+            spoken = dialogue_spoken_seconds(
+                str(unit.get("text") or ""),
+                self.project_json.get("source_language"),
+                project_speech_rate_override(self.project_json),
+            )
+            params.update(spoken_seconds=f"{spoken:.1f}", duration_seconds=int(unit["duration_seconds"]))
+            return PromptAuthoringUnitRejected(str(exc), code="prompt_authoring_dialogue_overload", params=params)
+        return PromptAuthoringUnitRejected(str(exc), code="prompt_authoring_unit_invalid", params=params)
+
+    @staticmethod
+    def _duration_rejection(
+        targets: PromptAuthoringTargets, exc: UnitDurationOffTier
+    ) -> PromptAuthoringUnitRejected | None:
+        """单元时长越出生效档位转成修改输入：按界面位置称呼单元，带上现时长与可选档位。定位不到时返回 None。"""
+        found = find_item(targets.script, exc.unit_id)
+        if found is None:
+            return None
+        params: dict[str, Any] = {
+            "unit_id": exc.unit_id,
+            "position": found[0],
+            "duration_seconds": exc.duration_seconds,
+            "tiers": " / ".join(str(tier) for tier in exc.tiers),
+        }
+        return PromptAuthoringUnitRejected(str(exc), code="prompt_authoring_duration_off_tier", params=params)
+
+    def _formal_unit_promotion_violation(
+        self, targets: PromptAuthoringTargets, exc: DraftViolation | UnitDurationOffTier
+    ) -> DraftViolation:
+        """晋升前正式剧本单元没过预判时的违约：仍是 ``DraftViolation``（晋升照常报 ``draft_invalid``），按界面位置称呼单元。
+
+        问题码与参数沿用编写入口的同一份预判结果（``_unit_rejection`` / ``_duration_rejection``），换成草稿
+        晋升的文案 key：呈现层按 ``code`` 与 ``params`` 本地化。消息面向 Agent，同样按「视频单元 N」称呼，
+        不带内部单元 ID。违约定位不到正式剧本里的单元时原样保留消息。
+        """
+        rejection = (
+            self._duration_rejection(targets, exc)
+            if isinstance(exc, UnitDurationOffTier)
+            else self._unit_rejection(targets, exc)
+        )
+        if rejection is None:
+            return exc if isinstance(exc, DraftViolation) else DraftViolation(str(exc), code="duration_off_tier")
+        params = {key: value for key, value in rejection.params.items() if key != "unit_id"}
+        unit_id = str(rejection.params["unit_id"])
+        code = _FORMAL_UNIT_PROMOTION_KEYS[rejection.code]
+        message = translate(code, **params)
+        if isinstance(exc, DraftViolation) and rejection.code == "prompt_authoring_unit_invalid":
+            # 正文违约的具体原因换成位置称呼后附上，Agent 据此知道该改什么；改不掉内部 ID 的条目不附。
+            label = f"视频单元 {params['position']}"
+            reasons = [
+                f"{label}{str(item)[len(item.label) :]}"
+                for item in violation_items(exc)
+                if item.item_id == unit_id and item.label and str(item).startswith(item.label)
+            ]
+            message += "".join(f"\n   - {reason}" for reason in reasons if unit_id not in reason)
+        return DraftViolation(message, code=code, params=params, item_id=unit_id)
 
     def _assert_reference_unit_text_valid(self, units: list[dict], *, max_refs: int | None) -> None:
         """按机器产物的严格口径预判正式脚本各 unit 正文，违约时把定位与出路指回时间线。
@@ -1522,6 +1645,7 @@ class ScriptGenerator:
                         locations=item.locations,
                         reason=item.reason,
                         action=item.action,
+                        item_id=str(unit["unit_id"]),
                     )
                     for item in violation_items(exc)
                 ]
@@ -1572,7 +1696,18 @@ class ScriptGenerator:
         units = list(targets.entries)
 
         def preflight() -> str | None:
-            self._assert_reference_units_authorable(units, facts=facts)
+            try:
+                self._assert_reference_units_authorable(units, facts=facts)
+            except DraftViolation as exc:
+                rejection = self._unit_rejection(targets, exc)
+                if rejection is None:
+                    raise
+                raise rejection from exc
+            except UnitDurationOffTier as exc:
+                rejection = self._duration_rejection(targets, exc)
+                if rejection is None:
+                    raise
+                raise rejection from exc
             return self._reference_prompt_authoring_draft_revision(episode)
 
         if await asyncio.to_thread(preflight) is not None:
@@ -1922,9 +2057,10 @@ class ScriptGenerator:
     ) -> Path:
         draft = read_quarantine(self.project_path, episode, QUARANTINE_KIND_PROMPT_AUTHORING)
         if draft is None:
+            draft_path = quarantine_path(self.project_path, episode, QUARANTINE_KIND_PROMPT_AUTHORING)
             raise FileNotFoundError(
                 f"集（id={episode}）没有可晋升的 prompt_authoring 待修复草稿"
-                f"（{quarantine_path(self.project_path, episode, QUARANTINE_KIND_PROMPT_AUTHORING)} 缺失或内容不是合法信封）"
+                f"（{draft_path.relative_to(self.project_path).as_posix()} 缺失或内容不是合法信封）"
             )
 
         filename = output_filename or formal_script_filename(self.project_path, self.project_json, episode)
@@ -1943,7 +2079,10 @@ class ScriptGenerator:
         units = list(targets.entries)
         # 与产出路径同一份预判：草稿在场期间用户可能在时间线上改过单元，不复判就会让改短时长后
         # 念不完的台词、或未登记的 @[名称] 借晋升一路落盘。
-        self._assert_reference_units_authorable(units, facts=facts)
+        try:
+            self._assert_reference_units_authorable(units, facts=facts)
+        except (DraftViolation, UnitDurationOffTier) as exc:
+            raise self._formal_unit_promotion_violation(targets, exc) from exc
         max_refs = self._resolve_max_refs(facts)
         try:
             authored = self._merge_reference_visual(units, json.dumps(draft.content), episode, max_refs=max_refs)

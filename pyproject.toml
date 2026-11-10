@@ -1,7 +1,7 @@
 [project]
 name = "arcreel"
 # managed by release-please — do not bump manually
-version = "0.33.0"
+version = "0.36.0"
 description = "AI video generation workspace"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -9,7 +9,7 @@ dependencies = [
     "claude-agent-sdk>=0.2.153",
     "fastapi>=0.138.2",
     # fastapi 未 re-export 的 ASGI 类型与 MutableHeaders / FormData / UploadFile 直接取自 starlette。
-    "starlette>=1.6.0",
+    "starlette>=1.8.0",
     "google-genai>=2.21.0",
     "Pillow>=12.1.1",
     "pydantic>=2.12.5",
@@ -33,7 +33,6 @@ dependencies = [
     "charset-normalizer>=3.4.6",
     "docx2txt>=0.9",
     "mammoth>=1.12.0",
-    "ebooklib>=0.20",
     "beautifulsoup4>=4.14.3",
     "lxml>=6.1.0",
     "packaging>=24.0",
@@ -52,6 +51,7 @@ dependencies = [
     "imageio-ffmpeg>=0.6.0",
     # 1.x 改用 httpx2，respx 与基于 httpx 的自定义 transport 拦截不到；约束见 docs/agents/dependencies.md。
     "anthropic>=0.125.0,<1",
+    "tos>=2.9.3",
 ]
 
 [dependency-groups]
@@ -70,6 +70,7 @@ dev = [
     "deptry>=0.24.0",
     "pytest-testmon>=2.2.0",
     "blockbuster>=1.5.29",
+    "anyio>=4.14.2",
 ]
 dramaos = [
     "scenedetect-headless==0.7.2",
@@ -107,7 +108,7 @@ timeout_method = "signal"
 # 并行不写进 addopts，只在 CI 命令里显式开（-n 4 --dist loadfile）：小选集并行更慢，
 # 每 worker 重新 import server.app 的固定开销吃掉全部收益，而本地调试几乎都是小选集。
 markers = [
-    "unit: 快速、隔离、不触达真实 I/O 或外部服务的测试",
+    "unit: 快速、隔离的测试；可只读访问仓库内已提交的文件，写文件只落在 tmp_path，不触达真实 DB、子进程、网络或外部服务",
     "integration: 跨模块真实协作测试；禁止 mock 被测 module 的公共入口（否则是在测 mock 本身）",
     "e2e: 端到端、依赖真实外部资源（远程 API、大模型调用、重型 ffmpeg 等）的测试；CI 默认跳过",
     "sqlite_only: 仅适用于 SQLite 的测试（依赖 SQLite 特定 fixture / 行为，PG CI job 会跳过）",
@@ -328,6 +329,7 @@ DEP002 = [
 # DEP004（import 了 dev 依赖）——tests/ 与 scripts/ 在扫描范围内，deptry 无法按目录区分
 # dev 与生产文件，故逐项列出它们正当 import 的测试框架包；其余 dev 依赖仍受本规则守护。
 DEP004 = [
+    "anyio",          # 回归测试直接构造 httpx 所用的 anyio 取消域
     "pytest",         # 测试框架
     "_pytest",        # pytest 的内部模块，根 conftest 复用其选择参数解析器
     "pytest_asyncio", # pytest 的 asyncio 插件，测试内直接用 @pytest_asyncio.fixture（本规则按模块名匹配）

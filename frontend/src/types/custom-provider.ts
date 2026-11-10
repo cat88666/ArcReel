@@ -101,8 +101,6 @@ export interface CustomProviderModelInfo {
   path_overrides: PathOverrides | null;
   /** 当前端点可修改地址的请求。 */
   requests: EndpointRequest[];
-  /** 正在引用该模型的全局 system_settings 键名（如 default_video_backend_i2v）；未被引用为 null。 */
-  global_bucket_refs: string[] | null;
 }
 
 /** 供应商模型对应到的模型条目摘要。`priced` 为 false 时条目没有可用的价目表，调用同样记为未定价。 */
@@ -119,14 +117,15 @@ export type ReferenceAudioMode = "none" | "direct";
 
 /** 后端 VideoCapabilities 中界面用得到的子集（后端另有 reference_audio_per_image、
  *  max_reference_audio_total_seconds、max_prompt_chars 等纯执行期维度，不在此声明）。
- *  参考图路径以 max_reference_images > 0 表达，
- *  不另设布尔位——两份声明会漂移出「称支持但上限为 0」这类自相矛盾的状态。 */
+ *  取值是调用端点声明与模型条目两侧求值的结果。参考图路径以 max_reference_images 表达：0 为不接受，
+ *  null 为接受但两侧都没有声明张数（未收录）；不另设布尔位——两份声明会漂移出「称支持但上限为 0」这类
+ *  自相矛盾的状态。参考音频段数上限同理。 */
 export interface VideoCapabilityFlags {
   first_frame: boolean;
   last_frame: boolean;
-  max_reference_images: number;
+  max_reference_images: number | null;
   reference_audio_mode: ReferenceAudioMode;
-  max_reference_audio_count: number;
+  max_reference_audio_count: number | null;
 }
 
 /** 成片音轨形态：可控 / 恒有声 / 恒无声。 */

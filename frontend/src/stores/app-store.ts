@@ -8,7 +8,7 @@ import type {
   WorkspaceNotificationTarget,
 } from "@/types";
 
-/** 提示上的操作按钮，用于可逆操作的「撤销」；点击后执行回调并关闭这条提示。 */
+/** 提示上的操作按钮，用于可逆操作的「撤销」，或在用户已离开时打开刚完成的结果（如「打开项目」）；点击后执行回调并关闭这条提示。 */
 interface ToastAction {
   label: string;
   onClick: () => void;
@@ -112,6 +112,11 @@ interface AppState {
   // Grid list invalidation signal (incremented on grid_ready SSE events)
   gridsRevision: number;
   invalidateGrids: () => void;
+
+  // 项目回收站失效信号：删除、恢复、清除（含 Agent 发起的）经项目事件 SSE 推来时自增，
+  // 文件视图据此重拉目录树与回收站分区。
+  trashRevision: number;
+  invalidateTrash: () => void;
 
   // 视频单元失效信号：参考生视频任务终态经项目事件 SSE 推来时自增，参考生
   // 视频画布据此重拉单元，生成完成后无需手动刷新即可看到成片。
@@ -273,6 +278,9 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   gridsRevision: 0,
   invalidateGrids: () => set((s) => ({ gridsRevision: s.gridsRevision + 1 })),
+
+  trashRevision: 0,
+  invalidateTrash: () => set((s) => ({ trashRevision: s.trashRevision + 1 })),
 
   referenceVideoUnitsRevision: 0,
   invalidateReferenceVideoUnits: () =>

@@ -23,6 +23,8 @@ from lib.infra.app_data_dir import app_data_dir
 
 PROJECT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9-]+$")
 PROJECT_FILENAME = "project.json"
+#: 全局资产库在数据根下的目录名；资产记录里的路径以数据根为基准，前缀即本目录名。
+GLOBAL_ASSETS_DIRNAME = "global_assets"
 
 
 def is_project_dir(path: Path) -> bool:
@@ -61,9 +63,14 @@ class DataRootLayout:
         return self.root / "projects"
 
     @property
+    def deleted_projects_dir(self) -> Path:
+        """已删除项目：被整体删除的项目以 ``<本目录>/<墓碑名>/`` 存放，保留期内可整体恢复。"""
+        return self.root / "deleted_projects"
+
+    @property
     def global_assets_dir(self) -> Path:
         """全局资产库；资产记录里的路径以数据根为基准，前缀即本目录名。"""
-        return self.root / "global_assets"
+        return self.root / GLOBAL_ASSETS_DIRNAME
 
     @property
     def users_dir(self) -> Path:
@@ -122,6 +129,7 @@ class DataRootLayout:
         会话启动之后才出现的目录不在 ``denyRead`` 中（内置读工具仍按数据根默认拒绝）。
         """
         return (
+            self.deleted_projects_dir,
             self.global_assets_dir,
             self.users_dir,
             self.log_dir,
@@ -154,6 +162,11 @@ class DataRootLayout:
     def project_migration_error_log_path(self) -> Path:
         """项目 schema 迁移的错误日志。"""
         return self.runtime_dir / "project-migration-errors.log"
+
+    @property
+    def auth_token_secret_path(self) -> Path:
+        """未设置 ``AUTH_TOKEN_SECRET`` 时自动生成的 JWT 签名密钥；仅属主可读写。"""
+        return self.runtime_dir / "auth-token-secret"
 
     @property
     def image_thumbnail_cache_dir(self) -> Path:

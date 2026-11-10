@@ -2,6 +2,7 @@
 // 在临时数据目录里启动后端、创建演示项目，按 RECORDINGS 逐个请求并写入 e2e/fixtures/recorded/。
 // 时间戳、临时数据目录、仓库检出路径、令牌与项目修订号改写成固定值，重录后只有接口形状的变化会出现在 diff 里。
 // 后端改动接口形状的 PR 同时重录。
+import { COMFYUI_AUDIO_ASPECT } from "./fixtures/comfyui.ts";
 import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
@@ -22,7 +23,7 @@ const DEMO_PROJECT = "demo";
 interface Recording {
   /** 替身文件名（不含扩展名）。 */
   file: string;
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "DELETE";
   /** 页面实际请求的路径；带查询串时写全，参数顺序不限。查询串不同的请求分别录制。 */
   path: string;
   /** 不带令牌请求。 */
@@ -42,6 +43,7 @@ const LOGIN: Recording = {
 };
 
 const RECORDINGS: Recording[] = [
+  { file: "comfyui-audio-aspect-infer", method: "POST", path: "/api/v1/custom-endpoints/comfyui/infer", json: COMFYUI_AUDIO_ASPECT },
   { file: "auth-status", method: "GET", path: "/api/v1/auth/status", anonymous: true },
   LOGIN,
   { file: "system-config", method: "GET", path: "/api/v1/system/config" },
@@ -50,6 +52,7 @@ const RECORDINGS: Recording[] = [
   { file: "custom-providers-endpoints", method: "GET", path: "/api/v1/custom-providers/endpoints" },
   { file: "onboarding-status", method: "GET", path: "/api/v1/onboarding/status" },
   { file: "projects", method: "GET", path: "/api/v1/projects" },
+  { file: "deleted-projects", method: "GET", path: "/api/v1/deleted-projects" },
   { file: "project-demo", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}` },
   // 工作区与集页的启动请求（项目事件流是 SSE，不录制，场景里按需替换）。
   { file: "tasks", method: "GET", path: "/api/v1/tasks?page_size=200" },
@@ -75,6 +78,8 @@ const RECORDINGS: Recording[] = [
   { file: "provider-gemini-aistudio-multiplier", method: "GET", path: "/api/v1/providers/gemini-aistudio/multiplier" },
   { file: "provider-gemini-aistudio-models", method: "GET", path: "/api/v1/providers/gemini-aistudio/models" },
   { file: "system-config-model-candidates", method: "GET", path: "/api/v1/system/config/model-candidates" },
+  // 默认模型「自动选择」的实际模型（录制环境没有供应商，各用途都选不出），全局设置、项目设置与新建项目向导共用。
+  { file: "system-config-auto-backends", method: "GET", path: "/api/v1/system/config/auto-backends" },
   // 全局设置：访问令牌列表（录制环境没有令牌，多条目由场景替换）。
   { file: "api-keys", method: "GET", path: "/api/v1/api-keys" },
   // 全局设置「ArcReel Agent」：Agent 供应商列表（录制环境为空）与添加对话框的预设供应商目录。
@@ -108,6 +113,10 @@ const RECORDINGS: Recording[] = [
     path: "/api/v1/custom-providers/endpoints/newapi-video/definition",
   },
   { file: "market-submissions", method: "GET", path: "/api/v1/market/submissions" },
+  // 全局设置「素材库与存储」：对象存储连接与新增图片保存位置（录制环境没有连接，保存位置为本地）、素材库账号与推理凭证绑定（为空）；已配置的状态由场景替换。
+  { file: "object-storage-connection", method: "GET", path: "/api/v1/object-storage/connection" },
+  { file: "asset-library-accounts", method: "GET", path: "/api/v1/asset-library/accounts" },
+  { file: "asset-library-bindings", method: "GET", path: "/api/v1/asset-library/bindings" },
   // 全局设置「市场」：市场源（录制环境只有内置的官方源，从未刷新）与条目快照（为空）；刷新、聚合与条目详情访问外网，由场景替换。
   { file: "market-sources", method: "GET", path: "/api/v1/market/sources" },
   { file: "market-entries", method: "GET", path: "/api/v1/market/entries?type=endpoint" },
@@ -122,11 +131,17 @@ const RECORDINGS: Recording[] = [
   { file: "project-demo-agent-memory", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/agent-memory` },
   // 项目「分集」视图：演示项目没有整本源文，只有一集无原文的集；整本源文、多集与未登记文件由场景替换。
   { file: "project-demo-episodes-view", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/episodes-view` },
+  // 项目「文件」视图：项目根与 scripts 目录（演示项目只有一集的空正式脚本；多文件、长文件名与预览正文由场景替换）。
+  { file: "project-demo-file-view", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/file-view?path=` },
+  { file: "project-demo-file-view-scripts", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/file-view?path=scripts` },
+  // 文件视图的「项目回收站」分区：演示项目没有删除记录，多条记录由场景替换。
+  { file: "project-demo-trash", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/trash` },
   // 集页「多宫格分镜图」：宫格档位上限与宫格记录（演示项目没有宫格，多组联合图由场景替换）。
   { file: "project-demo-grid-capability", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/grid-capability` },
   { file: "project-demo-grids", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/grids` },
   // 集页剪辑视图：演示集还没有视频，也就没有剪辑时间线，显示空状态；有剪辑时间线的读取结果与出片现状由场景替换。
   { file: "project-demo-edit-timelines", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/edit-timelines?episode=1` },
+  { file: "comfyui-audio-aspect-create", method: "POST", path: "/api/v1/custom-endpoints", json: COMFYUI_AUDIO_ASPECT },
 ];
 
 // 资产库里的演示资产：两个角色、一个场景、一个道具，都没有图片。
@@ -162,7 +177,8 @@ function normalize(value: unknown, dataDir: string): unknown {
   if (typeof value === "string") {
     if (ISO_TIMESTAMP.test(value)) return FIXED_NOW;
     if (UUID.test(value)) return fixedUuid(value);
-    return value.replaceAll(dataDir, "<data-dir>").replaceAll(REPO_ROOT, "<repo-root>");
+    return value.replaceAll(dataDir, "<data-dir>").replaceAll(REPO_ROOT, "<repo-root>")
+      .replace(/#deleted-\d{8}T\d{6}Z$/, "#deleted-20260101T080000Z");
   }
   if (Array.isArray(value)) return value.map((item) => normalize(item, dataDir));
   if (value && typeof value === "object") {
@@ -243,10 +259,13 @@ async function main() {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ARCREEL_DATA_DIR: dataDir,
+    ARCREEL_SKIP_CATALOG_SYNC: "1",
     AUTH_ENABLED: "true",
     AUTH_USERNAME: USERNAME,
     AUTH_PASSWORD: PASSWORD,
     AUTH_TOKEN_SECRET: "e2e-token-secret-for-recording-only",
+    // 后端启动时会读 .env（含向上查找到的主仓 .env），里面的 DATABASE_URL 会把录制接到开发者的库。
+    PYTHON_DOTENV_DISABLED: "1",
   };
   // 数据库落在临时数据目录里，不碰开发者自己的库。
   delete env.DATABASE_URL;
@@ -275,6 +294,8 @@ async function main() {
     // 一集还没有分镜的空正式脚本，集页显示「新增第一个分镜」。
     await postJson(baseUrl, token, `/api/v1/projects/${DEMO_PROJECT}/episodes`, { title: "第一集" });
     await postJson(baseUrl, token, `/api/v1/projects/${DEMO_PROJECT}/episodes/1/blank-script`, {});
+    await postJson(baseUrl, token, "/api/v1/projects", { name: "deleted-demo", title: "已删除演示项目", generation_mode: "storyboard" });
+    await request(baseUrl, token, { method: "DELETE", path: "/api/v1/projects/deleted-demo" });
     // 资产库按更新时间倒序列出，逐个创建使顺序与 LIBRARY_ASSETS 相反、且每次录制一致。
     for (const asset of LIBRARY_ASSETS) await postForm(baseUrl, token, "/api/v1/assets", asset);
 

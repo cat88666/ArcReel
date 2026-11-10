@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict
 
 from lib.infra.api_errors import NotFoundError, UnprocessableError
 from lib.infra.async_thread import run_sync_transaction
+from lib.project import asset_trash
 from lib.project.asset_merge import (
     MERGEABLE_ASSET_TYPES,
     AssetMergeNotFoundError,
@@ -36,11 +37,13 @@ from lib.project.asset_rename import (
     AssetRenameFileCollisionError,
     AssetRenameHistoryCollisionError,
     AssetRenameNotFoundError,
+    foreign_named_file_field,
 )
 from lib.project.asset_types import (
     ALIASES_FIELD,
     ASSET_SPECS,
     DERIVATIVES_FIELD,
+    AssetSpec,
     ProjectAssetNameConflictError,
     localize_asset_type,
     record_asset_aliases,
@@ -96,6 +99,16 @@ def _require_string_list_fields(values: Mapping[str, Any], fields: Iterable[str]
             raise UnprocessableError("asset_field_must_be_string_list").with_diagnostic(
                 f"field '{field}' must be a list of strings"
             )
+
+
+def _require_owned_files(spec: AssetSpec, name: str, entry: Mapping[str, Any], values: Mapping[str, Any]) -> None:
+    """资产图、参考图与参考音频只能指向本资产名下的文件：共用别的资产的文件，改名、删除与恢复之后会悬空。"""
+    field = foreign_named_file_field(spec, name, entry, values)
+    if field is not None:
+        key = "asset_sheet_file_not_owned" if field == spec.sheet_field else "asset_reference_file_not_owned"
+        raise UnprocessableError(key, name=name).with_diagnostic(
+            f"field '{field}' must point at a file named after the asset"
+        )
 
 
 class _InvalidFieldValue(Exception):
@@ -234,6 +247,7 @@ def build_asset_router(
                 # 同名校验一样须走翻译。
                 raise UnprocessableError("asset_voice_notice_dismissed_at_stale")
         _require_string_list_fields(extras, spec.extra_list_fields)
+        _require_owned_files(spec, name, {}, extras)
         try:
 
             def _sync():
@@ -256,7 +270,11 @@ def build_asset_router(
                 if not ok:
                     raise HTTPException(status_code=409, detail=_t(keys["exists"], name=name))
                 data = manager.load_project(project_name)
-                return {"success": True, result_key: data[spec.bucket_key][name]}
+                # 回收站里有同名的删除记录时告诉前端，提示创作者可以把之前的资产图找回来。
+                trash_record = asset_trash.deleted_asset_record(
+                    manager.get_project_path(project_name), asset_type, name
+                )
+                return {"success": True, result_key: data[spec.bucket_key][name], "trash_record_id": trash_record}
 
             return await run_sync_transaction(_sync)
         except ProjectAssetNameConflictError as exc:
@@ -291,6 +309,7 @@ def build_asset_router(
                 manager = pm_getter()
 
                 def _mutate(entry: dict) -> None:
+                    _require_owned_files(spec, entry_name, entry, req)
                     for field in (*update_fields, *update_list_fields):
                         if req.get(field) is not None:
                             # voice_notice_dismissed_at 语义是「已确认到的声音版本」，必须原样
@@ -331,6 +350,8 @@ def build_asset_router(
         except FileNotFoundError as exc:
             raise NotFoundError("project_not_found", name=project_name) from exc
         except HTTPException:
+            raise
+        except UnprocessableError:
             raise
         except Exception as exc:
             logger.exception("请求处理失败")

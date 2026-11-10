@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, TypeGuard
 
 from lib.custom_provider.comfyui.artifacts import expected_suffixes_text
@@ -34,7 +34,9 @@ CAPABILITY_FAILURE_CODES: frozenset[str] = frozenset(
         "image_dashscope_4k_t2i_only",
         "image_endpoint_mismatch_no_i2i",
         "image_endpoint_mismatch_no_t2i",
+        "image_reference_images_exceeded",
         "image_reference_images_unreadable",
+        "image_seedream_edits_unavailable",
         "ref_payload_floor_exceeded",
         "video_capability_missing_t2v",
         "video_duration_invalid",
@@ -112,6 +114,18 @@ VIDEO_REQUEST_FACTS_FAILURE_CODES: frozenset[str] = frozenset(
     }
 )
 
+# 生成时的供应商素材：适用关联尚未可用或入库失败（``lib.asset_library.generation_inputs``），以及供应商以
+# 输入图片未通过审核拒绝请求（``lib.backends.provider_assets``）。后者能确定被拒图片时带上图片编号与名称。
+PROVIDER_ASSET_FAILURE_CODES: frozenset[str] = frozenset(
+    {
+        "provider_asset_link_failed",
+        "provider_asset_link_processing",
+        "provider_input_asset_rejected_at",
+        "provider_input_image_rejected",
+        "provider_input_image_rejected_at",
+    }
+)
+
 # Stable failure code -> i18n errors key. The code is agent-facing and persisted
 # in the DB; the key resolves to zh/en/vi templates rendered at read time.
 FAILURE_CODE_KEYS: dict[str, str] = {
@@ -119,9 +133,14 @@ FAILURE_CODE_KEYS: dict[str, str] = {
     **{code: code for code in REFERENCE_PROJECTION_FAILURE_CODES},
     **{code: code for code in GENERATION_INPUT_FAILURE_CODES},
     **{code: code for code in VIDEO_REQUEST_FACTS_FAILURE_CODES},
+    **{code: code for code in PROVIDER_ASSET_FAILURE_CODES},
     "provider_unsupported_media": "task_fail_provider_unsupported_media",
-    # 内置供应商的模型引用不在模型清单中（已下架或改名）：引用原样保留，由用户重新选择。
+    # 配音语速超出所选模型的取值范围：提交前拒绝，没有发出计费请求。
+    "narration_tts_speed_out_of_range": "narration_tts_speed_out_of_range",
+    # 内置供应商的模型引用不在模型清单中（已改名或从未收录）：引用原样保留，由用户重新选择。
     "model_not_in_provider_catalog": "model_not_in_provider_catalog",
+    # 引用的模型已下线：带下线日期与官方后继，没有登记的那一句按 failure_message_key 换用省去它的文案。
+    "model_discontinued": "model_discontinued",
     # 上游确定性 4xx 拒绝。params 里的 provider_reason 是脱敏截断后的上游原文，刻意不进
     # 译文模板：它不该被翻译，读侧按独立字段原样展示。
     "provider_rejected": "task_fail_provider_rejected",
@@ -142,6 +161,8 @@ FAILURE_CODE_KEYS: dict[str, str] = {
     "declarative_template_render_failed": "task_fail_declarative_template_render_failed",
     "declarative_response_extract_failed": "task_fail_declarative_response_extract_failed",
     "declarative_image_save_failed": "task_fail_declarative_image_save_failed",
+    "comfyui_reference_audio_invalid": "task_fail_comfyui_reference_audio_invalid",
+    "comfyui_aspect_ratio_unmapped": "task_fail_comfyui_aspect_ratio_unmapped",
     # 参考图或首尾帧不足时的改图失败：级联触到产物节点，这份 workflow 出片本身依赖那张图。
     "comfyui_image_drop_unsupported": "task_fail_comfyui_image_drop_unsupported",
     "comfyui_upload_failed": "task_fail_comfyui_upload_failed",
@@ -150,6 +171,10 @@ FAILURE_CODE_KEYS: dict[str, str] = {
     "comfyui_execution_error": "task_fail_comfyui_execution_error",
     "comfyui_interrupted": "task_fail_comfyui_interrupted",
     "comfyui_output_missing": "task_fail_comfyui_output_missing",
+    # 图片供应商成功响应却没带回图片（多为内容安全过滤）：见 ImageOutputMissingError。
+    "image_output_missing": "task_fail_image_output_missing",
+    # 返回的图片格式转不成位图（如矢量 SVG）：见 ImageOutputFormatError。
+    "image_output_format_unsupported": "task_fail_image_output_format_unsupported",
     "comfyui_output_type_mismatch": "task_fail_comfyui_output_type_mismatch",
     "comfyui_output_container_mismatch": "task_fail_comfyui_output_container_mismatch",
     "artifact_download_failed": "task_fail_artifact_download_failed",
@@ -353,6 +378,17 @@ def bound_reason(reason: str, limit: int) -> str:
 _COMFYUI_ARTIFACT_MISMATCH_CODES = frozenset({"comfyui_output_type_mismatch", "comfyui_output_container_mismatch"})
 
 
+def failure_message_key(code: str, params: Mapping[str, Any]) -> str:
+    """已登记失败码的文案 key。``model_discontinued`` 按参数里有没有下线日期与后继，选用省去对应一句的文案。"""
+    key = FAILURE_CODE_KEYS[code]
+    if code == "model_discontinued":
+        if not params.get("shutdown_date"):
+            key += "_undated"
+        if not params.get("successor"):
+            key += "_no_successor"
+    return key
+
+
 def render_failure(error_message: str | None, translate: Callable[..., str], names: DisplayNames) -> str | None:
     """Render a stored failure reason for display via the request Translator.
 
@@ -390,7 +426,7 @@ def render_failure(error_message: str | None, translate: Callable[..., str], nam
     if code in _COMFYUI_ARTIFACT_MISMATCH_CODES:
         media_type = params.get("media_type")
         params = {**params, "expected": expected_suffixes_text(media_type if isinstance(media_type, str) else "")}
-    return render_generation_input_error(FAILURE_CODE_KEYS[code], params, translate, names)
+    return render_generation_input_error(failure_message_key(code, params), params, translate, names)
 
 
 def parse_failure(error_message: str | None) -> tuple[str, dict[str, Any]] | None:

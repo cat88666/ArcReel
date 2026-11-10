@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import date
 from typing import Annotated, Any, Literal, assert_never, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -30,10 +31,12 @@ from arcreel_catalog_core import (
     VideoFacts,
     dump_entry,
 )
+from lib.backends.backend_assembly.specs import PROVIDER_ONLY_ENDPOINTS, builtin_model_endpoint
 from lib.billing.multipliers import get_provider_multiplier
 from lib.catalog import builtin_discovery, builtin_models
 from lib.catalog import query as catalog
 from lib.catalog.composition import EntrySource
+from lib.catalog.lifecycle import Lifecycle, LifecycleStatus, entry_lifecycle
 from lib.catalog.price_summary import summarize_price
 from lib.catalog.reload_order import LatestReadWins
 from lib.catalog.user_entries import (
@@ -44,8 +47,8 @@ from lib.catalog.user_entries import (
     reload_user_entries,
     save_user_entry,
 )
+from lib.config.model_setting_keys import GLOBAL_MODEL_SETTING_KEYS
 from lib.config.registry import PROVIDER_REGISTRY
-from lib.config.retired_model_ids import GLOBAL_MODEL_SETTING_KEYS, PROJECT_MODEL_SETTING_KEYS
 from lib.config.service import ConfigService
 from lib.custom_provider import is_custom_provider, make_provider_id, parse_provider_id
 from lib.custom_provider.capability_view import (
@@ -58,6 +61,7 @@ from lib.custom_provider.capability_view import (
 from lib.custom_provider.discovery_formats import is_comfyui_protocol
 from lib.custom_provider.duration_presets import infer_supported_durations
 from lib.custom_provider.endpoint_resolution import resolve_endpoint_spec
+from lib.custom_provider.endpoints import get_endpoint_spec
 from lib.custom_provider.model_facts import entry_summary, model_entry
 from lib.db import get_async_session
 from lib.db.models.custom_provider import CustomProviderModel
@@ -71,18 +75,32 @@ from server.routers.custom_providers import (
     CUSTOM_MODEL_SETTING_FIELDS,
     EndpointRequestDescriptor,
     add_custom_model,
+    cleanup_project_model_refs,
     custom_model_settings,
     discover_custom_provider_models,
     invalidate_provider_caches,
     remove_custom_model,
+    rename_project_model_refs,
     update_custom_model,
 )
+from server.services.project.model_references import project_model_references
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/providers", tags=["Providers"])
 
-ModelFlag = Literal["discontinued", "unpriced", "modified"]
+ModelFlag = Literal["discontinued", "retiring", "unpriced", "modified"]
+
+
+class LifecycleResponse(BaseModel):
+    """供应商模型所对应条目在今天的生命周期（UTC 日期）：状态、关停日期与官方后继（「模型厂商/官方模型名」）。
+
+    对应不上条目的模型为 ``available``，两个日期字段为 ``null``。
+    """
+
+    status: LifecycleStatus
+    shutdown_date: date | None = None
+    successor: str | None = None
 
 
 class PriceSummaryItemResponse(BaseModel):
@@ -104,10 +122,15 @@ class ProviderModelItem(BaseModel):
 
     - ``model_id``：设置与项目里引用这个模型的模型键；``api_model_name`` 是发给供应商的模型名。
     - ``display_name``：对应条目的显示名（自定义供应商取用户填写的名字）；没有时为 ``null``，界面显示模型 ID。
+    - ``is_default``：实际生效的默认模型；停用或已下线的模型不标，自定义供应商存下的默认设置不因此改动。
     - ``official``：内置供应商官方收录的模型，只能启用、停用；用户添加的与自定义供应商的模型为 ``false``。
-    - ``flags``：``discontinued`` 条目已下架；``unpriced`` 调用费用会记为未定价（对应不上条目或条目没有价格，
+    - ``flags``：``discontinued`` 条目已下线；``retiring`` 条目即将下线（关停日期在 ``lifecycle``）；``unpriced`` 调用费用会记为未定价（对应不上条目或条目没有价格，
       两级倍率之积为 0 时不计费，不标）；``modified`` 用户改过对应的条目，不再随官方更新。
     - ``endpoint``：自定义供应商模型的调用端点键；内置供应商为 ``null``。
+    - ``lifecycle``：所对应条目在今天的生命周期。已下线的模型仍在列表里，但不进入任何候选、也不能调用。
+    - ``min_app_version``：官方收录的模型标注的最低应用版本；没有标注、或不是官方收录的模型时为 ``null``。
+    - ``min_app_version_satisfied``：应用版本达到 ``min_app_version``。不满足的模型排在列表末尾，``enabled`` 与
+      ``is_default`` 为假，不进入任何候选、不作默认模型、也不能调用；不能启用，也没有模型设置可读（docs/adr/0103）。
     """
 
     model_id: str
@@ -119,7 +142,10 @@ class ProviderModelItem(BaseModel):
     official: bool
     flags: list[ModelFlag]
     price: PriceSummaryResponse | None
+    lifecycle: LifecycleResponse
     endpoint: str | None = None
+    min_app_version: str | None = None
+    min_app_version_satisfied: bool = True
 
 
 class ProviderModelsResponse(BaseModel):
@@ -138,8 +164,8 @@ class ProviderModelEnabledUpdate(BaseModel):
 
 class AddProviderModelRequest(BaseModel):
     """按 ID 添加：``media_type`` 用来区分两栖模型，以及给对应不上条目的模型指定媒体类型；``entry_binding`` 是
-    用户为它指定的条目（「模型厂商/官方模型名」）。``endpoint`` 是自定义供应商模型的调用端点，不给时按名字推断
-    （docs/adr/0105）；内置供应商不接受。"""
+    用户为它指定的条目（「模型厂商/官方模型名」）。``endpoint`` 是新模型的调用端点，不给时按名字推断
+    （docs/adr/0105）；内置供应商只接受它在该媒体类型下的内置调用端点，对上官方收录的模型时忽略。"""
 
     model_id: Annotated[str, Field(min_length=1, max_length=128)]
     media_type: MediaType | None = None
@@ -187,11 +213,13 @@ class AddProviderModelResponse(BaseModel):
 
 
 class CapabilityViewResponse(BaseModel):
-    """「这个供应商支持的参数」：每个维度的原值（没有能力覆盖时运行时采用的值，``null`` 表示不加约束）、生效的能力
-    覆盖与生效值。``editable`` 是可以修改的维度，按界面顺序；官方收录的模型为空。"""
+    """「这个供应商支持的参数」：每个维度的原值（没有能力覆盖时运行时采用的值，``null`` 表示未收录）、生效的能力
+    覆盖与生效值。``editable`` 是可以修改的维度，按界面顺序；官方收录的模型为空。``displayed`` 是界面要显示的全部维度，
+    按界面顺序，不在 ``editable`` 里的只读。"""
 
     media_type: str
     editable: list[str]
+    displayed: list[str]
     base: dict[str, Any]
     overrides: dict[str, Any]
     effective: dict[str, Any]
@@ -213,6 +241,7 @@ class SharedProviderResponse(BaseModel):
 class EntryInfoResponse(BaseModel):
     """供应商模型对应到的条目（合成后），供 Sheet 下段「模型信息」。
 
+    - ``discontinued``：条目在今天（UTC 日期）是否已下线，含关停日期已到的条目。
     - ``price``：价目表（目录数据的格式，可直接作为 ``EntryUpdate.price`` 回写）；没有价目表时为 ``null``。
     - ``source``：``official`` 跟随官方；``modified`` 用户改过，不再随官方更新；``user_created`` 用户新建、由用户填写。
     - ``official``：用户改过、或用户新建的条目日后被官方数据收录时，官方数据里的值（可「恢复官方数据」「改用官方数据」）；
@@ -235,6 +264,15 @@ class EntryInfoResponse(BaseModel):
     shared_with: list[SharedProviderResponse]
 
 
+class EndpointOption(BaseModel):
+    """内置供应商下用户添加的模型可选的一个调用端点。``display_name_key`` 是界面文案的 i18n key（dashboard ns），
+    声明式端点为空串，名字取 ``display_name``。"""
+
+    key: str
+    display_name_key: str
+    display_name: str | None = None
+
+
 class ProviderModelDetail(BaseModel):
     """供应商模型 Sheet 的内容。
 
@@ -245,6 +283,8 @@ class ProviderModelDetail(BaseModel):
       模型没有绑定。
     - 自定义供应商的模型另有 ``endpoint``、``resolution``、``path_overrides`` 与 ``requests``（调用端点可覆盖路径的
       请求）；内置供应商为空。
+    - 内置供应商下用户添加的模型另有 ``endpoint``（挂接的内置调用端点）与 ``endpoint_options``（这个供应商在该媒体类型下
+      可选的内置调用端点，按声明顺序）；官方收录的模型两者为空，端点跟随官方。
     """
 
     model: ProviderModelItem
@@ -257,6 +297,7 @@ class ProviderModelDetail(BaseModel):
     resolution: str | None = None
     path_overrides: dict[str, str] | None = None
     requests: list[EndpointRequestDescriptor] = []
+    endpoint_options: list[EndpointOption] = []
 
 
 class EntryUpdate(BaseModel):
@@ -276,11 +317,12 @@ class ProviderModelSettingsUpdate(BaseModel):
     """保存供应商模型 Sheet 的供应商设置与模型信息；没有传的字段不改。
 
     - 所有供应商模型：``enabled``，以及 ``entry``（修改对应的条目，存为用户副本，条目从此不再随官方更新）。
-    - 用户负责的模型：``model_id``（改模型 ID）、``multiplier``、``capability_overrides``（整份替换，``null`` 或
+    - 用户负责的模型：``model_id``（改模型 ID）、``endpoint``（调用端点；内置供应商只能选它在该媒体类型下的内置调用
+      端点）、``multiplier``、``capability_overrides``（整份替换，``null`` 或
       空对象表示清除）、``entry_binding``（关联到目录里的另一个模型，须是同媒体类型的现有条目；``null`` 解除，改回
       按名字对应）、``new_entry``（目录里找不到时手动填写：新建条目并绑定到它，目录里已有同名模型时 422；与
       ``entry_binding`` 同传时以 ``new_entry`` 为准）。条目与绑定都随这一次保存写入，任一步被拒则都不落库。
-    - 自定义供应商的模型：``is_default``、``endpoint``、``path_overrides``、``resolution``。
+    - 自定义供应商的模型：``is_default``、``path_overrides``、``resolution``。
     """
 
     enabled: bool | None = None
@@ -330,6 +372,7 @@ async def reload_user_added_models(session: AsyncSession) -> None:
                 capability_overrides=user_added_runtime_overrides(
                     row.media_type, row.capability_overrides, model_id=row.model_id
                 ),
+                endpoint=row.endpoint,
             )
             for row in rows
             if row.media_type in MEDIA_TYPES
@@ -337,16 +380,22 @@ async def reload_user_added_models(session: AsyncSession) -> None:
     )
 
 
-def _flags(entry: CatalogEntry | None, multiplier: float) -> list[ModelFlag]:
+def _flags(entry: CatalogEntry | None, multiplier: float, state: Lifecycle) -> list[ModelFlag]:
     flags: list[ModelFlag] = []
-    if entry is not None and entry.discontinued:
+    if state.status == "discontinued":
         flags.append("discontinued")
+    elif state.status == "retiring":
+        flags.append("retiring")
     priced = entry is not None and entry.price is not None and entry.price.is_priceable
     if not priced and multiplier != 0:
         flags.append("unpriced")
     if entry is not None and catalog.entry_source(entry.key) == "modified":
         flags.append("modified")
     return flags
+
+
+def _lifecycle(state: Lifecycle) -> LifecycleResponse:
+    return LifecycleResponse(status=state.status, shutdown_date=state.shutdown_date, successor=state.successor)
 
 
 def _price(entry: CatalogEntry | None) -> PriceSummaryResponse | None:
@@ -364,16 +413,25 @@ def _price(entry: CatalogEntry | None) -> PriceSummaryResponse | None:
 
 def _builtin_item(item: builtin_models.BuiltinModelItem, provider_multiplier: float) -> ProviderModelItem:
     view = item.view
+    return _builtin_view_item(view, provider_multiplier, enabled=item.enabled, is_default=item.is_default)
+
+
+def _builtin_view_item(
+    view: catalog.ProviderModelView, provider_multiplier: float, *, enabled: bool, is_default: bool
+) -> ProviderModelItem:
     return ProviderModelItem(
         model_id=view.model_id,
         api_model_name=view.api_model_name,
         display_name=view.entry.display_name if view.entry is not None else None,
         media_type=cast("MediaType", view.model.media_type),
-        enabled=item.enabled,
-        is_default=item.is_default,
+        enabled=enabled,
+        is_default=is_default,
         official=view.official,
-        flags=_flags(view.entry, provider_multiplier * view.multiplier),
+        flags=_flags(view.entry, provider_multiplier * view.multiplier, view.lifecycle),
         price=_price(view.entry),
+        lifecycle=_lifecycle(view.lifecycle),
+        min_app_version=view.min_app_version,
+        min_app_version_satisfied=view.min_app_version_satisfied,
     )
 
 
@@ -398,16 +456,19 @@ def _custom_item(row: CustomProviderModel, media_type: MediaType, provider_multi
         row.model_id, media_type=media_type, binding=catalog.binding_key(row.entry_binding, media_type)
     )
     display_name = row.display_name.strip() if row.display_name and row.display_name.strip() != row.model_id else None
+    state = entry_lifecycle(entry)
     return ProviderModelItem(
         model_id=row.model_id,
         api_model_name=row.model_id,
         display_name=display_name or (entry.display_name if entry is not None else None),
         media_type=media_type,
         enabled=row.is_enabled,
-        is_default=row.is_enabled and row.is_default,
+        # 与内置供应商一致：列表里的默认标记是实际生效的默认，停用或下线后不再标出（默认模型解析同样跳过它）
+        is_default=row.is_enabled and row.is_default and not state.discontinued,
         official=False,
-        flags=_flags(entry, provider_multiplier * row.multiplier),
+        flags=_flags(entry, provider_multiplier * row.multiplier, state),
         price=_price(entry),
+        lifecycle=_lifecycle(state),
         endpoint=row.endpoint,
     )
 
@@ -431,10 +492,22 @@ def _raise_for(exc: builtin_models.BuiltinModelError, _t: Translator) -> HTTPExc
     return HTTPException(status_code=404 if exc.not_found else 422, detail=_t(exc.code, **exc.params))
 
 
-async def _builtin_items(session: AsyncSession, provider_id: str) -> list[ProviderModelItem]:
+async def _builtin_items(
+    session: AsyncSession, provider_id: str, *, include_version_gated: bool = False
+) -> list[ProviderModelItem]:
+    """内置供应商的模型行。``include_version_gated`` 时在末尾加上应用版本不够的官方收录模型：只显示所需版本，
+    不启用、不作默认（docs/adr/0103）。"""
     provider_multiplier = await get_provider_multiplier(session, provider_id)
-    items = await builtin_models.list_builtin_models(session, provider_id)
-    return [_builtin_item(item, provider_multiplier) for item in items]
+    items = [
+        _builtin_item(item, provider_multiplier)
+        for item in await builtin_models.list_builtin_models(session, provider_id)
+    ]
+    if include_version_gated:
+        items += [
+            _builtin_view_item(view, provider_multiplier, enabled=False, is_default=False)
+            for view in catalog.version_gated_models(provider_id)
+        ]
+    return items
 
 
 @router.get("/{provider_id}/models", response_model=ProviderModelsResponse)
@@ -453,7 +526,7 @@ async def list_provider_models(
         )
     _require_builtin(provider_id, _t)
     return ProviderModelsResponse(
-        models=await _builtin_items(session, provider_id),
+        models=await _builtin_items(session, provider_id, include_version_gated=True),
         discoverable=builtin_discovery.is_discoverable(provider_id),
     )
 
@@ -535,11 +608,6 @@ async def add_provider_model(
             raise HTTPException(status_code=404, detail=_t("provider_model_not_found", model=model_id))
         return AddProviderModelResponse(model=item, official=False)
     _require_builtin(provider_id, _t)
-    if body.endpoint is not None:
-        raise HTTPException(
-            status_code=422,
-            detail=_t("provider_model_setting_not_applicable", model=body.model_id, setting="endpoint"),
-        )
     try:
         added = await builtin_models.add_builtin_model(
             session,
@@ -548,6 +616,7 @@ async def add_provider_model(
             media_type=body.media_type,
             entry_binding=body.entry_binding,
             inferred_media_type=builtin_discovery.name_media_type(provider_id, body.model_id.strip()),
+            endpoint=body.endpoint,
         )
     except builtin_models.BuiltinModelError as exc:
         raise _raise_for(exc, _t) from exc
@@ -637,13 +706,14 @@ async def remove_provider_model(
     _t: Translator,
     session: AsyncSession = Depends(get_async_session),
 ) -> Response:
-    """移除用户负责的模型：自定义供应商的模型（同时清空全局设置里指向它的引用），或内置供应商下用户添加的模型。
+    """移除用户负责的模型：自定义供应商的模型（同时清空全局设置与项目里指向它的引用），或内置供应商下用户添加的模型。
     官方收录的模型只能停用。"""
     if is_custom_provider(provider_id):
         db_id = await _custom_db_id(session, provider_id, _t)
         await remove_custom_model(session, db_id, model_id, _t)
         await session.commit()
         await invalidate_provider_caches(request)
+        await cleanup_project_model_refs(db_id, {model_id})
         return Response(status_code=204)
     _require_builtin(provider_id, _t)
     try:
@@ -658,10 +728,13 @@ async def remove_provider_model(
 
 def _capabilities_response(view: CapabilityView | None, media_type: str) -> CapabilityViewResponse:
     if view is None:
-        return CapabilityViewResponse(media_type=media_type, editable=[], base={}, overrides={}, effective={})
+        return CapabilityViewResponse(
+            media_type=media_type, editable=[], displayed=[], base={}, overrides={}, effective={}
+        )
     return CapabilityViewResponse(
         media_type=view.media_type,
         editable=list(view.editable),
+        displayed=list(view.displayed),
         base=view.base,
         overrides=view.overrides,
         effective=view.effective,
@@ -746,7 +819,7 @@ async def _entry_info(session: AsyncSession, entry: CatalogEntry | None, provide
         display_name=entry.display_name,
         media_type=entry.media_type,
         aliases=list(entry.aliases),
-        discontinued=entry.discontinued,
+        discontinued=entry_lifecycle(entry).discontinued,
         context_length=entry.context_length,
         facts=_facts_json(entry),
         price=_price_json(entry),
@@ -786,14 +859,36 @@ async def _builtin_detail(
         official=view.official,
         overrides=view.capability_overrides,
     )
+    media_type = view.model.media_type
     return ProviderModelDetail(
         model=_builtin_item(item, provider_multiplier),
         multiplier=None if view.official else view.multiplier,
         provider_multiplier=provider_multiplier,
         entry=await _entry_info(session, view.entry, provider_id),
         entry_binding=await _builtin_binding(session, provider_id, model_id, official=view.official),
-        capabilities=_capabilities_response(capabilities, view.model.media_type),
+        capabilities=_capabilities_response(capabilities, media_type),
+        endpoint=None if view.official else _user_added_endpoint(provider_id, media_type, model_id),
+        endpoint_options=(
+            []
+            if view.official
+            else [_endpoint_option(e) for e in builtin_models.endpoint_options(provider_id, media_type)]
+        ),
     )
+
+
+def _user_added_endpoint(provider_id: str, media_type: str, model_id: str) -> str | None:
+    try:
+        return builtin_model_endpoint(provider_id, media_type, model_id)
+    except ValueError:
+        return None
+
+
+def _endpoint_option(endpoint: str) -> EndpointOption:
+    """内置调用端点的界面名：与自定义供应商共用的端点取端点注册表的文案，只属于内置供应商的端点按端点名取 i18n key。"""
+    if endpoint in PROVIDER_ONLY_ENDPOINTS:
+        return EndpointOption(key=endpoint, display_name_key=f"endpoint_{endpoint.replace('-', '_')}_display")
+    spec = get_endpoint_spec(endpoint)
+    return EndpointOption(key=endpoint, display_name_key=spec.display_name_key, display_name=spec.display_name)
 
 
 async def _custom_detail(
@@ -834,7 +929,7 @@ async def get_provider_model(
 
 
 _BUILTIN_SETTING_FIELDS = frozenset(
-    {"enabled", "model_id", "multiplier", "capability_overrides", "entry", "entry_binding", "new_entry"}
+    {"enabled", "model_id", "endpoint", "multiplier", "capability_overrides", "entry", "entry_binding", "new_entry"}
 )
 
 
@@ -909,6 +1004,11 @@ async def _apply_binding(session: AsyncSession, change: _BindingChange, media_ty
         raise HTTPException(status_code=422, detail=_t("provider_model_binding_not_found", binding=change.ref))
 
 
+def _endpoint_in_options(provider_id: str, media_type: str, endpoint: str | None) -> str | None:
+    """同一次保存里换到的端点，供按新端点核对能力覆盖；不在可选端点里的由保存时拒绝，这里按没换处理。"""
+    return endpoint if endpoint in builtin_models.endpoint_options(provider_id, media_type) else None
+
+
 async def _save_builtin_settings(
     session: AsyncSession,
     provider_id: str,
@@ -932,7 +1032,11 @@ async def _save_builtin_settings(
         if item is not None and not item.view.official:
             try:
                 kwargs["capability_overrides"] = check_user_added_overrides(
-                    provider_id, model_id, item.view.model.media_type, body.capability_overrides
+                    provider_id,
+                    model_id,
+                    item.view.model.media_type,
+                    body.capability_overrides,
+                    endpoint=_endpoint_in_options(provider_id, item.view.model.media_type, body.endpoint),
                 )
             except OverrideRejected as exc:
                 raise HTTPException(status_code=422, detail=_t(exc.code, **exc.params)) from exc
@@ -948,6 +1052,7 @@ async def _save_builtin_settings(
             enabled=body.enabled,
             new_model_id=body.model_id,
             multiplier=body.multiplier,
+            endpoint=body.endpoint,
             **kwargs,
         )
     except builtin_models.BuiltinModelError as exc:
@@ -996,6 +1101,7 @@ async def update_provider_model(
         if entry_saved or (binding is not None and binding.created is not None):
             await reload_user_entries(session)
         await invalidate_provider_caches(request)
+        await rename_project_model_refs(db_id, model_id, saved_model_id)
         return await _custom_detail(session, provider_id, db_id, saved_model_id, _t)
     saved_model_id = await _save_builtin_settings(session, provider_id, model_id, body, binding, _t)
     await session.commit()
@@ -1007,20 +1113,12 @@ async def update_provider_model(
 
 
 def _project_references(reference: str) -> list[ProjectReference]:
-    """读每个项目的 project.json，挑出模型设置项引用了 ``reference`` 的项目；读不了的项目跳过。"""
-    from lib.config.resolver import get_project_manager
-
-    pm = get_project_manager()
-    found: list[ProjectReference] = []
-    for name in pm.list_projects():
-        try:
-            project = pm.load_project(name)
-        except (OSError, ValueError):
-            continue
-        if any(project.get(key) == reference for key in PROJECT_MODEL_SETTING_KEYS):
-            title = project.get("title")
-            found.append(ProjectReference(name=name, title=title if isinstance(title, str) and title else None))
-    return found
+    """模型设置字段引用了 ``reference`` 的项目；读不了的项目跳过。"""
+    return [
+        ProjectReference(name=project.name, title=project.title)
+        for project in project_model_references()
+        if reference in project.references.values()
+    ]
 
 
 @router.get("/{provider_id}/model-references", response_model=ProviderModelReferences)

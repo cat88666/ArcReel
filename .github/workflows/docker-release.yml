@@ -3,6 +3,7 @@ name: Docker Release
 # v* tag 触发的正式发布：双架构漏洞闸门 → 多架构构建 → semver + latest 标签，
 # 同一次构建推送 ghcr 与 Docker Hub，附带 SBOM 与 provenance attestation。
 # GitHub Release 由 release-please 创建，此处不再重复生成。
+# 镜像发布成功后触发目录数据仓库（ArcReel/arcreel-catalog）构建一次。
 
 on:
   push:
@@ -48,14 +49,14 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -67,7 +68,9 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          build-args: APT_REFRESH=${{ steps.apt.outputs.week }}
+          build-args: |
+            APT_REFRESH=${{ steps.apt.outputs.week }}
+            BUILD_COMMIT=${{ github.sha }}
           platforms: linux/amd64
           load: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:scan-amd64-${{ github.sha }}
@@ -78,7 +81,9 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          build-args: APT_REFRESH=${{ steps.apt.outputs.week }}
+          build-args: |
+            APT_REFRESH=${{ steps.apt.outputs.week }}
+            BUILD_COMMIT=${{ github.sha }}
           platforms: linux/arm64
           load: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:scan-arm64-${{ github.sha }}
@@ -150,7 +155,9 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          build-args: APT_REFRESH=${{ steps.apt.outputs.week }}
+          build-args: |
+            APT_REFRESH=${{ steps.apt.outputs.week }}
+            BUILD_COMMIT=${{ github.sha }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -186,3 +193,22 @@ jobs:
             echo "::error::pushed tags diverge from the build digest"
             exit 1
           fi
+
+      # 镜像全部落地后触发目录数据仓库构建：它按 ArcReel 最新发布版本，放出此前因最低应用版本暂缓的供应商模型。
+      # 放在镜像发布之后，是为了不出现「数据已放出、镜像还没就绪」的空档。fork 的发版不触发上游仓库
+      - name: Create App token for catalog build
+        id: catalog-token
+        if: github.repository == 'ArcReel/ArcReel'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_PLEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          owner: ArcReel
+          repositories: arcreel-catalog
+          permission-actions: write
+
+      - name: Trigger catalog build
+        if: github.repository == 'ArcReel/ArcReel'
+        env:
+          GH_TOKEN: ${{ steps.catalog-token.outputs.token }}
+        run: gh workflow run build.yml -R ArcReel/arcreel-catalog --ref main

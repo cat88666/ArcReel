@@ -1162,7 +1162,7 @@ def _sg_with_project(tmp_path, project: dict, *, config_resolver: ConfigResolver
     return sg
 
 
-_VEO = "gemini-aistudio/veo-3.1-generate-preview"
+_VEO = "gemini-vertex/veo-3.1-generate-001"
 
 
 class TestPlanningVideoFacts:
@@ -1283,7 +1283,7 @@ async def test_planning_and_execution_read_the_same_tiers_under_one_configuratio
         project,
         route=planning.require(bucket).route,
         generation_type=bucket,
-        identity=ExecutionVideoIdentity("gemini-aistudio", "veo-3.1-generate-preview"),
+        identity=ExecutionVideoIdentity("gemini-vertex", "veo-3.1-generate-001"),
         resolver=resolver,
     )
 
@@ -1722,11 +1722,11 @@ class TestLoadReferenceScriptPlan:
         with pytest.raises(ValueError, match=r"unit_id 改写到 episode=2 后重复"):
             sg._load_reference_script_plan(2, [4, 6, 8])
 
-    def test_duration_outside_supported_raises(self, tmp_path):
+    def test_loading_preserves_duration_for_per_unit_admission(self, tmp_path):
         sg = self._generator(tmp_path)
-        self._write(sg, 1, {"units": [self._unit("E1U01", duration=5)]})  # 5 ∉ [4,6,8]
-        with pytest.raises(ValueError, match="时长非法"):
-            sg._load_reference_script_plan(1, [4, 6, 8])
+        self._write(sg, 1, {"units": [self._unit("E1U01", duration=5)]})
+        units = sg._load_reference_script_plan(1, [4, 6, 8])
+        assert units[0]["duration_seconds"] == 5
 
     def test_strips_retired_duration_override_marker_and_persists(self, tmp_path):
         """存量草稿的退役 ``duration_override`` 标记被剥掉并就地回写；二次加载不再触发。"""

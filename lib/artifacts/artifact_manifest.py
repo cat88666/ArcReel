@@ -41,6 +41,7 @@ from lib.infra.content_digest import (
     remember_file_digest,
 )
 from lib.infra.schema_guards import is_str
+from lib.material.work_files import absent_work_file_digest
 from lib.project.asset_types import ASSET_TYPES, asset_name_comparison_key
 
 
@@ -205,7 +206,7 @@ class ArtifactObservation:
     content_digest: str | None = None
     content_bytes: bytes | None = None
     file_stat: os.stat_result | None = None
-    """读取内容摘要时打开的那个文件版本的 stat；只在算了摘要时给出。"""
+    """经受约束的描述符打开的那个文件版本的 stat；文件存在且可安全打开时给出，算了摘要时与摘要同属一个版本。"""
 
 
 class ArtifactManifestAdapter(Protocol):
@@ -498,7 +499,23 @@ class ArtifactManifest:
         it the claim is read from storage.
         """
 
-        observation = self._adapter.inspect_artifact(artifact_path)
+        return self.compare_observed_entry(
+            key,
+            observation=self._adapter.inspect_artifact(artifact_path),
+            expected=expected,
+            entries=entries,
+        )
+
+    def compare_observed_entry(
+        self,
+        key: ArtifactKey,
+        *,
+        observation: ArtifactObservation,
+        expected: ArtifactManifestEntry | None,
+        entries: Mapping[ArtifactKey, ArtifactManifestEntry] | None = None,
+    ) -> ArtifactComparison:
+        """:meth:`compare_entry` on an inspection the caller already made in this request."""
+
         if observation.blocker is not None:
             return ArtifactComparison(
                 status=ArtifactStatus.BLOCKED,
@@ -881,18 +898,30 @@ class ProjectArtifactManifestAdapter:
         except ValueError as exc:
             blocker = ArtifactBlocker(code="artifact_path_invalid", path=str(artifact_path), detail=str(exc))
             return ArtifactObservation(artifact_path=str(artifact_path), present=False, blocker=blocker)
-        if os.name == "posix":
-            return self._inspect_artifact_posix(
-                normalized,
-                include_content_digest=include_content_digest,
-                include_content_bytes=include_content_bytes,
-                chunk_observer=chunk_observer,
-            )
-        return self._inspect_artifact_portable(
+        inspect = self._inspect_artifact_posix if os.name == "posix" else self._inspect_artifact_portable
+        observation = inspect(
             normalized,
             include_content_digest=include_content_digest,
             include_content_bytes=include_content_bytes,
             chunk_observer=chunk_observer,
+        )
+        if observation.present or observation.blocker is not None or include_content_bytes or chunk_observer:
+            return observation
+        return self._absent_work_file(normalized, include_content_digest=include_content_digest) or observation
+
+    def _absent_work_file(self, normalized: str, *, include_content_digest: bool) -> ArtifactObservation | None:
+        """缓存已清理的远端内容版本工作文件：正式素材仍在对象存储，按版本记录的摘要视为在场。
+
+        需要实际字节的读取方先经 ``lib.material.work_files.local_work_files`` 取回；这里只回答在场与内容身份。
+        没有 stat：图片类产物不记内容事实。
+        """
+        digest = absent_work_file_digest(self._project_dir, normalized)
+        if digest is None:
+            return None
+        return ArtifactObservation(
+            artifact_path=normalized,
+            present=True,
+            content_digest=digest if include_content_digest else None,
         )
 
     def _read_open_artifact(
@@ -1097,7 +1126,7 @@ class ProjectArtifactManifestAdapter:
             present=True,
             content_digest=content_digest,
             content_bytes=content_bytes,
-            file_stat=opened_file_stat if content_digest is not None else None,
+            file_stat=opened_file_stat,
         )
 
     def _inspect_artifact_portable(
@@ -1218,7 +1247,7 @@ class ProjectArtifactManifestAdapter:
             present=True,
             content_digest=content_digest,
             content_bytes=content_bytes,
-            file_stat=opened_stat if content_digest is not None else None,
+            file_stat=opened_stat,
         )
 
     @staticmethod
@@ -1688,9 +1717,9 @@ class ProjectArtifactManifestAdapter:
     def _remove_manifest_unlocked(self, root_fd: int | None) -> None:
         def unlink() -> None:
             if root_fd is None:
-                (self._project_dir / MANIFEST_FILENAME).unlink()
+                (self._project_dir / MANIFEST_FILENAME).unlink()  # hard-delete: infra -- 已清空的产物清单 sidecar
             else:
-                os.unlink(MANIFEST_FILENAME, dir_fd=root_fd)
+                os.unlink(MANIFEST_FILENAME, dir_fd=root_fd)  # hard-delete: infra -- 已清空的产物清单 sidecar
 
         try:
             _retry_while_held_open(unlink, self._sleep)
@@ -2516,6 +2545,6 @@ def _create_temporary_file(root_fd: int, *, nofollow_flag: int) -> tuple[int, st
 
 def _unlink_temporary_file(tmp_name: str, root_fd: int | None) -> None:
     if root_fd is None:
-        os.unlink(tmp_name)
+        os.unlink(tmp_name)  # hard-delete: temp -- 清单原子写的临时文件
     else:
-        os.unlink(tmp_name, dir_fd=root_fd)
+        os.unlink(tmp_name, dir_fd=root_fd)  # hard-delete: temp -- 清单原子写的临时文件

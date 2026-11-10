@@ -12,7 +12,8 @@ import {
   Trash2,
 } from "lucide-react";
 import { useEditUnit, type EditUnit } from "@/components/shared/edit-unit/useEditUnit";
-import { RetainedEditUnit, useRetainWhile } from "@/components/shared/edit-unit/RetainedEditUnit";
+import { useRetainWhile } from "@/components/shared/edit-unit/edit-unit-retention";
+import { RetainedEditUnit } from "@/components/shared/edit-unit/RetainedEditUnit";
 import { useConfirmLeave, useLeaveGuard } from "@/components/shared/edit-unit/LeaveGuard";
 import { UnsavedChangesBar } from "@/components/shared/edit-unit/UnsavedChangesBar";
 import {
@@ -41,14 +42,21 @@ import { STATUS_CONF, deriveUnitStatus } from "./unit-status";
 import { tierProblemText } from "./unit-tier-problem";
 import { ReferenceSplitAlert } from "./ReferenceSplitAlert";
 import { ReferenceDurationConfirmDialog } from "./ReferenceDurationConfirmDialog";
+import { ReferenceUnitAddDialog } from "./ReferenceUnitAddDialog";
 import { ReferenceBatchAdmissionDialog } from "./ReferenceBatchAdmissionDialog";
+import {
+  ReferenceBatchPreviewDialog,
+  type ReferenceBatchSkip,
+  type ReferenceBatchSkipReason,
+} from "./ReferenceBatchPreviewDialog";
 import { referenceBatchOutcome } from "./batch-outcome";
 import { AdScriptButton, AdScriptProgress } from "@/components/canvas/shared/AdScriptDialog";
 import { BatchFillButton, useBatchGap } from "@/components/canvas/episode-page/BatchFillButton";
 import { EpisodeHeaderActions } from "@/components/canvas/episode-page/EpisodeHeaderActions";
 import type { EpisodeCanvasContext } from "@/components/canvas/episode-page/EpisodePage";
 import { NoScriptBlankState } from "@/components/canvas/shared/StartBlankScriptButton";
-import { computeVoiceLegacyNotice, VoiceLegacyBanner } from "./VoiceLegacyBanner";
+import { VoiceLegacyBanner } from "./VoiceLegacyBanner";
+import { computeVoiceLegacyNotice } from "./voice-legacy-notice";
 import { useReferenceDurationGate } from "@/hooks/useReferenceDurationGate";
 import { ReferenceScriptPlanPreviewPanel } from "@/components/canvas/reference/ReferenceScriptPlanPreviewPanel";
 import { PromptAuthoringDraftPanel, usePromptAuthoringDraft } from "./PromptAuthoringDraftPanel";
@@ -82,8 +90,10 @@ import type {
   ReferenceUnitCapabilityMap,
   ReferenceVideoUnit,
   UnitStatus,
+  WorkflowAdmission,
 } from "@/types";
-import { itemIdWithinEpisode } from "@/utils/episode-display";
+import { itemPositionLabel } from "@/utils/episode-display";
+import { ItemPositionOfTotal } from "@/components/shared/episode-item/ItemPositionOfTotal";
 import { stepAnchor } from "@/utils/move-anchor";
 
 export interface ReferenceVideoCanvasProps extends EpisodeCanvasContext {
@@ -162,11 +172,14 @@ function unitNarrationText(unit: ReferenceVideoUnit | null): string {
  */
 function UnitPromptEdit({
   unit,
+  unitLabel,
   onSave,
   allowNavigation,
   children,
 }: {
   unit: ReferenceVideoUnit;
+  /** 离开确认里称呼这个单元：「视频单元 5」。 */
+  unitLabel: string;
   onSave: (unitId: string, prompt: string) => Promise<string>;
   allowNavigation: (to: string) => boolean;
   children: (edit: EditUnit<string>) => ReactNode;
@@ -178,7 +191,7 @@ function UnitPromptEdit({
     source: unit.text,
     save,
     allowNavigation,
-    leaveTitle: t("reference_unit_leave_title", { id: itemIdWithinEpisode(unitId) }),
+    leaveTitle: t("reference_unit_leave_title", { id: unitLabel }),
   });
   return <>{children(edit)}</>;
 }
@@ -446,21 +459,43 @@ export function ReferenceVideoCanvas({
     [confirmLeave, select, t],
   );
 
-  // afterUnitId 缺省时追加到末尾；新单元不继承同号旧单元的产物与版本历史。
-  // store 新增后选中新单元，同样先经离开拦截。
-  const handleAdd = useCallback(
-    (afterUnitId?: string) => {
+  // 新增先弹框填写正文：空正文的单元服务端以 needs_replan 拒绝创建。
+  // `afterUnitId` 缺省时追加到末尾；新单元不继承同号旧单元的产物与版本历史。
+  const [addTarget, setAddTarget] = useState<{ afterUnitId?: string } | null>(null);
+  const [addPrompt, setAddPrompt] = useState("");
+  const [addingUnit, setAddingUnit] = useState(false);
+  const finishCreation = useCallback(() => Promise.resolve(true), []);
+  useLeaveGuard({ dirty: false, saving: addingUnit, save: finishCreation });
+  const handleAdd = useCallback((afterUnitId?: string) => {
+    setAddPrompt("");
+    setAddTarget({ afterUnitId });
+  }, []);
+  // store 新增后选中新单元：离开拦截放在提交这一步，取消新增不会白丢当前单元的修改。
+  const handleAddSubmit = useCallback(
+    (prompt: string) => {
+      if (!addTarget || addingUnit) return;
+      const { afterUnitId } = addTarget;
       confirmLeave(
-        () => {
-          void addUnit(projectName, episode, {
-            prompt: "",
-            ...(afterUnitId !== undefined ? { after_unit_id: afterUnitId } : {}),
-          }).catch((e: unknown) => toastError(e));
+        async () => {
+          setAddingUnit(true);
+          try {
+            await addUnit(projectName, episode, {
+              prompt,
+              ...(afterUnitId !== undefined ? { after_unit_id: afterUnitId } : {}),
+            });
+            setAddTarget(null);
+            return true;
+          } catch (e) {
+            toastError(e, (message) => t("reference_unit_add_failed", { message }));
+            return false;
+          } finally {
+            setAddingUnit(false);
+          }
         },
         { saveLabel: t("common:save_and_switch") },
       );
     },
-    [confirmLeave, addUnit, projectName, episode, t],
+    [addTarget, addingUnit, confirmLeave, addUnit, projectName, episode, t],
   );
 
   // 改序不弹确认；请求在途时丢弃后续操作，避免基于过期顺序计算锚点。
@@ -483,6 +518,14 @@ export function ReferenceVideoCanvas({
     [isUnitLocked, ttsBusyUnitIds],
   );
   const [removeUnitId, setRemoveUnitId] = useState<string | null>(null);
+  /** 确认框里称呼单元：「视频单元 5」，已不在列表里时「已删除」。 */
+  const unitPositionOf = useCallback(
+    (unitId: string | null) => {
+      const index = unitId ? units.findIndex((u) => u.unit_id === unitId) : -1;
+      return itemPositionLabel("unit", index < 0 ? null : index + 1, t);
+    },
+    [units, t],
+  );
   const [removingUnit, setRemovingUnit] = useState(false);
   const openRemoveDialog = useCallback(
     (unitId: string) => {
@@ -547,19 +590,21 @@ export function ReferenceVideoCanvas({
    * 生成、重复计费并覆盖刚出的成片。实时读 store 而非渲染期 units 快照。
    *
    * 本地写入（成片上传、版本恢复、时长保存）服务端看不见，也即将改写该 unit，同样排除。
+   *
+   * 返回排除的原因，确认框据此列出跳过项；`null` 表示可以提交。
    */
-  const canEnqueueBatchUnit = useCallback(
-    (unitId: string) => {
+  const batchSkipReason = useCallback(
+    (unitId: string): ReferenceBatchSkipReason | null => {
       // 只排除本画布自己的写入（服务端看不到它们）：生成占用与 needs_replan 交给准入去报告。
       const hasLocalWrite =
         uploading.ref.current.has(unitId) ||
         restoring.ref.current.has(unitId) ||
         durationSaving.ref.current.has(unitId);
-      if (hasLocalWrite) return false;
+      if (hasLocalWrite) return "local_write";
       const fresh = useReferenceVideoStore
         .getState()
         .unitsByEpisode[referenceVideoCacheKey(projectName, episode)]?.find((u) => u.unit_id === unitId);
-      return !fresh?.generated_assets?.video_clip;
+      return fresh?.generated_assets?.video_clip ? "has_video" : null;
     },
     [projectName, episode, uploading.ref, restoring.ref, durationSaving.ref],
   );
@@ -567,6 +612,8 @@ export function ReferenceVideoCanvas({
   const durationGate = useReferenceDurationGate({ projectName, episode });
   /** 整批准入判定的未决结论（需确认 / 受阻）；admitted 由 toast 反馈，不进这里。 */
   const [batchAdmission, setBatchAdmission] = useState<ReferenceBatchAdmission | null>(null);
+  /** 提交前确认框的输入：本轮要预览的单元与画布摘掉的跳过项。 */
+  const [batchPlan, setBatchPlan] = useState<{ unitIds: string[]; skipped: ReferenceBatchSkip[] } | null>(null);
 
   const enqueue = useCallback(
     async (unitId: string, confirmedRequestDuration: number | undefined) => {
@@ -609,6 +656,7 @@ export function ReferenceVideoCanvas({
       async (unitIds: string[], confirmedDurations: ReadonlyMap<string, number>) => {
       for (const id of unitIds) {
         if (!canEnqueue(id)) continue;
+        // react-doctor-disable-next-line react-doctor/async-await-in-loop -- 有意串行：每次入队前按最新状态复核，让后端依次做去重检查
         await enqueue(id, confirmedDurations.get(id));
       }
     },
@@ -655,7 +703,7 @@ export function ReferenceVideoCanvas({
         try {
           const result = await API.uploadReferenceUnitVideo(projectName, episode, unitId, file);
           useProjectsStore.getState().updateAssetFingerprints(result.asset_fingerprints);
-          useAppStore.getState().pushToast(t("media_upload_success", { id: unitId }), "success");
+          useAppStore.getState().pushToast(t("media_upload_success", { id: unitPositionOf(unitId) }), "success");
         } catch (e) {
           toastError(e, (msg) => t("media_upload_failed", { message: msg }));
           return;
@@ -670,7 +718,7 @@ export function ReferenceVideoCanvas({
         setUploading(unitId, false);
       }
     },
-    [projectName, episode, loadUnits, isUnitLocked, setUploading, t],
+    [projectName, episode, loadUnits, isUnitLocked, setUploading, unitPositionOf, t],
   );
 
   const handleUnitsRefresh = useCallback(
@@ -724,8 +772,11 @@ export function ReferenceVideoCanvas({
           unit_ids: unitIds,
           ...(confirmedDurations ? { confirmed_request_durations: confirmedDurations } : {}),
         });
+        // 确认框与结论弹窗在同一次渲染里交接，不叠两层弹窗。
+        setBatchPlan(null);
         setBatchAdmission(referenceBatchOutcome(admission) === "queued" ? null : admission);
       } catch (e) {
+        setBatchPlan(null);
         setBatchAdmission(null);
         toastError(e, (msg) => t("reference_batch_request_failed", { error: msg }));
       }
@@ -733,7 +784,7 @@ export function ReferenceVideoCanvas({
     [projectName, episode, t],
   );
 
-  const handleBatchGenerate = useCallback(async () => {
+  const handleBatchGenerate = useCallback(() => {
     if (batchTargets.length === 0) {
       useAppStore.getState().pushToast(t("reference_batch_nothing_to_do"), "info");
       return;
@@ -741,49 +792,66 @@ export function ReferenceVideoCanvas({
     setStackTab("preview");
     // 实时复核而非用渲染期快照：其它入口（单元按钮、Agent 入队、SSE 落库）可能已占用
     // 同一 unit。命中即跳过，不当作错误提示——批量入口的语义是「把还能生成的都排上」，
-    // 逐个报错只会刷屏。
-    const targets = batchTargets.map((u) => u.unit_id).filter(canEnqueueBatchUnit);
-    if (targets.length === 0) {
+    // 逐个报错只会刷屏；跳过的单元连同原因列在确认框里。
+    const skipped = batchTargets.flatMap((unit): ReferenceBatchSkip[] => {
+      const reason = batchSkipReason(unit.unit_id);
+      return reason === null ? [] : [{ unit_id: unit.unit_id, reason }];
+    });
+    const skippedIds = new Set(skipped.map((item) => item.unit_id));
+    const unitIds = batchTargets.map((u) => u.unit_id).filter((unitId) => !skippedIds.has(unitId));
+    if (unitIds.length === 0) {
       useAppStore.getState().pushToast(t("reference_batch_nothing_to_do"), "info");
       return;
     }
-    await runBatch(targets);
-  }, [batchTargets, canEnqueueBatchUnit, runBatch, t]);
+    // 付费视频先确认再提交：确认框列出名单、跳过项与预估费用，时长档位待确认时一并拍板。
+    setBatchPlan({ unitIds, skipped });
+  }, [batchTargets, batchSkipReason, t]);
 
   /**
-   * 聚合确认后重发同一端点完成入队：档位按 tier 摊回各 unit，目标集合仍是本轮全部
-   * 目标（无需确认的单元也在其中，否则它们永远排不上）。
+   * 按一份准入结论提交：档位按 tier 摊回各 unit，目标集合是结论里的全部单元（无需确认的
+   * 单元也在其中，否则它们永远排不上）。
    *
-   * 提交时刻再复核一次：弹窗停留期间（用户思考时长，可以很长）清单里的单元可能已被
+   * 提交时刻再复核一次：确认框停留期间（用户思考时长，可以很长）清单里的单元可能已被
    * 别处生成完成——按冻结清单原样重发会重复计费并覆盖刚出的成片。
+   */
+  const submitAdmitted = useCallback(
+    async (admission: WorkflowAdmission) => {
+      const durationByUnit = new Map<string, number>();
+      for (const tier of admission.confirmation?.tiers ?? []) {
+        // 档位没解析出来的组没有可确认的值：略过后重发，服务端会照旧把它算成缺口，
+        // 而不是收到一个空档位当成用户已拍板。
+        if (tier.request_duration_seconds == null) continue;
+        for (const unitId of tier.unit_ids) durationByUnit.set(unitId, tier.request_duration_seconds);
+      }
+      const targets = Array.from(
+        new Set([...admission.units.map((u) => u.unit_id), ...durationByUnit.keys()]),
+      ).filter((unitId) => batchSkipReason(unitId) === null);
+      if (targets.length === 0) {
+        setBatchPlan(null);
+        // 弹窗此刻已关闭，不给反馈的话界面只是静静地什么也没发生。
+        useAppStore.getState().pushToast(t("reference_batch_nothing_to_do"), "info");
+        return;
+      }
+      const confirmed: Record<string, number> = {};
+      for (const unitId of targets) {
+        const duration = durationByUnit.get(unitId);
+        if (duration != null) confirmed[unitId] = duration;
+      }
+      await runBatch(targets, Object.keys(confirmed).length > 0 ? confirmed : undefined);
+    },
+    [batchSkipReason, runBatch, t],
+  );
+
+  /**
+   * 提交时档位与预览时不同（预览之后剧本或模型配置有变），结论弹窗会再请一次确认：
+   * 那是一份新的结论，确认后按它重发。
    */
   const handleBatchConfirm = useCallback(() => {
     const admission = batchAdmission;
     setBatchAdmission(null);
-    const tiers = admission?.confirmation?.tiers ?? [];
-    if (!admission || tiers.length === 0) return;
-    const durationByUnit = new Map<string, number>();
-    for (const tier of tiers) {
-      // 档位没解析出来的组没有可确认的值：略过后重发，服务端会照旧把它算成缺口，
-      // 而不是收到一个空档位当成用户已拍板。
-      if (tier.request_duration_seconds == null) continue;
-      for (const unitId of tier.unit_ids) durationByUnit.set(unitId, tier.request_duration_seconds);
-    }
-    const targets = Array.from(
-      new Set([...admission.units.map((u) => u.unit_id), ...durationByUnit.keys()]),
-    ).filter(canEnqueueBatchUnit);
-    if (targets.length === 0) {
-      // 弹窗此刻已关闭，不给反馈的话界面只是静静地什么也没发生。
-      useAppStore.getState().pushToast(t("reference_batch_nothing_to_do"), "info");
-      return;
-    }
-    const confirmed: Record<string, number> = {};
-    for (const unitId of targets) {
-      const duration = durationByUnit.get(unitId);
-      if (duration != null) confirmed[unitId] = duration;
-    }
-    void runBatch(targets, confirmed);
-  }, [batchAdmission, canEnqueueBatchUnit, runBatch, t]);
+    if (!admission || (admission.confirmation?.tiers ?? []).length === 0) return;
+    void submitAdmitted(admission);
+  }, [batchAdmission, submitAdmitted]);
 
   const onAdd = useCallback(() => handleAdd(), [handleAdd]);
 
@@ -988,12 +1056,7 @@ export function ReferenceVideoCanvas({
         {/* 中栏上方：单元头部、单元提示与窄屏下的编辑 / 预览切换 */}
         <div className="col-start-2 row-start-1 flex min-w-0 flex-col border-b border-border">
           <div className="flex flex-wrap items-center gap-2 px-4 py-2">
-            <span
-              translate="no"
-              className="rounded-sm bg-primary px-2 py-0.5 font-mono text-xs font-semibold text-primary-foreground"
-            >
-              {itemIdWithinEpisode(unit.unit_id)}
-            </span>
+            <ItemPositionOfTotal itemId={unit.unit_id} kind="unit" position={selectedIndex + 1} total={units.length} />
             <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
               <Clock aria-hidden className="size-3.5" />
               {renderDurationControl(unit, edit)}
@@ -1004,11 +1067,6 @@ export function ReferenceVideoCanvas({
               </span>
             )}
             <span className="flex-1" />
-            {selectedIndex >= 0 && (
-              <span className="font-mono text-xs tabular-nums text-muted-foreground">
-                {selectedIndex + 1} / {units.length}
-              </span>
-            )}
             <div className="flex items-center">
               <HeaderIconButton
                 label={t("reference_unit_move_earlier")}
@@ -1161,7 +1219,7 @@ export function ReferenceVideoCanvas({
             count={videoGap}
             units
             disabled={batchTargets.length === 0}
-            onClick={() => void handleBatchGenerate()}
+            onClick={() => handleBatchGenerate()}
           />
         </EpisodeHeaderActions>
       )}
@@ -1263,6 +1321,7 @@ export function ReferenceVideoCanvas({
             <UnitPromptEdit
               key={selected.unit_id}
               unit={selected}
+              unitLabel={unitPositionOf(selected.unit_id)}
               onSave={handlePromptSave}
               allowNavigation={allowNavigation}
             >
@@ -1336,7 +1395,7 @@ export function ReferenceVideoCanvas({
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {t("reference_unit_remove_title", { id: itemIdWithinEpisode(removeUnitId ?? "") })}
+              {t("reference_unit_remove_title", { id: unitPositionOf(removeUnitId) })}
             </AlertDialogTitle>
             <AlertDialogDescription>{t("reference_unit_remove_desc")}</AlertDialogDescription>
           </AlertDialogHeader>
@@ -1354,7 +1413,25 @@ export function ReferenceVideoCanvas({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      <ReferenceUnitAddDialog
+        open={addTarget !== null}
+        prompt={addPrompt}
+        submitting={addingUnit}
+        onPromptChange={setAddPrompt}
+        onSubmit={handleAddSubmit}
+        onClose={() => setAddTarget(null)}
+      />
       <ReferenceDurationConfirmDialog {...durationGate.dialogProps} />
+      {batchPlan && (
+        <ReferenceBatchPreviewDialog
+          projectName={projectName}
+          episode={episode}
+          unitIds={batchPlan.unitIds}
+          skipped={batchPlan.skipped}
+          onConfirm={submitAdmitted}
+          onClose={() => setBatchPlan(null)}
+        />
+      )}
       <ReferenceBatchAdmissionDialog
         admission={batchAdmission}
         onConfirm={handleBatchConfirm}

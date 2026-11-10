@@ -1,7 +1,7 @@
 ---
 id: faq
 title: 常见问题
-sidebar_position: 7
+sidebar_position: 8
 update_docs: fact-check
 ---
 
@@ -65,6 +65,18 @@ docker compose up -d --force-recreate
 
 源码部署则重启 ArcReel 服务。不要在公网部署中关闭身份认证。
 
+### 修改 `.env` 后为什么没有生效？ {#env-changes-not-applied}
+
+Docker 部署在创建容器时读取 `.env`，之后 `docker compose restart`、容器崩溃后的自动拉起和宿主机重启都沿用当时的环境变量。修改 `.env` 后，在实际使用的 Compose 目录执行：
+
+```bash
+docker compose up -d
+```
+
+不要用 `docker compose restart` 让修改生效。启动时发现进程环境变量与挂载的 `.env` 取值不一致，日志会输出一条 WARNING，只列出变量名，不输出取值。
+
+`AUTH_PASSWORD` 留空时只在首次启动生成一次，之后重启沿用 `.env` 中的值。`AUTH_TOKEN_SECRET` 留空时，签名密钥保存在数据目录的 `runtime/auth-token-secret`（Docker 部署的数据目录是 Compose 目录下的 `projects/`），重启后已登录的会话仍然有效；在 `.env` 中设置后以设置值为准。
+
 ### Docker 怎样更新？更新会丢失项目吗？ {#docker-update}
 
 先完成备份，再在对应的 Compose 目录执行：
@@ -119,6 +131,18 @@ ArcReel Agent（智能体）与内容生成使用两套独立配置：
 4. 在设置页“关于”中下载诊断日志，查看错误发生时间附近的具体上游状态码。
 
 连通性检查只代表最小请求成功；长会话仍可能受到额度、上下文长度、限流或代理超时影响。
+
+### Windows 从源码启动后，Agent 提示事件循环不支持创建子进程怎么办？ {#windows-reload-agent}
+
+在 Windows 原生环境用 `--reload` 启动后端时，uvicorn 会改用不支持子进程的事件循环，Agent 无法拉起 Claude Code。界面显示「后端的事件循环不支持创建子进程」，旧版本只显示 `Failed to start Claude Code:`，冒号后为空。
+
+去掉 `--reload` 重新启动后端：
+
+```bash
+uv run uvicorn server.app:app --port 1241
+```
+
+也可以运行 `uv run python -m server.app`，它在 Windows 上不启用 reload，监听地址取 `LISTEN_HOST` 与 `LISTEN_PORT`。不启用 reload 时，修改代码后需要手动重启后端。
 
 ## 供应商、模型与 API {#providers-models-api}
 
@@ -277,11 +301,21 @@ ArcReel Agent（智能体）与内容生成使用两套独立配置：
 
 不存在适用于所有项目的固定“每分钟价格”。应结合项目费用预估、实际调用明细和供应商账单评估。
 
+### 删错了内容还能找回吗？ {#recover-deleted-content}
+
+能。项目内的删除，无论由你还是 Agent 发起，都会成为项目回收站里的一条删除记录，保留 30 天。在工作区的「文件」里打开「项目回收站」分区，选择记录点「恢复」。恢复只新增，不覆盖现有内容；原名或原编号已被占用时，恢复的对象会换名或换编号，提示里会写明新名。
+
+删除整个项目则进入项目列表页的「已删除项目」。各类对象怎样删除和恢复、合并资产后的恢复，以及 Agent 的删除与恢复能力，见[文件视图与项目回收站](./files-and-trash.md)。
+
 ### 项目 ZIP 与全站备份有什么区别？ {#project-zip-vs-full-backup}
 
-项目 ZIP 用于导入、迁移单个项目，可以选择仅导出当前版本或包含完整版本历史。它不包含全局供应商设置、登录配置、任务与费用记录、Agent 会话或 Agent 记忆。
+项目 ZIP 用于导入、迁移单个项目，可以选择仅导出当前版本或包含完整版本历史。它不包含全局供应商设置、登录配置、任务与费用记录、Agent 会话或 Agent 记忆。图片的可用供应商素材关联随项目 ZIP 带走，导入后的使用规则见[项目 ZIP 与供应商素材关联](./providers.md#asset-library-in-project-zip)。
 
-导入的项目与现有项目同名时，选择「覆盖现有项目」等同于删除现有项目后再导入：现有项目排队中的任务取消，任务、使用记录与 Agent 会话按已删除项目保留，不带入导入的项目，Agent 记忆随现有项目一并删除。需要同时保留两个项目时，选择「自动重命名导入」。
+项目回收站不包含在项目 ZIP 中，完整数据根备份会保留其中的删除记录。项目回收站的用法见[文件视图与项目回收站](./files-and-trash.md)。
+
+删除的项目会进入项目列表页的「已删除项目」，连同它的项目回收站保留 30 天，可以整体恢复或彻底删除，详见[已删除项目](./files-and-trash.md#deleted-projects)。
+
+导入的项目与现有项目同名时，选择「覆盖现有项目」等同于删除现有项目后再导入：现有项目排队中的任务取消，任务、使用记录与 Agent 会话按已删除项目保留，不带入导入的项目；现有项目连同 Agent 记忆进入「已删除项目」。需要同时保留两个项目时，选择「自动重命名导入」。
 
 需要灾难恢复时，请使用前文的全站备份方式，同时保存项目目录、数据库与所需凭据。
 

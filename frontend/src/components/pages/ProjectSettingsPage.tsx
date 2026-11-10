@@ -15,15 +15,15 @@ import { Button } from "@/components/ui/button";
 import { ProjectMemoryFiles } from "@/components/agent-memory/ProjectMemoryFiles";
 import { SaveBar } from "@/components/shared/edit-unit/SaveBar";
 import { PartialSaveError, useEditUnit } from "@/components/shared/edit-unit/useEditUnit";
-import { isValidEpisodeTargetDuration } from "@/components/shared/EpisodeTargetDurationField";
-import { executingVideoModel } from "@/components/shared/LayeredModelFields";
+import { isValidEpisodeTargetDuration } from "@/components/shared/episode-target-duration";
+import { executingVideoModel } from "@/components/shared/model-layers";
 import { countModelOverrides } from "@/components/shared/model-overrides";
 import { ModelConfigSection, type ModelConfigValue } from "@/components/shared/ModelConfigSection";
-import { narrationDeliveryProblem } from "@/components/shared/NarrationDeliveryFields";
+import { narrationDeliveryProblem } from "@/components/shared/narration-delivery";
 import { PageHeader } from "@/components/shared/page-shell/PageHeader";
 import { PageShell, PageShellFooter } from "@/components/shared/page-shell/PageShell";
 import { PageSidebar, type PageSidebarGroup } from "@/components/shared/page-shell/PageSidebar";
-import { isValidSpeechRate } from "@/components/shared/SpeechRateField";
+import { isValidSpeechRate } from "@/components/shared/speech-rate";
 import { useDisplayNames } from "@/hooks/useDisplayNames";
 import { useModelCandidates } from "@/hooks/useModelCandidates";
 import { useCapabilitiesStore } from "@/stores/capabilities-store";
@@ -93,12 +93,14 @@ interface LoadedSettings {
 }
 
 async function loadSettings(projectName: string, signal: AbortSignal): Promise<LoadedSettings> {
-  const [configRes, projectRes, providers, customProviders, narrationDefaults] = await Promise.all([
+  const [configRes, projectRes, providers, customProviders, narrationDefaults, auto] = await Promise.all([
     API.getSystemConfig({ signal }),
     API.getProject(projectName, { signal }),
     getProviderModels({ signal }).catch(() => [] as ProviderInfo[]),
     getCustomProviderModels({ signal }).catch(() => [] as CustomProviderInfo[]),
     API.getNarrationDefaults({ signal }).catch(() => null),
+    // 自动选择的实际模型只用于展示与能力查询，读不到时退回只显示「自动选择」
+    API.getAutoBackends({ signal }).catch(() => null),
   ]);
   const settings = configRes.settings;
   const globals: GlobalModelDefaults = {
@@ -111,6 +113,7 @@ async function loadSettings(projectName: string, signal: AbortSignal): Promise<L
     textDefault: settings?.default_text_backend ?? "",
     textSimple: settings?.text_backend_simple ?? "",
     textComplex: settings?.text_backend_complex ?? "",
+    auto,
   };
   const project = projectRes.project as unknown as Record<string, unknown>;
   return {
@@ -152,6 +155,7 @@ function ProjectSettingsView({ projectName }: { projectName: string }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loadCount, setLoadCount] = useState(0);
 
+  // react-doctor-disable-next-line react-doctor/no-set-state-after-await-in-effect -- await 后的写入都先检查 controller.signal.aborted，cleanup 中 abort 作废上一轮
   useEffect(() => {
     const controller = new AbortController();
     voidCall(
@@ -426,6 +430,7 @@ function LoadedProjectSettings({ projectName, loaded }: { projectName: string; l
           audioBackends={loaded.options.audioBackends}
           providerNames={providerNames}
           modelNames={modelNames}
+          lifecycle={candidates?.lifecycle}
         />
       );
       break;

@@ -21,6 +21,8 @@ from lib.project.asset_types import (
     normalize_asset_name,
     validate_asset_name,
 )
+from lib.project.project_migration_report import MigrationAdjustment
+from lib.project.project_migrations.legacy_shapes import normalize_shared_reference_files
 from lib.project.project_migrations.staged_swap import new_rollback_dir, new_staging_dir
 from lib.script.reference_video.text_parser import line_speech_marks, rewrite_mentions
 
@@ -324,14 +326,17 @@ def _rewrite_legacy_markdown_drafts(project_dir: Path, occurrences: list[_AssetO
 def _record_for_stem(
     records: list[_AssetOccurrence], stem: str, *, allow_sequence: bool
 ) -> tuple[_AssetOccurrence, str] | None:
-    for item in records:
-        if stem == item.old_name:
-            return item, ""
     if allow_sequence:
+        # 按序号命名的目录里文件只会是 ``名_<n>``；资产名本身可以以 ``_数字`` 结尾，
+        # 精确同名或归一同名的匹配会把 ``Cup`` 的 ``Cup_1`` 认成资产 ``Cup_1`` 自己的文件。
         for item in sorted(records, key=lambda value: len(value.old_name), reverse=True):
             prefix = f"{item.old_name}_"
             if stem.startswith(prefix) and stem[len(prefix) :].isdigit():
                 return item, stem[len(item.old_name) :]
+        return None
+    for item in records:
+        if stem == item.old_name:
+            return item, ""
     key = asset_name_comparison_key(stem)
     matches = [item for item in records if item.key == key]
     if matches:
@@ -539,13 +544,15 @@ def _execute_moves(moves: list[tuple[Path, Path]]) -> None:
         raise
 
 
-def _migrate_staged_tree(project_dir: Path) -> None:
+def _migrate_staged_tree(project_dir: Path) -> list[MigrationAdjustment]:
     project_file = project_dir / "project.json"
     _assert_migration_write_target(project_dir, project_file)
     project = load_json(project_file)
     if int(project.get("schema_version") or 0) >= 6:
-        return
+        return []
     _assert_migration_write_roots(project_dir)
+    adjusted = normalize_shared_reference_files(project_dir, schema_version=int(project.get("schema_version") or 0))
+    project = load_json(project_file)
     reserved_keys = _retained_history_keys(project_dir, project)
     for asset_type, keys in _reserved_media_keys(project_dir).items():
         reserved_keys.setdefault(asset_type, set()).update(keys)
@@ -579,9 +586,23 @@ def _migrate_staged_tree(project_dir: Path) -> None:
     project["schema_version"] = 6
     ensure_project_asset_namespace(project)
     atomic_write_json(project_file, project)
+    path_rewrites = {
+        normalize_asset_name(source.relative_to(project_dir).as_posix()): target.relative_to(project_dir).as_posix()
+        for source, target in moves
+    }
+    names = {(item.asset_type, item.old_name): item.new_name for item in occurrences}
+    return [
+        item.model_copy(
+            update={
+                "file": item.file and path_rewrites.get(normalize_asset_name(item.file), item.file),
+                "params": {**item.params, "name": names[item.params["asset_type"], item.params["name"]]},
+            }
+        )
+        for item in adjusted
+    ]
 
 
-def migrate_v5_to_v6(project_dir: Path) -> None:
+def migrate_v5_to_v6(project_dir: Path, *, record: list[MigrationAdjustment] | None = None) -> None:
     """Make the multi-file v6 migration atomic by transforming a sibling staging tree then swapping it in.
 
     交换窗口内进程被硬杀的善后见 ``lib.project.project_migrations.staged_swap``。
@@ -598,18 +619,20 @@ def migrate_v5_to_v6(project_dir: Path) -> None:
     rollback = new_rollback_dir(project_dir)
     try:
         shutil.copytree(project_dir, staging, symlinks=True, dirs_exist_ok=True)
-        _migrate_staged_tree(staging)
+        adjusted = _migrate_staged_tree(staging)
         os.replace(project_dir, rollback)
         try:
             os.replace(staging, project_dir)
         except BaseException:
             os.replace(rollback, project_dir)
             raise
-        shutil.rmtree(rollback, ignore_errors=True)
+        shutil.rmtree(rollback, ignore_errors=True)  # hard-delete: infra -- 迁移交换成功后的迁移前副本
+        if record is not None:
+            record.extend(adjusted)
     finally:
         # ignore_errors：staging 清理失败（占用/权限）不得中断本块，否则下面的原树恢复检查
         # 会被跳过，项目目录停在缺失状态。
-        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)  # hard-delete: temp -- 迁移暂存树
         if rollback.exists() and not project_dir.exists():
             os.replace(rollback, project_dir)
 

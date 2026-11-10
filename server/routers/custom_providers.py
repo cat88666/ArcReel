@@ -23,21 +23,24 @@ from lib.backends.http_status_errors import raise_for_status_redacted
 from lib.backends.image_backends.base import ImageCapability
 from lib.catalog.model_id import has_dot_segment
 from lib.catalog.query import binding_key, find_bound_entry
+from lib.config.model_setting_keys import PROJECT_MODEL_SETTING_KEYS
 from lib.config.repository import mask_secret
 from lib.custom_provider import is_custom_endpoint, make_provider_id
 from lib.custom_provider.capabilities import (
     AUDIO_OVERRIDE_KEYS,
     AUDIO_TRACK_OVERRIDE_KEYS,
-    CAPABILITY_OVERRIDE_FIELDS,
     CHANNEL_FACT_OVERRIDE_KEYS,
-    capability_type_name,
-    capability_value_matches,
     filter_valid_overrides,
     resolve_audio_pair,
     strip_incoherent_audio_overrides,
-    system_video_capabilities,
+    two_sided_video_capabilities,
 )
-from lib.custom_provider.capability_view import CapabilityView, custom_capability_view
+from lib.custom_provider.capability_view import (
+    CapabilityView,
+    custom_capability_view,
+    overridable_keys,
+    override_value_check,
+)
 from lib.custom_provider.discovery_formats import endpoint_attachment_holds, is_comfyui_protocol
 from lib.custom_provider.endpoint_resolution import endpoint_spec_from_row, resolve_endpoint_spec
 from lib.custom_provider.endpoints import (
@@ -51,7 +54,6 @@ from lib.custom_provider.endpoints import (
 from lib.custom_provider.model_facts import (
     ALL_MODEL_FACT_OVERRIDE_KEYS,
     COMFYUI_VIDEO_OVERRIDE_KEYS,
-    MODEL_FACT_OVERRIDE_KEYS,
     comfyui_duration_override,
     matched_entry_summary,
     model_fact_overrides,
@@ -148,10 +150,8 @@ _PROJECT_BACKEND_KEYS = (
     "default_text_backend",
 )
 
-# 全局 DB settings 中可能引用自定义模型的全部键，供能力编辑界面只读提示影响面用（`docs/adr/0054`：
-# 提示不拦截保存）。与 _BACKEND_SETTING_KEYS 分开维护：后者界定删除时的级联清理范围，视频桶键按
-# ADR 0054 不在清理之列，但仍需提示。每个键须在 frontend/src/i18n/*/dashboard.ts 有
-# global_bucket_label_<key> 文案，由 test_global_bucket_keys_have_i18n_labels 守住。
+# 全局 DB settings 中可能引用自定义模型的全部键，模型改 ID 时据此改写引用。与 _BACKEND_SETTING_KEYS
+# 分开维护：后者界定删除时的级联清理范围，视频桶键按 ADR 0054 不在清理之列，但改 ID 仍要跟随。
 _GLOBAL_BUCKET_REFERENCE_KEYS = (
     *_BACKEND_SETTING_KEYS,
     "default_video_backend_i2v",
@@ -313,9 +313,6 @@ class ModelResponse(BaseModel):
     # 对应到的条目摘要（maker / name / media_type / display_name / priced）；对应不上条目时为 None，
     # 这个模型的调用记为未定价。
     matched_entry: dict[str, object] | None = None
-    # 正在引用该模型的全局 system_settings 键名（如 default_video_backend_i2v）；未被引用为
-    # None。只查 DB 全局配置，不扫描项目文件（`docs/adr/0054`）；前端据此渲染非阻塞提示。
-    global_bucket_refs: list[str] | None = None
 
 
 class ProviderResponse(BaseModel):
@@ -400,9 +397,9 @@ class EndpointCatalogResponse(BaseModel):
 
 
 def _system_capabilities_for(
-    endpoint: str, model_id: str, endpoint_spec: EndpointSpec | None = None
+    endpoint: str, model_id: str, endpoint_spec: EndpointSpec | None = None, entry_binding: str | None = None
 ) -> dict[str, object] | None:
-    """读该 model 的系统判定能力；非 video endpoint 返回 None。
+    """读该 model 的判定能力（调用端点声明与模型条目两侧求值，不含能力覆盖）；非 video endpoint 返回 None。
 
     判定失败（endpoint 已下线、注册表声明异常）时降级为 None 而非 500：列表端点要能把
     其余模型正常呈现出来，单行判定不出来只是设置页少一段"判定值"提示。
@@ -413,7 +410,11 @@ def _system_capabilities_for(
         media_type = endpoint_spec.media_type if endpoint_spec is not None else static_media_type(endpoint)
         if media_type != "video":
             return None
-        caps = asdict(system_video_capabilities(endpoint=endpoint, model_id=model_id, endpoint_spec=endpoint_spec))
+        caps = asdict(
+            two_sided_video_capabilities(
+                endpoint=endpoint, model_id=model_id, endpoint_spec=endpoint_spec, entry_binding=entry_binding
+            )
+        )
         return {k: v for k, v in caps.items() if k not in _AUDIO_TRACK_FIELDS}
     except ValueError:
         logger.warning("无法判定系统能力: endpoint=%r model_id=%r", endpoint, model_id)
@@ -425,6 +426,7 @@ def _effective_overrides_for_response(
     model_id: str,
     overrides: object | None,
     endpoint_spec: EndpointSpec | None = None,
+    entry_binding: str | None = None,
 ) -> dict[str, object] | None:
     """回显前按写入侧同一判定过滤，剔除执行层不会采用的键值，并收窄至开放白名单。
 
@@ -468,6 +470,7 @@ def _effective_overrides_for_response(
             endpoint=endpoint,
             model_id=model_id,
             endpoint_spec=endpoint_spec,
+            entry_binding=entry_binding,
         )
     implemented = endpoint_spec.image_capabilities
     for key, value in model_fact_overrides(overrides, media_type, model_id=model_id).items():
@@ -476,24 +479,6 @@ def _effective_overrides_for_response(
             continue
         filtered[key] = value
     return filtered or None
-
-
-def _extract_global_bucket_refs(all_settings: dict[str, str], provider_id: int) -> dict[str, list[str]]:
-    """从一次性拉取的全局 settings 中挑出引用该 provider 模型的键，按 model_id 分组。"""
-    prefix = f"{make_provider_id(provider_id)}/"
-    refs: dict[str, list[str]] = {}
-    for key in _GLOBAL_BUCKET_REFERENCE_KEYS:
-        val = all_settings.get(key, "")
-        if val and val.startswith(prefix):
-            refs.setdefault(val[len(prefix) :], []).append(key)
-    return refs
-
-
-async def _global_bucket_refs_for_provider(session: AsyncSession, provider_id: int) -> dict[str, list[str]]:
-    from lib.config.service import ConfigService
-
-    all_settings = await ConfigService(session).get_all_settings()
-    return _extract_global_bucket_refs(all_settings, provider_id)
 
 
 async def _read_endpoint_specs(
@@ -521,7 +506,6 @@ async def _read_endpoint_specs(
 
 def _model_to_response(
     m,
-    global_bucket_refs: list[str] | None = None,
     endpoint_spec: EndpointSpec | None = None,
 ) -> ModelResponse:
     requests = endpoint_spec.requests if endpoint_spec is not None else ()
@@ -532,9 +516,9 @@ def _model_to_response(
     return ModelResponse(
         path_overrides=effective_path_overrides(m.path_overrides, requests) or None,
         requests=[EndpointRequestDescriptor(**asdict(r)) for r in requests],
-        system_capabilities=_system_capabilities_for(m.endpoint, m.model_id, endpoint_spec),
+        system_capabilities=_system_capabilities_for(m.endpoint, m.model_id, endpoint_spec, m.entry_binding),
         capability_overrides=_effective_overrides_for_response(
-            m.endpoint, m.model_id, m.capability_overrides, endpoint_spec
+            m.endpoint, m.model_id, m.capability_overrides, endpoint_spec, m.entry_binding
         ),
         id=m.id,
         model_id=m.model_id,
@@ -548,17 +532,14 @@ def _model_to_response(
         matched_entry=(
             matched_entry_summary(m.model_id, media_type, m.entry_binding) if media_type is not None else None
         ),
-        global_bucket_refs=global_bucket_refs or None,
     )
 
 
 def _provider_to_response(
     provider,
     models,
-    global_bucket_refs: dict[str, list[str]] | None = None,
     endpoint_specs: Mapping[str, EndpointSpec] | None = None,
 ) -> ProviderResponse:
-    refs = global_bucket_refs or {}
     return ProviderResponse(
         id=provider.id,
         display_name=provider.display_name,
@@ -568,7 +549,6 @@ def _provider_to_response(
         models=[
             _model_to_response(
                 m,
-                refs.get(m.model_id),
                 None if endpoint_specs is None else endpoint_specs.get(m.endpoint),
             )
             for m in models
@@ -600,23 +580,84 @@ async def _clear_global_provider_refs(
             await svc.set_setting(key, "")
 
 
-def _cleanup_project_refs(prefix: str, setting_keys: tuple[str, ...]) -> None:
-    """删除 provider 后，清理所有项目 project.json 中的悬空引用。"""
+async def _rename_global_provider_refs(session: AsyncSession, provider_id: int, old_id: str, new_id: str) -> None:
+    """模型改 ID 后，把全局 settings 里指向旧 ID 的引用改写成新 ID（含视频桶键）；不提交事务。"""
+    from lib.config.service import ConfigService
+
+    svc = ConfigService(session)
+    prefix = make_provider_id(provider_id)
+    old_ref, new_ref = f"{prefix}/{old_id}", f"{prefix}/{new_id}"
+    for key in _GLOBAL_BUCKET_REFERENCE_KEYS:
+        if await svc.get_setting(key, "") == old_ref:
+            await svc.set_setting(key, new_ref)
+
+
+def _mutate_all_projects(mutate: Callable[[dict], None]) -> None:
+    """对每个项目的 project.json 应用 ``mutate``；读取失败或项目不可写的跳过（非致命）。"""
     from lib.config.resolver import get_project_manager
 
     pm = get_project_manager()
     for proj_name in pm.list_projects():
         try:
-
-            def _mutate(p: dict, _prefix=prefix, _keys=setting_keys) -> None:
-                for key in _keys:
-                    val = p.get(key, "")
-                    if isinstance(val, str) and val.startswith(_prefix):
-                        p.pop(key, None)
-
-            pm.update_project(proj_name, _mutate)
+            pm.update_project(proj_name, mutate)
         except Exception:
-            pass  # 读取失败或项目不可写，跳过（非致命）
+            logger.warning("同步项目 %s 的模型引用失败，已跳过", proj_name, exc_info=True)
+
+
+def _cleanup_project_refs(prefix: str, setting_keys: tuple[str, ...], model_ids: set[str] | None = None) -> None:
+    """删除 provider 或其中的模型后，清理所有项目 project.json 中的悬空引用。
+
+    ``model_ids`` 为 None 时清理指向该 provider 任一模型的引用（删除供应商），否则只清指向其中模型的引用。
+    ``model_settings`` 里这些模型的条目不受 ``setting_keys`` 约束一律清掉：被删模型的分辨率覆盖已没有用处，
+    留着还会被之后同 ID 的新模型接管。
+    """
+    if model_ids is not None and not model_ids:
+        return
+
+    def _hits(ref: object) -> bool:
+        return (
+            isinstance(ref, str) and ref.startswith(prefix) and (model_ids is None or ref[len(prefix) :] in model_ids)
+        )
+
+    def _mutate(p: dict) -> None:
+        for key in setting_keys:
+            if _hits(p.get(key, "")):
+                p.pop(key, None)
+        model_settings = p.get("model_settings")
+        if isinstance(model_settings, dict):
+            for ref in [r for r in model_settings if _hits(r)]:
+                del model_settings[ref]
+
+    _mutate_all_projects(_mutate)
+
+
+def _rename_project_refs(prefix: str, old_id: str, new_id: str) -> None:
+    """模型改 ID 后，把所有项目里指向旧 ID 的引用改写成新 ID：10 个引用键与 ``model_settings`` 的键。"""
+    old_ref, new_ref = f"{prefix}{old_id}", f"{prefix}{new_id}"
+
+    def _mutate(p: dict) -> None:
+        for key in PROJECT_MODEL_SETTING_KEYS:
+            if p.get(key) == old_ref:
+                p[key] = new_ref
+        model_settings = p.get("model_settings")
+        if isinstance(model_settings, dict) and old_ref in model_settings:
+            model_settings[new_ref] = model_settings.pop(old_ref)
+
+    _mutate_all_projects(_mutate)
+
+
+async def cleanup_project_model_refs(provider_id: int, model_ids: set[str]) -> None:
+    """已提交的模型删除之后，清理项目里指向这些模型的引用（同步文件 I/O，放到线程池）。"""
+    if model_ids:
+        await run_sync_transaction(
+            _cleanup_project_refs, f"{make_provider_id(provider_id)}/", _PROJECT_BACKEND_KEYS, model_ids
+        )
+
+
+async def rename_project_model_refs(provider_id: int, old_id: str, new_id: str) -> None:
+    """已提交的模型改 ID 之后，把项目里指向旧 ID 的引用改写成新 ID（同步文件 I/O，放到线程池）。"""
+    if old_id != new_id:
+        await run_sync_transaction(_rename_project_refs, f"{make_provider_id(provider_id)}/", old_id, new_id)
 
 
 def _check_duplicate_model_ids(models: list[ModelInput], _t: Callable[..., str]) -> None:
@@ -641,6 +682,7 @@ def _check_capability_overrides(
     model_id: str,
     _t: Callable[..., str],
     spec: EndpointSpec | None = None,
+    entry_binding: str | None = None,
 ) -> None:
     """写入侧校验：合成函数对脏值只降级不抛，合法性把关全在这里。
 
@@ -671,9 +713,7 @@ def _check_capability_overrides(
                 ),
             )
         return
-    applicable = MODEL_FACT_OVERRIDE_KEYS.get(media_type, frozenset()) | (
-        CHANNEL_FACT_OVERRIDE_KEYS if media_type == "video" else frozenset()
-    )
+    applicable = overridable_keys(media_type)
     for key, value in overrides.items():
         if key not in applicable:
             raise HTTPException(
@@ -688,11 +728,7 @@ def _check_capability_overrides(
             )
         # 值类型判定复用读取侧的同一函数：两边各写一份会漂移，届时写入侧放行的值被合成
         # 静默忽略，正是本能力覆盖链路要消灭的「界面允许、执行反悔」。
-        if key in CHANNEL_FACT_OVERRIDE_KEYS:
-            expected = CAPABILITY_OVERRIDE_FIELDS[key]
-            valid, expected_name = capability_value_matches(value, expected), capability_type_name(expected)
-        else:
-            valid, expected_name = model_fact_value_matches(key, value), model_fact_type_name(key)
+        valid, expected_name = override_value_check(media_type, key, value)
         if not valid:
             raise HTTPException(
                 status_code=422,
@@ -747,7 +783,9 @@ def _check_capability_overrides(
     # 而不是留给执行期静默降级——降级后用户会拿到「最多支持 0 段」这种无从遵循的提示。
     # 稀疏覆盖只写其中一维也能凑出该组合，故按系统判定补齐未覆盖的那一维再判。
     if any(key in overrides for key in AUDIO_OVERRIDE_KEYS):
-        mode, count = resolve_audio_pair(overrides, endpoint=endpoint, model_id=model_id, endpoint_spec=resolved_spec)
+        mode, count = resolve_audio_pair(
+            overrides, endpoint=endpoint, model_id=model_id, endpoint_spec=resolved_spec, entry_binding=entry_binding
+        )
         if not audio_capability_pair_is_coherent(mode=mode, count=count):
             raise HTTPException(
                 status_code=422,
@@ -774,6 +812,7 @@ def _check_model_capability_overrides(
             m.model_id,
             _t,
             None if specs is None else specs[m.endpoint],
+            m.entry_binding,
         )
 
 
@@ -991,7 +1030,7 @@ async def update_custom_model(
 
     ``changes`` 只含要改的字段（见 :data:`CUSTOM_MODEL_SETTING_FIELDS`），校验规则与整表保存相同。停用时同时
     取消默认；设为默认时同时启用，并取消同一默认分组里其他模型的默认。改了模型 ID 时，全局设置里指向旧 ID 的
-    引用随之清空，与整表保存删掉一个模型同一口径。
+    引用随之改写成新 ID；项目里的引用由调用方在提交后用 :func:`rename_project_model_refs` 改写。
 
     条目绑定只校验形状；是否在目录里、是否与保存后的调用端点同媒体类型，由调用方在提交前核对（见
     ``server/routers/provider_models.py`` 的 ``_apply_binding``），因为同一次保存新建的条目这时还不在目录里。
@@ -1048,7 +1087,7 @@ async def update_custom_model(
         setattr(row, key, value)
     await session.flush()
     if target.model_id != old_model_id:
-        await _clear_global_provider_refs(session, provider_id, {old_model_id})
+        await _rename_global_provider_refs(session, provider_id, old_model_id, target.model_id)
     return row
 
 
@@ -1062,7 +1101,10 @@ def _model_input_rejected(
 
 
 async def remove_custom_model(session: AsyncSession, provider_id: int, model_id: str, _t: Callable[..., str]) -> None:
-    """从自定义供应商移除一个模型，并清空全局设置里指向它的引用；不提交事务。"""
+    """从自定义供应商移除一个模型，并清空全局设置里指向它的引用；不提交事务。
+
+    项目里的引用由调用方在提交后用 :func:`cleanup_project_model_refs` 清理。
+    """
     repo = CustomProviderRepository(session)
     row = await repo.get_model_by_ids(provider_id, model_id)
     if row is None:
@@ -1191,7 +1233,7 @@ async def custom_model_settings(session: AsyncSession, row: CustomProviderModel)
             spec=spec,
             raw_overrides=row.capability_overrides,
             applied_overrides=_effective_overrides_for_response(
-                row.endpoint, row.model_id, row.capability_overrides, spec
+                row.endpoint, row.model_id, row.capability_overrides, spec, row.entry_binding
             ),
             entry_binding=row.entry_binding,
         ),
@@ -1210,16 +1252,12 @@ async def list_providers(
     """列出所有自定义供应商（含模型列表）。"""
     repo = CustomProviderRepository(session)
     pairs = await repo.list_providers_with_models()
-    from lib.config.service import ConfigService
-
-    all_settings = await ConfigService(session).get_all_settings()
     endpoint_specs = await _read_endpoint_specs(session, [model for _, models in pairs for model in models])
     return {
         "providers": [
             _provider_to_response(
                 p,
                 models,
-                _extract_global_bucket_refs(all_settings, p.id),
                 endpoint_specs,
             )
             for p, models in pairs
@@ -1297,7 +1335,6 @@ async def create_provider(
     return _provider_to_response(
         provider,
         models,
-        await _global_bucket_refs_for_provider(session, provider.id),
         await _read_endpoint_specs(session, models),
     )
 
@@ -1317,7 +1354,6 @@ async def get_provider(
     return _provider_to_response(
         provider,
         models,
-        await _global_bucket_refs_for_provider(session, provider_id),
         await _read_endpoint_specs(session, models),
     )
 
@@ -1354,7 +1390,6 @@ async def update_provider(
     return _provider_to_response(
         provider,
         models,
-        await _global_bucket_refs_for_provider(session, provider_id),
         await _read_endpoint_specs(session, models),
     )
 
@@ -1380,6 +1415,7 @@ async def full_update_provider(
         raise HTTPException(status_code=404, detail=_t("provider_not_found"))
     stored_models = {m.model_id: m for m in await repo.list_models(provider_id)}
     models: list[ModelInput] | None = None
+    removed_model_ids: set[str] = set()
     specs: dict[str, EndpointSpec] = {}
     if body.models is not None:
         _check_duplicate_model_ids(body.models, _t)
@@ -1404,15 +1440,16 @@ async def full_update_provider(
         raise HTTPException(status_code=404, detail=_t("provider_not_found"))
     if models is not None:
         await repo.replace_models(provider_id, [m.to_db_dict(specs[m.endpoint]) for m in models])
-        await _clear_global_provider_refs(session, provider_id, stored_models.keys() - {m.model_id for m in models})
+        removed_model_ids = stored_models.keys() - {m.model_id for m in models}
+        await _clear_global_provider_refs(session, provider_id, removed_model_ids)
     await session.commit()
     await invalidate_provider_caches(request)
+    await cleanup_project_model_refs(provider_id, removed_model_ids)
     await session.refresh(provider)
     saved_models = await repo.list_models(provider_id)
     return _provider_to_response(
         provider,
         saved_models,
-        await _global_bucket_refs_for_provider(session, provider_id),
         await _read_endpoint_specs(session, saved_models),
     )
 

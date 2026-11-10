@@ -35,7 +35,7 @@ from lib.infra.data_root_layout import DataRootLayout
 from lib.prompts.prompt_templates.builtin import builtin_templates
 from server.agent_runtime.agent_access_policy import AgentAccessPolicy
 from server.agent_runtime.arcreel_mcp import build_arcreel_mcp_server
-from server.auth import create_token, is_auth_enabled
+from server.auth import EMBEDDED_AGENT_SUB, create_token, is_auth_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +197,7 @@ class OptionsAssembler:
             f"对 ta 的所有项目生效，目录 `{memory_dir.as_posix()}`。文件结构与维护方式同项目记忆。",
             "",
             "- **分级**：对用户所有项目都成立的偏好写入用户记忆；只对本项目成立的留在项目记忆；拿不准留项目记忆",
-            "- **读写**：用 Read / Write / Edit / Glob / Grep 直接读写该目录下的文件；Bash 读不到记忆目录",
+            "- **读写**：用 Read / Write / Edit / Glob / Grep 直接读写该目录下的文件；Bash 读写不了该目录",
         ]
         if index:
             lines.append(f"- **索引**：以下是用户记忆的 `{INDEX_FILENAME}`，你以往会话留下的笔记")
@@ -349,7 +349,7 @@ class OptionsAssembler:
                 "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1",
                 "ARCREEL_API_BASE": (os.environ.get("ARCREEL_API_BASE") or "http://127.0.0.1:1241/api/v1").rstrip("/"),
                 "ARCREEL_API_TOKEN": (
-                    create_token("embedded-agent", expiry_seconds=_EMBEDDED_AGENT_TOKEN_EXPIRY_SECONDS)
+                    create_token(EMBEDDED_AGENT_SUB, expiry_seconds=_EMBEDDED_AGENT_TOKEN_EXPIRY_SECONDS)
                     if is_auth_enabled()
                     else ""
                 ),
@@ -359,7 +359,7 @@ class OptionsAssembler:
 
         def _build_sandbox_and_mcp_server() -> tuple[dict[str, Any], McpSdkServerConfig]:
             # 两者都会扫盘/建目录（sandbox 敏感路径解析、MCP 服务的 ProjectManager），合并一次卸到线程。
-            sandbox = policy.build_sandbox_settings(project_cwd, user_id=user_id)
+            sandbox = policy.build_sandbox_settings(project_cwd)
             # 内置 ArcReel in-process MCP server — handler 跑在主进程，绕过 sandbox。
             server = build_arcreel_mcp_server(project_name=project_name, data_root=self.data_root, user_id=user_id)
             return sandbox, server

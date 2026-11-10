@@ -78,6 +78,7 @@ from lib.episode.source_remap import (
     remap_for_insert,
     remap_for_move,
 )
+from lib.episode.source_trash import trash_source_file
 from lib.script import script_review
 
 if TYPE_CHECKING:
@@ -291,7 +292,7 @@ def _revision(operation: Mapping[str, Any], impact: SourceFileImpact) -> str:
 
 def _restore_file(path: Path, content: bytes | None) -> None:
     if content is None:
-        path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)  # hard-delete: rollback -- 撤销时移除事务前不存在的文件
     else:
         path.write_bytes(content)
 
@@ -377,7 +378,7 @@ def _apply(
         path = episode_source_path(project_dir, episode)
         if path.is_file() and not path.is_symlink():
             _remember(path, undo)
-            path.unlink()
+            path.unlink()  # hard-delete: derived -- 整本源文变化后退下的派生集原文，可由分集账本重新生成
     _sync_snapshots(project_dir, project, docs, change.touched, undo)
     _record_fingerprints(project, docs, change.touched)
 
@@ -415,18 +416,6 @@ def _text_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def _purge_raw_backups(project_dir: Path, rel: str, undo: ExitStack) -> None:
-    """去掉文件的原件备份（``source/raw/`` 下同主干的文件）：内容已换，旧原件不再对应这个文件。"""
-    raw_dir = project_dir / "source" / "raw"
-    if raw_dir.is_symlink() or not raw_dir.is_dir():
-        return
-    stem = Path(rel).stem
-    for path in raw_dir.iterdir():
-        if path.stem == stem and path.is_file() and not path.is_symlink():
-            _remember(path, undo)
-            path.unlink()
-
-
 def _plan_rewrite(
     filename: str, text: str, *, replace: bool, source_kind: SourceKind | None = None
 ) -> Callable[[Path, dict[str, Any]], _Change]:
@@ -444,9 +433,10 @@ def _plan_rewrite(
             kind_change = (rel, source_kind)
 
         def commit(p: dict[str, Any], undo: ExitStack) -> None:
-            _write_text(project_dir / rel, text, undo)
             if replace:
-                _purge_raw_backups(project_dir, rel, undo)
+                # 替换上传：旧文件连同原始上传件进项目回收站，原始上传件不再对应新内容。
+                trash_source_file(project_dir, rel, undo)
+            _write_text(project_dir / rel, text, undo)
             if source_kind is not None:
                 record_whole_source_file_kind(p, rel, source_kind)
 
@@ -485,7 +475,7 @@ def replace_whole_source_file(
     """用新内容替换整本源文文件 ``source/<filename>``：保留它的位置与文件名，类型缺省时不变。
 
     重映射与编辑相同。改了类型时，起点在这个文件、已有脚本规划的切出集归入「因改类型而 stale 的脚本规划」。
-    原件备份随之去掉。
+    旧文件连同原件备份移入项目回收站。
     """
     normalized = _require_text(text)
     operation = {"action": "replace", "file": filename, "text": _text_digest(normalized), "kind": source_kind}
@@ -496,7 +486,7 @@ def replace_whole_source_file(
 def delete_whole_source_file(
     pm: ProjectManager, project_name: str, filename: str, *, revision: str | None = None, dry_run: bool = False
 ) -> SourceFileChangeOutcome:
-    """删除整本源文文件 ``source/<filename>``：等同于删掉它的全部文字，再移出整本源文清单、删掉文件与原件备份。
+    """删除整本源文文件 ``source/<filename>``：等同于删掉它的全部文字，再移出整本源文清单，文件与原件备份移入项目回收站。
 
     文件在服务之外被改动过时同样可以删除。文件在盘上已缺失或读不出时，原文范围起点或终点记在它里面的切出集
     整段按删除处理（读不到它的长度，跨进别的文件的部分也不保留）。
@@ -522,11 +512,7 @@ def delete_whole_source_file(
 
         def commit(p: dict[str, Any], undo: ExitStack) -> None:
             remove_whole_source_file(p, rel)
-            path = project_dir / rel
-            if path.is_file() and not path.is_symlink():
-                _remember(path, undo)
-                path.unlink()
-            _purge_raw_backups(project_dir, rel, undo)
+            trash_source_file(project_dir, rel, undo)
 
         return _Change(docs=[doc for doc in docs if doc.rel_path != rel], remaps=remaps, commit=commit, touched=[rel])
 

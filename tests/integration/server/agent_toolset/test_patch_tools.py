@@ -227,7 +227,8 @@ def _problem_code(outcome: ToolOutcome[ScriptPatchResult]) -> str:
 
 
 class TestPatchEpisodeScript:
-    async def test_four_operation_union_commits_as_one_batch(self, ctx: ToolHarness) -> None:
+    @pytest.mark.parametrize("spelling", ["prefixed", "bare"])
+    async def test_four_operation_union_commits_as_one_batch(self, ctx: ToolHarness, spelling: str) -> None:
         """内嵌信封：摘要在前，其后的 JSON 就是结构化结果，重新生成提示与 mention 警告同时出现在两处。"""
         revision = script_revision(_load(ctx))
         session_server = build_arcreel_mcp_server(project_name="demo", data_root=ctx.data_root)["instance"]
@@ -236,7 +237,7 @@ class TestPatchEpisodeScript:
                 name="patch_episode_script",
                 arguments={
                     "script": "episode_1.json",
-                    "base_revision": revision,
+                    "base_revision": revision.removeprefix("sha256-v1:") if spelling == "bare" else revision,
                     "operations": [
                         {"op": "update", "id": "E1S01", "fields": {"image_prompt.scene": "@[无名路人]回头"}},
                         {"op": "insert", "after_id": "E1S01", "item": _segment("ignored")},
@@ -260,7 +261,7 @@ class TestPatchEpisodeScript:
         assert "无名路人" in summary
         assert "重新生成" in summary
         saved = _load(ctx)["segments"]
-        assert [segment["segment_id"] for segment in saved] == ["E1S01", "E1S02", "E1S02_1"]
+        assert [segment["segment_id"] for segment in saved] == ["E1S01", "E1S02", "E1S04"]
         assert saved[0]["image_prompt"]["scene"] == "@[无名路人]回头"
 
     async def test_batch_multi_segment_multi_field(self, ctx: ToolHarness) -> None:
@@ -645,12 +646,12 @@ class TestPatchEpisodeScriptStructuralOperations:
     @pytest.mark.parametrize(
         ("removed_id", "structural"),
         [
-            # 删掉末条再新增，取号回到被删的号。
+            # 删掉末条再新增：编号只分配、不复用，不会取回被删的号。
             ("E1S02", {"op": "insert", "after_id": "E1S01", "item": _segment("ignored")}),
             ("E1S01_1", {"op": "split", "id": "E1S01", "parts": [_segment("a"), _segment("b")]}),
         ],
     )
-    async def test_new_identity_does_not_inherit_removed_id_assets(
+    async def test_removed_id_is_not_handed_out_again(
         self,
         ctx: ToolHarness,
         removed_id: str,
@@ -672,8 +673,9 @@ class TestPatchEpisodeScriptStructuralOperations:
         out = await _patch(ctx, [{"op": "remove", "id": removed_id}, structural])
 
         _committed(out)
-        recycled = next(segment for segment in _load(ctx)["segments"] if segment["segment_id"] == removed_id)
-        assert recycled["generated_assets"] == {}
+        saved = _load(ctx)["segments"]
+        assert removed_id not in [segment["segment_id"] for segment in saved]
+        assert all((segment.get("generated_assets") or {}).get("video_clip") != "old-paid.mp4" for segment in saved)
         assert adapter.get_entry(old_video) is None
 
     async def test_split_keeps_first_id_and_clears_new_identity_assets(self, ctx: ToolHarness) -> None:
@@ -684,7 +686,8 @@ class TestPatchEpisodeScriptStructuralOperations:
         _committed(out)
         saved = _load(ctx)["segments"]
         ids = [s["segment_id"] for s in saved]
-        assert ids == ["E1S01", "E1S01_1", "E1S02"]
+        # 后续部分取本集用过的最大号之后的新主序号，不再加 _k 后缀
+        assert ids == ["E1S01", "E1S03", "E1S02"]
         assert not saved[0].get("generated_assets")
         assert not saved[1].get("generated_assets")
 
@@ -705,7 +708,7 @@ class TestPatchEpisodeScriptStructuralOperations:
 
         admission = _rejected(out).speech_admission
         assert admission is not None
-        assert admission.unit_id == "E1U1_2"
+        assert admission.unit_id == "E1U3"
         assert admission.problems[0].code == "mixed_speech"
         assert _load(ref_ctx) == before
 

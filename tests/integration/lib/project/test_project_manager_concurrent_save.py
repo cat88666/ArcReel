@@ -20,6 +20,7 @@ import pytest
 from lib.artifacts.version_manager import VersionManager
 from lib.infra.content_digest import canonical_json_digest
 from lib.project import project_manager as project_manager_module
+from lib.project import project_trash
 from lib.project.project_manager import ProjectManager, ScriptWriteConflict
 from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
 from server.services.project.project_archive import ProjectArchiveService
@@ -70,7 +71,7 @@ def _make_script(episode: int, payload_size: int) -> dict:
 
 
 class TestSaveScriptConcurrency:
-    def test_replacement_media_cleanup_keeps_script_writers_locked_out(self, tmp_path: Path, monkeypatch) -> None:
+    def test_removed_entry_media_cleanup_keeps_script_writers_locked_out(self, tmp_path: Path, monkeypatch) -> None:
         pm = ProjectManager(tmp_path)
         _seed_project(pm, "demo")
         script = _make_script(1, 1)
@@ -82,26 +83,26 @@ class TestSaveScriptConcurrency:
         versions = VersionManager(project_path)
         versions.add_version("videos", "E1S0", "old", source_file=current)
         script_lock = project_path / "scripts" / ".episode_1.json.lock"
-        checked: list[Path] = []
-        original_unlink = Path.unlink
+        checked: list[str] = []
+        original_record = project_trash.record_deletion
 
-        def guarded_unlink(path: Path, *args, **kwargs) -> None:
-            if path == current:
-                # 媒体被删除时，独立写方不能取得正式剧本锁并提交新产物。
-                with (
-                    pytest.raises(portalocker.AlreadyLocked),
-                    portalocker.Lock(script_lock, flags=portalocker.LOCK_EX | portalocker.LOCK_NB),
-                ):
-                    pass
-                checked.append(path)
-            original_unlink(path, *args, **kwargs)
+        def guarded_record(project_dir: Path, obj, files, **kwargs):
+            # 旧媒体移进项目回收站时，独立写方不能取得正式剧本锁并提交新产物。
+            with (
+                pytest.raises(portalocker.AlreadyLocked),
+                portalocker.Lock(script_lock, flags=portalocker.LOCK_EX | portalocker.LOCK_NB),
+            ):
+                pass
+            checked.append(obj["id"])
+            return original_record(project_dir, obj, files, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", guarded_unlink)
-        pm.save_script("demo", script, "episode_1.json", replaced_resource_ids=("E1S0",))
+        monkeypatch.setattr(project_trash, "record_deletion", guarded_record)
+        script["segments"][0]["segment_id"] = "E1S1"
+        pm.save_script("demo", script, "episode_1.json")
 
-        assert checked == [current]
+        assert checked == ["E1S0"]
         assert not current.exists()
-        assert versions.get_versions("videos", "E1S0")["versions"] == []
+        assert not versions.has_versions("videos", "E1S0")
 
     def test_same_name_project_creation_claims_directory_atomically(self, tmp_path: Path, monkeypatch) -> None:
         pm = ProjectManager(tmp_path)

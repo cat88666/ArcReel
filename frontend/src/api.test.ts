@@ -9,6 +9,7 @@ import {
   SpeechAdmissionError,
 } from "@/api";
 import i18n from "@/i18n";
+import { useProjectsStore } from "@/stores/projects-store";
 import { clearToken, setToken } from "@/utils/auth";
 import { flushStream, stubSseFetch } from "@/test/fakeSseFetch";
 
@@ -52,6 +53,7 @@ describe("API", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    useProjectsStore.setState({ currentScripts: {} });
   });
 
   it.each([
@@ -212,19 +214,23 @@ describe("API", () => {
     });
 
     it("preserves and presents a structured speech admission blocker", async () => {
+      // 文案按单元在本集里的当前位置称呼：E1U2 排在第 2 位。
+      useProjectsStore.setState({
+        currentScripts: { "episode_1.json": { episode: 1, video_units: [{ unit_id: "E1U5" }, { unit_id: "E1U2" }] } as never },
+      });
       const admission = {
         allowed: false as const,
-        unit_id: "E1S01",
+        unit_id: "E1U2",
         mode: null,
         problems: [{
           code: "needs_replan" as const,
-          unit_id: "E1S01",
+          unit_id: "E1U2",
           locations: [{ path: ["needs_replan"], line: null }],
           reason: "unit_marked_needs_replan",
           action: "replan_unit",
         }, {
           code: "mixed_speech" as const,
-          unit_id: "E1S01",
+          unit_id: "E1U2",
           locations: [
             { path: ["utterances", 0, "text"], line: null },
             { path: ["utterances", 1, "text"], line: null },
@@ -239,16 +245,15 @@ describe("API", () => {
 
       const error: SpeechAdmissionError = await API.generateVideo(
         "demo",
-        "E1S01",
+        "E1U2",
         "vid",
         "episode_1.json",
       ).catch((e) => e);
 
       expect(error).toBeInstanceOf(SpeechAdmissionError);
       expect(error.admission).toEqual(admission);
-      expect(error.message).toContain("S01");
-      expect(error.message).not.toContain("E1S01");
-      expect(error.message).toContain("utterances.0.text");
+      expect(error.message).toContain("视频单元 2 在 utterances.0.text, utterances.1.text 同时包含角色台词和旁白");
+      expect(error.message).not.toContain("U2");
     });
 
     it("preserves the shared script-edit result from compatibility endpoints", async () => {
@@ -1079,7 +1084,7 @@ describe("API", () => {
             jsonData: {
               detail: "导入包校验失败",
               errors: ["缺少 project.json", "缺少 scripts/episode_1.json"],
-              warnings: ["发现未识别的附加文件/目录: extra"],
+              warnings: ["发现未识别的附加文件/目录：extra"],
               diagnostics: {
                 blocking: [
                   { code: "validation_error", message: "缺少 project.json" },
@@ -1089,7 +1094,7 @@ describe("API", () => {
                   { code: "missing_clues_field", message: "segments[0]: 补全缺失字段 clues_in_segment" },
                 ],
                 warnings: [
-                  { code: "validation_warning", message: "发现未识别的附加文件/目录: extra" },
+                  { code: "validation_warning", message: "发现未识别的附加文件/目录：extra" },
                 ],
               },
             },
@@ -1105,7 +1110,7 @@ describe("API", () => {
         message: "导入包校验失败",
         detail: "导入包校验失败",
         errors: ["缺少 project.json", "缺少 scripts/episode_1.json"],
-        warnings: ["发现未识别的附加文件/目录: extra"],
+        warnings: ["发现未识别的附加文件/目录：extra"],
         diagnostics: {
           blocking: [
             { code: "validation_error", message: "缺少 project.json" },
@@ -1115,7 +1120,7 @@ describe("API", () => {
             { code: "missing_clues_field", message: "segments[0]: 补全缺失字段 clues_in_segment" },
           ],
           warnings: [
-            { code: "validation_warning", message: "发现未识别的附加文件/目录: extra" },
+            { code: "validation_warning", message: "发现未识别的附加文件/目录：extra" },
           ],
         },
       });
@@ -1577,6 +1582,24 @@ describe("API.referenceVideos", () => {
       confirmed_request_durations: { E1U1: 8 },
     });
     expect(res.decision).toBe("admitted");
+  });
+
+  it("previewReferenceVideoBatch posts the same selection to the preview endpoint", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ decision: "admitted", units: [], skipped_unit_ids: [], estimated_cost: null, unpriced_count: 0 }),
+        { status: 200 },
+      ),
+    );
+
+    const res = await API.previewReferenceVideoBatch("proj", 1, { unit_ids: ["E1U1"] });
+
+    expect(fetchMock.mock.calls[0]![0]).toContain(
+      "/projects/proj/reference-videos/episodes/1/units/generate-batch/preview",
+    );
+    expect(fetchMock.mock.calls[0]![1]!.method).toBe("POST");
+    expect(JSON.parse(fetchMock.mock.calls[0]![1]!.body as string)).toEqual({ unit_ids: ["E1U1"] });
+    expect(res.unpriced_count).toBe(0);
   });
 
   it("precheckReferenceVideoDuration sends no query string", async () => {

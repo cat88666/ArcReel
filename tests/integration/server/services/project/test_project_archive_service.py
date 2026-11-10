@@ -7,17 +7,24 @@ import stat
 import zipfile
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
 
 import pytest
 
-from lib.artifacts.artifact_activation import ArtifactCurrencyResolver
+from lib.artifacts.artifact_activation import (
+    ArtifactCurrencyResolver,
+    stage_preserved_artifact_claims,
+    take_migrated_artifact_claims,
+)
+from lib.artifacts.artifact_currency import read_artifact_content_digest
 from lib.artifacts.artifact_manifest import (
     MANIFEST_FILENAME,
     ArtifactBasis,
     ArtifactBasisDescriptor,
     ArtifactKey,
+    ArtifactManifestArchiveSnapshot,
     ArtifactManifestEntry,
     ArtifactStatus,
     ProjectArtifactManifestAdapter,
@@ -32,6 +39,8 @@ from lib.final_cut.basis import FinalCutVariant, final_cut_artifact_path, final_
 from lib.i18n import _
 from lib.infra.validation_messages import default_translate
 from lib.jianying_draft.basis import jianying_draft_artifact_path, jianying_draft_key
+from lib.project import deleted_projects, project_trash
+from lib.project.asset_derivatives import derivative_artifact_key
 from lib.project.project_manager import ProjectManager
 from lib.project.project_migration_report import load_migration_report
 from lib.project.project_migrations.runner import migrate_project_dir
@@ -47,19 +56,20 @@ from server.services.project.project_archive import (
     ProjectArchiveValidationError,
 )
 from tests.factories import wav_bytes
+from tests.legacy_project_shapes import write_legacy_named_reference_bases_project
 
 
 class _RetireRecorder:
-    """记下覆盖导入收尾的项目名，可在目录替换之后模拟提交失败。数据库那一半由导入路由的测试覆盖。"""
+    """记下覆盖导入收尾的项目目录名，可在目录替换之后模拟提交失败。数据库那一半由导入路由的测试覆盖。"""
 
     def __init__(self, *, fail_after_replace: bool = False) -> None:
         self.retired: list[str] = []
         self._fail_after_replace = fail_after_replace
 
     @contextmanager
-    def __call__(self, project_name: str) -> Generator[None]:
-        self.retired.append(project_name)
-        yield
+    def __call__(self, project_dir: Path) -> Generator[str]:
+        self.retired.append(project_dir.name)
+        yield f"{project_dir.name}#deleted-20261025T000000Z"
         if self._fail_after_replace:
             raise RuntimeError("commit failed")
 
@@ -1340,6 +1350,22 @@ class TestProjectArchiveService:
         assert result.project_name != "demo"
         assert (pm.get_project_path(result.project_name) / "project.json").exists()
 
+    @pytest.mark.parametrize("schema_version", [0, 1])
+    def test_import_minimal_legacy_archive_has_no_backup_warnings(self, tmp_path, schema_version):
+        pm = ProjectManager(tmp_path / "projects")
+        archive_path = tmp_path / "legacy.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(
+                "project.json",
+                json.dumps({"schema_version": schema_version, "title": "Demo", "content_mode": "narration"}),
+            )
+
+        result = ProjectArchiveService(pm).import_project_archive(archive_path, uploaded_filename="legacy.zip")
+
+        assert result.project["schema_version"] == CURRENT_PROJECT_SCHEMA_VERSION
+        assert list(pm.get_project_path(result.project_name).glob("project.json.bak.v*"))
+        assert not any(warning.key == "val_unrecognized_entry" for warning in result.warnings)
+
     def test_import_legacy_v1_archive_runs_migration(self, tmp_path):
         """启动后导入的旧归档（schema_version=1 + legacy image_backend）在导入入口走完整迁移链。"""
         import json as _json
@@ -1762,9 +1788,14 @@ class TestProjectArchiveService:
         assert (pm.get_project_path("demo") / "source" / "chapter.txt").read_text(encoding="utf-8") == "source"
         assert retire.retired == ["demo"]
         assert not list(pm.projects_dir.glob(".import-*"))
+        # 被覆盖的旧项目成为已删除项目
+        [replaced] = deleted_projects.list_entries(pm.layout)
+        assert replaced.name == "demo"
+        replaced_dir = pm.layout.deleted_projects_dir / replaced.id
+        assert json.loads((replaced_dir / "project.json").read_text(encoding="utf-8"))["style"] == "Stale"
 
     def test_import_overwrite_drops_the_project_memory_of_the_replaced_project(self, tmp_path):
-        """覆盖导入等同于删除现有项目再导入：旧项目的记忆随旧目录删除，不带进新项目。"""
+        """覆盖导入等同于删除现有项目再导入：旧项目的记忆随旧项目进入已删除项目，不带进新项目。"""
         pm = ProjectManager(tmp_path / "projects")
         _create_project(pm, style="Fresh")
         service = ProjectArchiveService(pm, retire_project=_RetireRecorder())
@@ -1782,10 +1813,13 @@ class TestProjectArchiveService:
         assert not (pm.get_project_path("demo") / ".arcreel").exists()
         assert not list(pm.projects_dir.glob(".import-*"))
 
-    def test_export_omits_project_memory(self, tmp_path):
+    def test_export_omits_project_memory_and_trash(self, tmp_path):
+        """项目私有区（项目记忆与项目回收站）都不随归档导出。"""
         pm = ProjectManager(tmp_path / "projects")
         project_dir = _create_project(pm)
         _write_text(project_dir / ".arcreel" / "memory" / "MEMORY.md", "index")
+        _write_text(project_dir / "notes.txt", "deleted later")
+        project_trash.record_deletion(project_dir, {"kind": "file", "path": "notes.txt"}, ["notes.txt"])
 
         service = ProjectArchiveService(pm)
         archive_path, _ = service.export_project("demo")
@@ -2507,3 +2541,79 @@ class TestArchiveDiagnosticsLocalization:
             manifest = json.loads(archive.read(f"demo/{ARCHIVE_MANIFEST_NAME}"))
         messages = [item["message"] for item in manifest["export_diagnostics"]["warnings"]]
         assert any("notes.txt" in message and re.search(r"[一-鿿]", message) for message in messages)
+
+
+def test_an_archive_exported_at_schema_18_keeps_storyboards_and_grids_current_after_import(tmp_path, monkeypatch):
+    """信封里的 claim 与原地升级一样经迁移链平移：v18→v19 改了分镜图与宫格的依据口径，导入后它们仍是 current。"""
+    source = ProjectManager(tmp_path / "source")
+    write_legacy_named_reference_bases_project(source.projects_dir, name="demo")
+    # 模拟 schema 18 发行版的导出器：它把 18 当作当前版本，把清单放进信封。
+    monkeypatch.setattr(project_archive_module, "project_schema_is_current", lambda _project: True)
+    archive_path, _ = ProjectArchiveService(source).export_project("demo")
+    monkeypatch.undo()
+    with zipfile.ZipFile(archive_path) as archive:
+        assert "artifact_manifest" in json.loads(archive.read(f"demo/{ARCHIVE_MANIFEST_NAME}"))
+    target = ProjectManager(tmp_path / "target")
+
+    ProjectArchiveService(target).import_project_archive(
+        archive_path, uploaded_filename="demo.zip", confirm_report=True
+    )
+
+    project_dir = target.get_project_path("demo")
+    entries = ProjectArtifactManifestAdapter(project_dir).snapshot_entries()
+    resolver = ArtifactCurrencyResolver(project_dir)
+    for key in (
+        ArtifactKey.episode_grid(1, "grid_123456789abc"),
+        ArtifactKey.episode_storyboard(1, "E1S01"),
+        ArtifactKey.episode_storyboard(1, "E1S02"),
+        ArtifactKey.episode_storyboard(1, "E1S03"),
+    ):
+        assert resolver.compare(key, artifact_path=entries[key].artifact_path).status is ArtifactStatus.CURRENT
+
+
+def test_claims_the_migration_chain_rekeys_keep_their_archived_content_digests(tmp_path):
+    """迁移给 claim 换键并搬图（依据摘要与字节不变）时，新键沿用信封里旧键的内容摘要；同字节的两条各自沿用。
+
+    迁移补录的条目对不上旧 claim，不带摘要。
+    """
+    project_dir = tmp_path / "staging"
+    _write_json(project_dir / "project.json", {"schema_version": CURRENT_PROJECT_SCHEMA_VERSION - 1})
+    basis = ArtifactBasis.build("test/uploaded-sheet", kind_version=1, inputs={"bytes": "same"})
+    moves = {
+        derivative_artifact_key("Ann", name): (
+            derivative_artifact_key("Alice", name),
+            f"characters/derivatives/Ann/{name}.png",
+            f"characters/derivatives/Alice/{name}.png",
+        )
+        for name in ("Hat", "Cap")
+    }
+    for _new_key, old_path, _new_path in moves.values():
+        _write_bytes(project_dir / old_path, b"same bytes")
+    _write_bytes(project_dir / "characters/Bob.png", b"bob")
+    claims = {
+        old_key: ArtifactManifestEntry(artifact_path=old_path, basis_digest=basis.digest)
+        for old_key, (_new_key, old_path, _new_path) in moves.items()
+    }
+    adapter = ProjectArtifactManifestAdapter(project_dir)
+    digest = read_artifact_content_digest(adapter, next(iter(claims.values())).artifact_path)
+    preserved = ArtifactManifestArchiveSnapshot(entries=claims, content_digests=dict.fromkeys(claims, digest))
+
+    assert stage_preserved_artifact_claims(project_dir, preserved)
+    (project_dir / "characters/derivatives/Alice").mkdir(parents=True)
+    replacements: dict[ArtifactKey, ArtifactManifestEntry | None] = {}
+    for old_key, (new_key, old_path, new_path) in moves.items():
+        (project_dir / old_path).rename(project_dir / new_path)
+        replacements[old_key] = None
+        replacements[new_key] = replace(claims[old_key], artifact_path=new_path)
+    bob_basis = ArtifactBasis.build("test/asset-sheet", kind_version=1, inputs={"sheet": "bob"})
+    replacements[_BOB_SHEET] = ArtifactManifestEntry(artifact_path="characters/Bob.png", basis_digest=bob_basis.digest)
+    assert adapter.replace_entries_if_matches_atomically(expected=claims, replacements=replacements)
+
+    carried = take_migrated_artifact_claims(project_dir, preserved)
+
+    assert carried.entries == {new_key: replacements[new_key] for new_key, _old, _new in moves.values()}
+    assert carried.content_digests == {new_key: digest for new_key, _old, _new in moves.values()}
+    assert not (project_dir / MANIFEST_FILENAME).exists()
+
+
+_BOB_SHEET = ArtifactKey.asset_sheet("character", "Bob")

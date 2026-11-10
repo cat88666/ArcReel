@@ -87,6 +87,24 @@ os.environ["ARCREEL_DATA_DIR"] = str(Path(_OWNED_TEST_HOME_DIR) / "data")
 os.environ["CLAUDE_CONFIG_DIR"] = str(Path(_OWNED_TEST_HOME_DIR) / "claude-config")
 os.environ.pop("AI_ANIME_PROJECTS", None)
 
+# 未设置 AUTH_TOKEN_SECRET 时，签名密钥由 lifespan 在启动期从数据根读出或生成，之后缓存在进程内。
+# 不经 lifespan 直接签发 token 的用例会在事件循环上首次读写密钥文件，缓存又跨用例共享，
+# 哪条用例撞上首次读写取决于执行顺序。钉一个固定值；验证密钥持久化的用例自行 delenv。
+if not os.environ.get("AUTH_TOKEN_SECRET"):
+    os.environ["AUTH_TOKEN_SECRET"] = "arcreel-test-token-secret-0123456789abcdef"
+
+# `import lib` 时 `lib.infra.env_init` 读取 .env：项目根没有 .env 就向上回溯，`.worktrees/` 下的
+# worktree 会读到主检出的 .env，其中的 provider 密钥让走 lifespan 的用例被启动期密钥检查拦下。
+# 测试结果不应依赖 checkout 里外的 .env，故整个测试进程（含其子进程）不读 .env；
+# 验证读取规则的用例自行 delenv。
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+
+# lifespan 的 `ensure_auth_password` 在 AUTH_PASSWORD 未设置时生成口令并回写项目根的 .env。
+# 钉一个固定值，未替换该步骤的 lifespan 用例不再改写仓库里的 .env；验证生成与回写的用例
+# 自行清掉 AUTH_PASSWORD 并传入 tmp 下的 env_path。
+if not os.environ.get("AUTH_PASSWORD"):
+    os.environ["AUTH_PASSWORD"] = "arcreel-test-password"
+
 
 def _remove_owned_test_home_dir() -> None:
     """只在创建临时目录的进程里回收（pid 守卫的理由同 ``_remove_owned_test_db_dir``）。"""
@@ -104,7 +122,8 @@ from server.agent_runtime.session_manager import SessionManager
 from server.agent_runtime.session_store import SessionMetaStore
 
 # 事件循环阻塞护栏：同步与异步用例全程启用，豁免清单外的阻塞调用让用例失败，见 tests/blocking_guard。
-pytest_plugins = ["tests.blocking_guard"]
+# 挂起诊断：设了 ARCREEL_TEST_HANG_DUMP_DIR 时，进程长时间无进展就转储全部线程的调用栈，见 tests/hang_watchdog.py。
+pytest_plugins = ["tests.blocking_guard", "tests.hang_watchdog"]
 
 
 @pytest.fixture
@@ -241,6 +260,68 @@ def stub_sandbox_check(isolated_data_root, monkeypatch, request):
     if request.path.name == "test_startup_assertions.py":
         return
     monkeypatch.setattr("server.app.check_sandbox_available", lambda: True)
+
+
+@pytest.fixture(autouse=True)
+def offline_official_catalog_sync(isolated_data_root, monkeypatch):
+    """应用 lifespan 启动的模型目录官方同步换成不发请求的空任务。
+
+    真实 lifespan 会立刻向目录数据仓库的 raw 地址取清单文件，用例结果随之依赖外网与网络时序：
+    断网时抓取立即失败、在后台写同步表并改进程内的同步状态，联网时又可能卡在建连上拖住关停。
+    这里只换 lifespan 引用的入口，autouse 让以后新增的 lifespan 用例同样不外发；空任务照常由
+    ``stop_official_sync`` 取消。同步本身的行为由 ``tests/integration/lib/catalog/test_official_sync.py``
+    直接调用 ``lib.catalog.official_sync`` 覆盖，不受影响。
+    """
+
+    def start_offline(*args, **kwargs) -> asyncio.Task[bool]:
+        return asyncio.get_running_loop().create_task(asyncio.Event().wait(), name="catalog-official-sync-offline")
+
+    monkeypatch.setattr("server.app.start_official_sync", start_offline)
+
+
+@pytest.fixture(autouse=True)
+def idle_asset_library_ingest(monkeypatch):
+    """应用 lifespan 启动的素材库入库循环换成不访问数据库与网络的空循环。
+
+    真实循环启动时即查询入库任务表并按间隔轮询，lifespan 用例的数据库与关停时序会随之变化。入库循环本身由
+    ``tests/unit/lib/asset_library`` 与 ``tests/unit/server/routers/test_provider_asset_links_api.py`` 直接调用
+    ``lib.asset_library.ingest.run_once`` 覆盖。
+    """
+    from lib.asset_library import ingest
+
+    class _IdleRunner(ingest.AssetIngestRunner):
+        async def _loop(self) -> None:
+            await asyncio.Event().wait()
+
+    def start_idle(session_factory) -> ingest.AssetIngestRunner:
+        runner = _IdleRunner(session_factory)
+        runner.start()
+        return runner
+
+    monkeypatch.setattr("server.app.start_asset_ingest", start_idle)
+
+
+@pytest.fixture(autouse=True)
+def idle_material_maintenance(monkeypatch):
+    """应用 lifespan 启动的远端素材维护循环换成空循环，理由同 ``idle_asset_library_ingest``。
+
+    结算、补偿删除与工作文件清理由 ``tests/integration/server/routers/test_remote_material_storage.py``
+    直接调用 ``lib.material`` 的入口覆盖。
+    """
+    from lib.material import maintenance
+
+    class _IdleMaintenance(maintenance.MaterialMaintenance):
+        async def _loop(self) -> None:
+            await asyncio.Event().wait()
+
+    def start_idle(
+        session_factory, projects_dir, deleted_projects_dir=None, data_root=None
+    ) -> maintenance.MaterialMaintenance:
+        runner = _IdleMaintenance(session_factory, projects_dir, deleted_projects_dir, data_root)
+        runner.start()
+        return runner
+
+    monkeypatch.setattr("server.app.start_material_maintenance", start_idle)
 
 
 #: 测试内主机名统一解析到的地址（TEST-NET-3，公网段、不可路由）。

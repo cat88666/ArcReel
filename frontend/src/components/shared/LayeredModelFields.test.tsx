@@ -3,7 +3,8 @@ import { describe, it, expect, vi } from "vitest";
 import type { ComponentProps } from "react";
 import userEvent from "@testing-library/user-event";
 import "@/i18n";
-import { LayeredModelFields, effectiveModel, type LayeredSubField } from "./LayeredModelFields";
+import { LayeredModelFields, type LayeredSubField } from "./LayeredModelFields";
+import { effectiveModel } from "./model-layers";
 
 const OPTIONS = ["gemini/veo-3", "ark/seedance"];
 const PROVIDER_NAMES = { gemini: "Gemini", ark: "Ark" };
@@ -108,6 +109,33 @@ describe("LayeredModelFields", () => {
     await openSelect(user, "图生视频");
     expect(screen.getByRole("option", { name: /veo-3/ })).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: /seedance/ })).not.toBeInTheDocument();
+  });
+
+  it("lists the models a sub-field filters out at the end of its dropdown, with the reason and not selectable", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderFields({
+      subFields: [
+        subField({
+          onChange,
+          filtered: [
+            { option: "ark/seedance", unmet: ["first_frame"] },
+            { option: "gemini/veo-2", unmet: [] },
+          ],
+        }),
+      ],
+    });
+    await user.click(disclosure()!);
+    await openSelect(user, "图生视频");
+
+    expect(screen.getByRole("group", { name: "不能用于图生视频" })).toBeInTheDocument();
+    const seedance = screen.getByRole("option", { name: /Ark · seedance/ });
+    expect(seedance).toHaveTextContent("不接受首帧");
+    expect(seedance).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("option", { name: /veo-2/ })).toHaveTextContent("无法判断是否支持");
+
+    await user.click(seedance);
+    expect(onChange).not.toHaveBeenCalled();
   });
 
   it("routes a sub-field selection to that sub-field's own onChange", async () => {

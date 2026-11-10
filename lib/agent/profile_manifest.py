@@ -28,8 +28,10 @@ from typing import Literal, cast
 
 import portalocker
 
+from lib.artifacts.formal_write import project_metadata_lock
 from lib.infra.content_digest import sha256_file
 from lib.infra.path_safety import PathTraversalError, safe_join
+from lib.project import project_trash
 
 logger = logging.getLogger(__name__)
 
@@ -416,7 +418,7 @@ def save_manifest(
         os.replace(tmp_str, path)
     except BaseException:
         with contextlib.suppress(OSError):
-            os.unlink(tmp_str)
+            os.unlink(tmp_str)  # hard-delete: temp -- 清单原子写的临时文件
         raise
     return True
 
@@ -441,7 +443,7 @@ def _safe_unlink_if_file(path: Path) -> None:
     # symlink to file → 识别成 True，unlink 删 symlink 本体而非 target；
     # 真 file → 识别 True + unlink。这是安全的，target 文件永远不会被误删。
     if path.is_file():
-        path.unlink()
+        path.unlink()  # hard-delete: derived -- 上游移除且用户未改过的 profile 物化文件，可由 profile 重新物化
 
 
 def _safe_copy(source: Path, dest: Path) -> None:
@@ -460,7 +462,7 @@ def _safe_copy(source: Path, dest: Path) -> None:
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_symlink():
-        dest.unlink()
+        dest.unlink()  # hard-delete: infra -- 复制前移除目标处的符号链接，防止写穿到链接目标
     # 拒绝 dest 是真实目录的情况：``shutil.copy2(src, dest_dir)`` 会变成 copy 到
     # ``dest_dir/src.name`` 这种意外路径而不是失败。决策表里 rel 永远是文件级别，
     # 出现 dest 是目录 = 用户/归档预置的同名目录，应显式失败让上层计 errors。
@@ -493,6 +495,33 @@ def _new_stats() -> dict:
 # ---------- 首次迁移分支 ----------
 
 
+def _trash_discarded_files(profile_dir: Path, project_dir: Path, mapping: dict[str, str]) -> None:
+    """重置会丢掉的文件（项目独有的、内容与内置 profile 不同的）先成为一条删除记录。
+
+    只收普通文件；不进入符号链接目录，链接本身不是内容。
+    """
+    discarded: list[str] = []
+    top = project_dir / _PROFILE_TOP_FILE
+    candidates = [top] if top.is_file() and not top.is_symlink() else []
+    tree = project_dir / _PROFILE_TREE_ROOT
+    if tree.is_dir() and not tree.is_symlink():
+        for dirpath, _dirnames, filenames in os.walk(tree, followlinks=False):
+            candidates.extend(Path(dirpath) / name for name in filenames)
+    for path in candidates:
+        rel = path.relative_to(project_dir).as_posix()
+        if path.is_symlink() or not path.is_file() or _is_skippable_dest(rel):
+            continue
+        source = profile_dir / mapping[rel] if rel in mapping else None
+        if source is None or not source.is_file() or sha256_file(source) != sha256_file(path):
+            discarded.append(rel)
+    if not discarded:
+        return
+    with project_metadata_lock(project_dir):
+        project_trash.record_deletion(
+            project_dir, {"kind": "agent_profile", "path": _PROFILE_TREE_ROOT}, sorted(discarded)
+        )
+
+
 def _full_reset_from_profile(
     profile_dir: Path,
     project_dir: Path,
@@ -516,14 +545,16 @@ def _full_reset_from_profile(
     # reset 留下半完成状态 + 不完整 manifest。
     dest_tree = project_dir / _PROFILE_TREE_ROOT
     dest_top = project_dir / _PROFILE_TOP_FILE
+    _trash_discarded_files(profile_dir, project_dir, mapping)
+    # 下面删的只剩与内置 profile 一致、随即重新物化的文件，以及符号链接和目录：定制已先进回收站。
     if dest_tree.is_symlink() or dest_tree.is_file():
-        dest_tree.unlink()
+        dest_tree.unlink()  # hard-delete: derived -- 定制已进回收站，其余由 profile 重新物化
     elif dest_tree.is_dir():
-        shutil.rmtree(dest_tree)
+        shutil.rmtree(dest_tree)  # hard-delete: derived -- 定制已进回收站，其余由 profile 重新物化
     if dest_top.is_symlink() or dest_top.is_file():
-        dest_top.unlink()
+        dest_top.unlink()  # hard-delete: derived -- 定制已进回收站，其余由 profile 重新物化
     elif dest_top.is_dir():
-        shutil.rmtree(dest_top)
+        shutil.rmtree(dest_top)  # hard-delete: derived -- 定制已进回收站，其余由 profile 重新物化
 
     manifest = Manifest.empty()
     for rel in sorted(mapping):

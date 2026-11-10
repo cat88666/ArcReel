@@ -35,6 +35,7 @@ from lib.artifacts.visual_artifact_provenance import (
 from lib.db.base import DEFAULT_USER_ID
 from lib.infra.api_errors import NotFoundError
 from lib.infra.async_thread import run_noninterruptible_sync, run_sync_transaction
+from lib.material.work_files import local_work_files
 from lib.project.asset_derivatives import (
     DERIVATIVE_ASSET_TYPE,
     DERIVATIVE_TASK_TYPE,
@@ -142,16 +143,21 @@ def resolve_current_image_rel(
       指向 ``scene_{id}_first.png``）；没有登记指针即没有产物，不按同名文件推断
       current；条目不存在抛 ``KeyError``。
     """
-    return _resolve_current_image_pointer(project, resource_type, resource_id, script)[1]
+    return resolve_current_image_pointer(project, resource_type, resource_id, script)[1]
 
 
-def _resolve_current_image_pointer(
+def resolve_current_image_pointer(
     project: dict[str, Any],
     resource_type: str,
     resource_id: str,
     script: dict[str, Any] | None,
 ) -> tuple[str, str | None]:
-    """Resolve the canonical resource identity and its metadata-owned image pointer."""
+    """Resolve the canonical resource identity and its metadata-owned image pointer.
+
+    The identity is the key the resource's versions are recorded under: the asset's on-disk
+    name (NFC/NFD tolerant), ``本体/衍生`` for a derivative, the item ID for a storyboard.
+    A resource that does not exist, including a malformed derivative ID, raises ``KeyError``.
+    """
 
     if resource_type == "storyboard":
         items, id_field, _, _, _ = get_storyboard_items(script or {})
@@ -167,7 +173,11 @@ def _resolve_current_image_pointer(
         return resolved_id, None
 
     if resource_type == DERIVATIVE_TASK_TYPE:
-        owner_name, derivative_name = split_derivative_artifact_id(resource_id)
+        try:
+            owner_name, derivative_name = split_derivative_artifact_id(resource_id)
+        except ValueError as exc:
+            # 不是「本体名/衍生名」的 ID 不指向任何衍生，与不存在同样处理
+            raise KeyError(f"derivative not found: {resource_id}") from exc
         try:
             target = resolve_derivative_target(project, owner_name, derivative_name)
         except NotFoundError as exc:
@@ -207,7 +217,7 @@ def resolve_usable_image_edit_source(
     resolution and immediately before provider submission.
     """
 
-    resolved_id, artifact_path = _resolve_current_image_pointer(project, resource_type, resource_id, script)
+    resolved_id, artifact_path = resolve_current_image_pointer(project, resource_type, resource_id, script)
     if not artifact_path:
         return None
     if resource_type == "storyboard":
@@ -344,9 +354,11 @@ async def execute_image_edit_task(
             raise ValueError(f"no current image to edit: {resource_type}/{resource_id}")
         # 资产名可能以 NFC/NFD 任一形态传入：选择缝返回真实落盘 key，之后的版本登记与
         # canonical 图路径统一按它写，避免同一资产落出两种编码形式的文件与版本记录。
+        return _project, _project_path, _source
+
+    def _freeze(_project: dict[str, Any], _project_path: Path, _source: _ImageEditSource):
         _key = _source.resource_id
-        _current_rel = _source.artifact_path
-        _current_image = _project_path / _current_rel
+        _current_image = _project_path / _source.artifact_path
         _aspect_ratio = get_aspect_ratio(_project, version_resource_type)
         _frozen = freeze_image_references(
             [_current_image],
@@ -374,8 +386,14 @@ async def execute_image_edit_task(
             raise
         return _project, _project_path, _current_image, _key, _aspect_ratio, _frozen, _basis, _source
 
-    try:
+    async def _prepare_frozen():
         # 读剧本可能顺带落盘迁移
+        prepared_project, prepared_path, source = await run_sync_transaction(_prepare)
+        # 编辑源是缓存已清理的远端内容版本时先取回，冻结期间登记使用
+        async with local_work_files(prepared_path, [source.artifact_path]):
+            return await run_sync_transaction(_freeze, prepared_project, prepared_path, source)
+
+    try:
         (
             project,
             project_path,
@@ -385,7 +403,7 @@ async def execute_image_edit_task(
             frozen_references,
             edit_basis,
             selected_source,
-        ) = await run_sync_transaction(_prepare)
+        ) = await _prepare_frozen()
     except BaseException:
         for frozen in frozen_snapshots:
             await run_noninterruptible_sync(frozen.cleanup)

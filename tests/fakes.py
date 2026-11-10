@@ -10,11 +10,11 @@ import asyncio
 import itertools
 import json
 import threading
-from collections.abc import AsyncIterator, Callable, Generator, Mapping
+from collections.abc import AsyncIterator, Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from instructor.core import InstructorRetryException
 
@@ -31,6 +31,23 @@ _STREAM_EOF = object()
 #: ``lib.custom_provider.comfyui.artifacts.container_matches``），裸占位字节会被判容器不符。
 MP4_BYTES = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00mp4-bytes"
 PNG_BYTES = b"\x89PNG\r\n\x1a\npng-bytes"
+
+
+@contextmanager
+def captured_vertex_credentials() -> Generator[MagicMock]:
+    """替换服务账号私钥解析，保留凭证路径与 scopes 供装配测试断言。"""
+    with patch("google.oauth2.service_account.Credentials.from_service_account_file", autospec=True) as load:
+        yield load
+
+
+@contextmanager
+def failing_manifest_replace(error: BaseException) -> Generator[None]:
+    """让清单的条件替换（迁移改写登记的提交点）抛出 *error*：模拟写入失败，或进程在提交点被杀。"""
+
+    from lib.artifacts.artifact_manifest import ProjectArtifactManifestAdapter
+
+    with patch.object(ProjectArtifactManifestAdapter, "replace_entries_if_matches_atomically", side_effect=error):
+        yield
 
 
 async def write_backend_output(path: Path, data: bytes) -> None:
@@ -65,7 +82,8 @@ class FakeProjectAssetMutationMixin:
         raise NotImplementedError
 
     def get_project_path(self, project_name: str) -> Path:
-        raise NotImplementedError
+        # 替身默认没有项目目录：给一个不存在的位置，新建资产时查项目回收站得到空。
+        return Path("/nonexistent-arcreel-fake-projects") / project_name
 
     def update_asset_entry(
         self,
@@ -75,6 +93,7 @@ class FakeProjectAssetMutationMixin:
         mutate_fn: Callable[[dict], None],
         *,
         on_commit: Callable[[Path], None] | None = None,
+        formal_paths: Sequence[Path] = (),
     ) -> dict[str, Any]:
         from lib.project.asset_types import ASSET_SPECS, resolve_asset_key
 
@@ -152,6 +171,23 @@ def persist_fake_script(project_path: Path, script_file: object, script: object)
     target = project_path / "scripts" / normalized
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+
+
+def write_generation_targets(
+    project_path: Path, *, segments: tuple[str, ...] = (), video_units: tuple[str, ...] = ()
+) -> None:
+    """写一份最小项目数据，让第 1 集剧本里有这些分镜条目与视频单元。
+
+    队列任务的产物提交前会复核目标资源仍在项目中，目标不在时产物进项目回收站。
+    """
+    (project_path / "project.json").write_text(
+        json.dumps({"episodes": [{"episode": 1, "script_file": "scripts/episode_1.json"}]}), encoding="utf-8"
+    )
+    script = {
+        "segments": [{"segment_id": item_id} for item_id in segments],
+        "video_units": [{"unit_id": item_id} for item_id in video_units],
+    }
+    persist_fake_script(project_path, "episode_1.json", script)
 
 
 def select_formal_video(
@@ -1081,14 +1117,31 @@ def use_project_manager(monkeypatch, pm: Any) -> None:
     模块那一处。真实 ``ProjectManager`` 与只实现用到方法的替身都可以传。
     """
     for_pm = lambda: pm  # noqa: E731 -- 同一个工厂装到下列每个调用方
+    monkeypatch.setattr("lib.asset_library.ingest.get_project_manager", for_pm)
     monkeypatch.setattr("lib.config.resolver.get_project_manager", for_pm)
     monkeypatch.setattr("lib.project.project_migration_guard.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.asset_sheets.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.assets.get_project_manager", for_pm)
     monkeypatch.setattr("server.routers.characters.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.derivative_uploads.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.episode_drafts.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.file_view.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.files.get_project_manager", for_pm)
     monkeypatch.setattr("server.routers.generate.get_project_manager", for_pm)
     monkeypatch.setattr("server.routers.grids.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.object_storage.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.products.get_project_manager", for_pm)
     monkeypatch.setattr("server.routers.projects.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.provider_asset_links.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.project_migration.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.project_trash.get_project_manager", for_pm)
     monkeypatch.setattr("server.routers.reference_videos.get_project_manager", for_pm)
+    monkeypatch.setattr("server.routers.shot_uploads.get_project_manager", for_pm)
     monkeypatch.setattr("server.routers.versions.get_project_manager", for_pm)
+    monkeypatch.setattr("server.services.currency.upload_finalize.get_project_manager", for_pm)
+    monkeypatch.setattr("server.services.grid.grid_split.get_project_manager", for_pm)
+    monkeypatch.setattr("server.services.project.end_frame.get_project_manager", for_pm)
+    monkeypatch.setattr("server.services.project.provider_asset_import.get_project_manager", for_pm)
     monkeypatch.setattr("server.services.tasks.generation_context.get_project_manager", for_pm)
     monkeypatch.setattr("server.services.tasks.generation_tasks.get_project_manager", for_pm)
     monkeypatch.setattr("server.services.tasks.image_edit_tasks.get_project_manager", for_pm)
@@ -1099,10 +1152,21 @@ def use_generation_context(monkeypatch, resolve: Callable[..., Any]) -> None:
     """生成任务执行链各入口的 ``resolve_generation_context`` 都换成 *resolve*（返回固定上下文的 async 函数）。
 
     生成任务、正式图提交与参考视频任务各自在模块顶部导入这个解析函数，一处换掉就有一条链拿到真实解析。
+
+    ``MagicMock`` 替身生成器没有显式给出 ``choose_reference_image_assets`` 时，按「没有适用的供应商素材关联」
+    补上：每张参考图都照常发送图片内容。选用规则本身由 ``tests/integration/lib/asset_library`` 覆盖。
     """
-    monkeypatch.setattr("server.services.tasks.formal_image_commit.resolve_generation_context", resolve)
-    monkeypatch.setattr("server.services.tasks.generation_tasks.resolve_generation_context", resolve)
-    monkeypatch.setattr("server.services.tasks.reference_video_tasks.resolve_generation_context", resolve)
+
+    async def _resolve(*args, **kwargs):
+        ctx = await resolve(*args, **kwargs)
+        generator = getattr(ctx, "generator", None)
+        if isinstance(generator, MagicMock) and not isinstance(generator.choose_reference_image_assets, AsyncMock):
+            generator.choose_reference_image_assets = AsyncMock(side_effect=lambda sources: (None,) * len(sources))
+        return ctx
+
+    monkeypatch.setattr("server.services.tasks.formal_image_commit.resolve_generation_context", _resolve)
+    monkeypatch.setattr("server.services.tasks.generation_tasks.resolve_generation_context", _resolve)
+    monkeypatch.setattr("server.services.tasks.reference_video_tasks.resolve_generation_context", _resolve)
 
 
 def use_video_thumbnail_extractor(monkeypatch, extract: Callable[..., Any]) -> None:
@@ -1125,6 +1189,28 @@ def bind_session_factory(monkeypatch, factory) -> None:
     monkeypatch.setattr("lib.db.async_session_factory", factory)
 
 
+def use_projects_session_factory(monkeypatch, factory) -> None:
+    """项目路由开数据库会话改用 *factory*。
+
+    ``server.routers.projects`` 在模块顶部绑定了 ``async_session_factory``（归档导入的收尾与正式提交、配置解析都经它），
+    :func:`bind_session_factory` 替换不到。
+    """
+    monkeypatch.setattr("server.routers.projects.async_session_factory", factory)
+
+
+def use_assets_router_sessions(monkeypatch, factory) -> None:
+    """全局资产库路由经 *factory* 开数据库会话：它在模块顶部绑定了 ``async_session_factory``。"""
+    monkeypatch.setattr("server.routers.assets.async_session_factory", factory)
+
+
+def use_object_storage_sdk(monkeypatch, factory: Callable[..., Any]) -> None:
+    """对象存储的网络边界：``create_sdk_client`` 改调 *factory*（收 ``ObjectStorageConfig``，返回 TOS SDK 客户端替身）。
+
+    TOS SDK 基于 requests，不经 httpx，respx 拦不到；所有对象存取都经这一处构造客户端。
+    """
+    monkeypatch.setattr("lib.object_storage.client.create_sdk_client", factory)
+
+
 def use_sdk_client(monkeypatch, factory: Callable[..., Any]) -> None:
     """``SessionManager`` 建 SDK 客户端时改调 *factory*（收 ``options``，通常返回 :class:`FakeSDKClient`）。"""
     monkeypatch.setattr("server.agent_runtime.session_manager.ClaudeSDKClient", factory)
@@ -1136,6 +1222,14 @@ def use_artifact_registration(monkeypatch, register: Callable[..., Any]) -> None
     写盘出口在函数内晚导入 ``register_current_artifact_if_provable``，替换 ``artifact_activation`` 上的名字即生效。
     """
     monkeypatch.setattr("lib.artifacts.artifact_activation.register_current_artifact_if_provable", register)
+
+
+def use_upload_claim_registration(monkeypatch, register: Callable[..., Any]) -> None:
+    """用户上传成品的产物登记（``register_current_resource_artifact``）改调 *register*，用来注入登记失败。
+
+    上传与导入的正式写入在 ``server.services.currency.upload_finalize`` 里登记，提交钩子失败时整次写入回滚。
+    """
+    monkeypatch.setattr("server.services.currency.upload_finalize.register_current_resource_artifact", register)
 
 
 def use_provider_env(monkeypatch, load: Callable[..., Any]) -> None:
@@ -1154,6 +1248,11 @@ def use_active_tasks_lookup(monkeypatch, lookup: Callable[..., Any]) -> None:
     monkeypatch.setattr("server.services.admission.video_batch_admission.get_active_tasks_for_resources", lookup)
 
 
+def use_project_json_write(monkeypatch, write: Callable[..., Any]) -> None:
+    """``ProjectManager`` 的 JSON 文件系统写入边界改调 *write*。"""
+    monkeypatch.setattr("lib.project.project_manager.atomic_write_json", write)
+
+
 def fail_project_json_write(monkeypatch, project_file: Path) -> None:
     """``ProjectManager`` 写 *project_file* 时抛 ``OSError("injected project write failure")``，其余文件照常写。
 
@@ -1168,7 +1267,7 @@ def fail_project_json_write(monkeypatch, project_file: Path) -> None:
             raise OSError("injected project write failure")
         return real_write(path, data)
 
-    monkeypatch.setattr("lib.project.project_manager.atomic_write_json", _fail_project_write)
+    use_project_json_write(monkeypatch, _fail_project_write)
 
 
 def use_generation_queue(monkeypatch, queue: Any) -> None:

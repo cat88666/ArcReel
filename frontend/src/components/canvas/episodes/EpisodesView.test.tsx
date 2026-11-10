@@ -198,10 +198,11 @@ describe("EpisodesView", () => {
     vi.spyOn(API, "getEpisodesView").mockResolvedValue(VIEW);
     const { location } = renderView("/episodes?upload=episode");
 
-    await findManuscript();
     // 打开对话框的状态在渲染期间从地址参数写入，与正文加载是两次独立的渲染，要等它出现。
     expect(await screen.findByRole("dialog", { name: "上传原文" })).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: /逐集原文/ })).toBeChecked();
+    // 模态对话框打开期间背景对辅助技术隐藏（含之后才加载出的正文），按 hidden 查询确认正文照常加载。
+    expect(await screen.findByRole("region", { name: "整本源文", hidden: true })).toBeInTheDocument();
     await waitFor(() => expect(location.history?.at(-1)).toBe("/episodes"));
   });
 
@@ -377,7 +378,7 @@ describe("EpisodesView", () => {
       const dialog = await screen.findByRole("alertdialog", { name: "删除「番外」" });
       expect(dialog).toHaveTextContent("删除「番外」后无法恢复，以下内容会一并删除：");
       expect(dialog).toHaveTextContent("集原文（8 字）、正式脚本");
-      fireEvent.click(within(dialog).getByRole("button", { name: "删除" }));
+      fireEvent.click(within(dialog).getByRole("button", { name: "移入项目回收站" }));
 
       await waitFor(() => expect(remove).toHaveBeenLastCalledWith("demo", 3, "rev-1"));
     });

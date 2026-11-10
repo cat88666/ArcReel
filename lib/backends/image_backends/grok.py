@@ -65,6 +65,7 @@ class GrokImageBackend:
     """xAI Grok (Aurora) 图片生成后端，支持 T2I 和 I2I。"""
 
     CHANNEL_CAPABILITIES: ClassVar[frozenset[ImageCapability]] = BOTH_IMAGE_CAPABILITIES
+    CHANNEL_REFERENCE_LIMIT: ClassVar[int | None] = _MAX_REFERENCE_IMAGES
 
     def __init__(
         self,
@@ -87,16 +88,15 @@ class GrokImageBackend:
     def capabilities(self) -> set[ImageCapability]:
         return set(self.CHANNEL_CAPABILITIES)
 
-    @property
-    def max_reference_images(self) -> int:
-        return _MAX_REFERENCE_IMAGES
+    async def reference_image_limit(self) -> int | None:
+        return self.CHANNEL_REFERENCE_LIMIT
 
     @staticmethod
     def estimate_usage(facts: ImageRequestFacts) -> Usage:
         refs = facts.reference_count
         return per_image_usage(
             output_images=1,
-            input_images=None if refs is None else min(refs, _MAX_REFERENCE_IMAGES),
+            input_images=refs,
             dimensions={"resolution": facts.image_size} if facts.image_size is not None else None,
         )
 
@@ -109,15 +109,13 @@ class GrokImageBackend:
             "aspect_ratio": _validate_aspect_ratio(request.aspect_ratio),
         }
         if request.image_size is not None:
-            generate_kwargs["resolution"] = request.image_size
+            # xai-sdk 的 convert_image_resolution_to_pb 只接受小写 "1k"/"2k"，目录取值为 "1K"/"2K"
+            generate_kwargs["resolution"] = request.image_size.lower()
 
         # I2I：将所有参考图转为 base64 data URI 列表
         reference_count = 0
         if request.reference_images:
             refs = request.reference_images
-            if len(refs) > _MAX_REFERENCE_IMAGES:
-                logger.warning("Grok 参考图数量 %d 超过上限 %d，截断", len(refs), _MAX_REFERENCE_IMAGES)
-                refs = refs[:_MAX_REFERENCE_IMAGES]
             # 存在性检查与读图编码都是阻塞 I/O，整体卸载到线程，避免堵住事件循环
             data_uris = await asyncio.to_thread(_encode_existing_refs, [ref.path for ref in refs])
             if data_uris:
@@ -146,6 +144,6 @@ class GrokImageBackend:
             usage=per_image_usage(
                 output_images=1,
                 input_images=reference_count,
-                dimensions={"resolution": generate_kwargs["resolution"]} if "resolution" in generate_kwargs else None,
+                dimensions={"resolution": request.image_size} if request.image_size is not None else None,
             ),
         )

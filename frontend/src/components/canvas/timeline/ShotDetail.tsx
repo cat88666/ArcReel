@@ -46,7 +46,8 @@ import { NarrationAudioCard } from "./NarrationAudioCard";
 import { NotesDrawer } from "./NotesDrawer";
 import { PromptPreviewButton } from "@/components/shared/PromptPreviewButton";
 import { ReferencesSection } from "./ReferencesSection";
-import { StatusBadge, statusFromAssets } from "./StatusBadge";
+import { statusFromAssets } from "./shot-status";
+import { StatusBadge } from "./StatusBadge";
 import { ShotStructureActions, type InsertShotHandler } from "./ShotStructureActions";
 import { SegmentBreakToggle } from "./SegmentBreakToggle";
 import { API } from "@/api";
@@ -55,9 +56,9 @@ import { isResourceBusy, isScriptFileBusy } from "@/stores/tasks-store";
 import { useCostStore } from "@/stores/cost-store";
 import { useProjectsStore } from "@/stores/projects-store";
 import { speakerCandidates } from "@/utils/plan-new-assets";
-import { durationIncompatibleLabel } from "@/components/canvas/shared/PlanDurationSelect";
+import { durationIncompatibleLabel } from "@/components/canvas/shared/duration-incompatible";
 import { errMsg } from "@/utils/async";
-import { itemIdWithinEpisode } from "@/utils/episode-display";
+import { useItemPositionLabel } from "@/components/shared/episode-item/useEpisodeItem";
 import { charactersFieldFor, type CharactersField } from "@/utils/script-shape";
 import {
   emptyImagePrompt,
@@ -471,6 +472,7 @@ export function ShotDetail({
   editRef,
 }: ShotDetailProps) {
   const { t } = useTranslation("dashboard");
+  const itemLabel = useItemPositionLabel(segmentId);
   const status = statusFromAssets(segment.generated_assets?.status);
   const segCost = useCostStore((s) => s.getSegmentCost(segmentId));
   const isAd = contentMode === "ad";
@@ -504,7 +506,7 @@ export function ShotDetail({
     source,
     save,
     isEqual: shotFieldsEqual,
-    leaveTitle: t("shot_leave_title", { id: itemIdWithinEpisode(segmentId) }),
+    leaveTitle: t("shot_leave_title", { id: itemLabel }),
     allowNavigation,
   });
   const { value: fields, setValue, dirty } = unit;
@@ -551,7 +553,7 @@ export function ShotDetail({
       // 复用版本恢复的刷新管线（refreshProject 等由父级回调承载）；刷新失败时父级已提示，不同时报告成功
       const refreshed = kind === "storyboard" ? await onRestoreStoryboard?.() : await onRestoreVideo?.();
       if (refreshed === false) return;
-      useAppStore.getState().pushToast(t("media_upload_success", { id: segmentId }), "success");
+      useAppStore.getState().pushToast(t("media_upload_success", { id: itemLabel }), "success");
     } catch (err) {
       useAppStore.getState().pushToast(t("media_upload_failed", { message: errMsg(err) }), "error");
     } finally {
@@ -879,6 +881,7 @@ export function ShotDetail({
                 <p className="mb-2 text-xs text-muted-foreground">{t("detail_legacy_dialogue_hint")}</p>
                 <ul className="flex flex-col gap-1.5">
                   {legacyDialogue.map((d, i) => (
+                    // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 旧版对白只读展示、只能整体清空，不重排增删，行内无状态，条目没有 ID
                     <li key={i} className="flex items-start gap-2 text-sm">
                       <TruncatedText text={d.speaker} className="w-20 shrink-0 text-muted-foreground" />
                       <span className="min-w-0 flex-1 wrap-break-word whitespace-pre-wrap">{d.line}</span>
@@ -1092,9 +1095,7 @@ export function ShotDetail({
           removeBlockedHint={
             generatingStoryboard || generatingVideo || generatingNarration
               ? t("shot_remove_blocked_generating")
-              : totalCount <= 1
-                ? t("shot_remove_blocked_last")
-                : undefined
+              : undefined
           }
           onInsert={onInsertShot}
           onRemove={onRemoveShot}

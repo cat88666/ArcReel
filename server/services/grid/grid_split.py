@@ -30,6 +30,7 @@ from lib.artifacts.visual_artifact_provenance import (
     VisualReference,
     build_grid_member_storyboard_visual_basis,
     build_stale_grid_member_storyboard_visual_basis,
+    project_basis_records_asset_names,
     project_basis_style_description,
     snapshot_visual_references,
     visual_file_digest,
@@ -37,6 +38,8 @@ from lib.artifacts.visual_artifact_provenance import (
 )
 from lib.infra.async_thread import run_noninterruptible_sync
 from lib.infra.path_safety import safe_join
+from lib.material.formal_objects import formal_commit
+from lib.material.work_files import local_work_files
 from lib.project.project_manager import get_project_manager
 from lib.script.grid.grid_manager import GridManager
 from lib.script.grid.models import GridGeneration
@@ -77,7 +80,25 @@ async def apply_grid_split(
     - 每格覆写前旧文件先补登版本、覆写后登记新版本（source="grid_split"）；
     - frame_chain 中已不在剧本内的 scene id 跳过并告警；
     - 完成后写 ``grid.split_at`` 并广播项目变更事件（含逐格指纹供前端 cache-bust）。
+    - 联合图与生成时的参考资产图是缓存已清理的远端内容版本时先取回，参考依据照常记进切出的分镜图；
+      切出的分镜图按新内容版本的全局保存位置写入。
     """
+    grid_image_path = grid.grid_image_path
+    if not grid_image_path:
+        raise GridImageNotReadyError(f"grid {grid.id} has no grid image to split")
+    project_path = await asyncio.to_thread(get_project_manager().get_project_path, project_name)
+    reads = [grid_image_path, *(ref.path for ref in grid.reference_images or [])]
+    async with local_work_files(project_path, reads), formal_commit(project_name):
+        return await _apply_grid_split(project_name, grid, grid_image_path, register_entries=register_entries)
+
+
+async def _apply_grid_split(
+    project_name: str,
+    grid: GridGeneration,
+    grid_image_path: str,
+    *,
+    register_entries: Callable[..., None] | None,
+) -> GridSplitResult:
     from PIL import Image
 
     from lib.script.grid.splitter import split_grid_image
@@ -85,9 +106,6 @@ async def apply_grid_split(
     from server.services.tasks.generation_tasks import emit_generation_success_batch
 
     pm = get_project_manager()
-    grid_image_path = grid.grid_image_path
-    if not grid_image_path:
-        raise GridImageNotReadyError(f"grid {grid.id} has no grid image to split")
 
     def _prepare() -> tuple[Path, GridManager, Path, VersionManager]:
         project_path = pm.get_project_path(project_name)
@@ -145,7 +163,7 @@ async def apply_grid_split(
                     src.load()
                     return snapshot, split_grid_image(src, grid.rows, grid.cols, video_aspect_ratio)
             except BaseException:
-                snapshot.unlink(missing_ok=True)
+                snapshot.unlink(missing_ok=True)  # hard-delete: temp -- 切分用的合成图快照
                 raise
 
         composite_snapshot, cells = _snapshot_and_split()
@@ -194,7 +212,7 @@ async def apply_grid_split(
                 staged_path = Path(staged_name)
                 staged_paths.append(staged_path)
                 os.close(fd)
-                staged_path.unlink()
+                staged_path.unlink()  # hard-delete: temp -- mkstemp 占位文件
                 cell.save(staged_path, format="PNG")
                 version_metadata = {"source": "grid_split", "grid_id": grid.id}
                 version_metadata_by_resource[resource_id] = version_metadata
@@ -318,6 +336,7 @@ async def apply_grid_split(
                                 member_aspect_ratio=member_ratio,
                                 references=references,
                                 source_composite_digest=composite_digest,
+                                asset_names=project_basis_records_asset_names(current_project),
                             )
                         except (OSError, TypeError, ValueError):
                             continue
@@ -410,8 +429,8 @@ async def apply_grid_split(
             return updated_ids, missing_ids
         finally:
             for staged_path in staged_paths:
-                staged_path.unlink(missing_ok=True)
-            composite_snapshot.unlink(missing_ok=True)
+                staged_path.unlink(missing_ok=True)  # hard-delete: temp -- 切分的暂存格
+            composite_snapshot.unlink(missing_ok=True)  # hard-delete: temp -- 切分用的合成图快照
 
     updated_ids, missing_ids = await run_noninterruptible_sync(_split_and_assign)
 

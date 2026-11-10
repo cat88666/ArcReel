@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -25,6 +27,7 @@ from lib.project.asset_types import (
     rekey_equivalent_entries,
 )
 from lib.references.reference_catalog import renamed_reference, split_derivative_reference
+from lib.script.grid.models import ReferenceImage
 from lib.script.reference_video.text_parser import rewrite_mentions
 from lib.script.script_references import iter_reference_sites
 
@@ -56,7 +59,7 @@ class AssetRenameFileCollisionError(ValueError):
 class AssetRenameHistoryCollisionError(ValueError):
     """新名下已有保留的版本历史，整体拒绝、不落盘。
 
-    资产删除只删资产桶 key，版本记录与快照会留下（见 delete_entry）：迁移过去会覆盖这份
+    早先的资产删除只删资产桶 key，版本记录与快照留在项目里：迁移过去会覆盖这份
     历史且不可恢复。与孤儿文件同口径——宁可 fail loud 让用户先处理，也不静默销毁。
     """
 
@@ -154,25 +157,56 @@ def rewrite_payload_references(payload: dict, asset_type: str, old_name: str, ne
     return count
 
 
+def rewrite_grid_reference_images(
+    references: list[ReferenceImage],
+    asset_type: str,
+    old_name: str,
+    new_name: str,
+    path_rewrites: Mapping[str, str],
+) -> int:
+    """就地把宫格记录冻结的参考图里指向 *old_name* 的条目改写为 *new_name*，返回改写数。
+
+    宫格记录冻结的是生成那一刻实际发出的参考图（路径、名字、类型），宫格与切格分镜的依据
+    按它重放；改名搬走了资产图却不改记录，重放就读不到图，宫格因此误判过期。名字按
+    :func:`renamed_reference` 判定（本体改名连带衍生），路径只在命中 *path_rewrites*
+    （本次改名实际迁移的文件，键与值都是项目相对路径）时改写——不是按名命名的文件不会被搬走，
+    原路径仍然有效。
+    """
+    count = 0
+    for reference in references:
+        if reference.ref_type != asset_type:
+            continue
+        renamed = renamed_reference(reference.name, old_name, new_name)
+        if renamed is None:
+            continue
+        path = path_rewrites.get(unicodedata.normalize("NFC", reference.path), reference.path)
+        if renamed != reference.name or path != reference.path:
+            reference.name = renamed
+            reference.path = path
+            count += 1
+    return count
+
+
 def renamed_file_stem(stem: str, old_name: str, new_name: str, *, allow_sequence: bool = False) -> str | None:
     """按「文件 stem = 资产名」不变式推导改名后的 stem；与旧名无关时返回 None。
 
     默认只认 stem 归一后**精确等于**旧名（sheet / 参考图 / 参考音频）。``allow_sequence``
-    额外放行 ``旧名_{序号}`` 形态（product 多图序列，见 server/routers/files.py 的
-    sequenced 命名），仅可用于确实按序号累积命名的位置：资产名本身允许下划线加数字
-    （``validate_asset_name`` 不禁），在普通目录放行该形态会把兄弟资产「旧名_2」的文件
-    一并卷走、把它的路径字段改成悬空。
+    表示该位置的文件全部按 ``名_{序号}`` 机械命名（product 多图序列，见
+    server/routers/files.py 的 sequenced 命名），此时**只**认 ``旧名_{序号}``，不再认 stem
+    恰好等于旧名的文件：资产名本身允许下划线加数字（``validate_asset_name`` 不禁），
+    商品 ``Cup_1`` 与 ``Cup`` 并存时，``Cup`` 的第 1 张原图 ``Cup_1.png`` 的 stem 恰好等于
+    ``Cup_1``，按精确同名认会把它当成 ``Cup_1`` 自己的文件。普通目录不要开 ``allow_sequence``，
+    否则兄弟资产「旧名_2」的文件会被一并卷走、路径字段改成悬空。
 
     比对与拼接都在归一坐标系上进行——macOS 落盘的文件名可能是 NFD。
     """
     normalized = normalize_asset_name(stem)
     target = normalize_asset_name(old_name)
-    if normalized == target:
-        return new_name
-    if allow_sequence:
-        prefix = f"{target}_"
-        if normalized.startswith(prefix) and normalized[len(prefix) :].isdigit():
-            return f"{new_name}_{normalized[len(prefix) :]}"
+    if not allow_sequence:
+        return new_name if normalized == target else None
+    prefix = f"{target}_"
+    if normalized.startswith(prefix) and normalized[len(prefix) :].isdigit():
+        return f"{new_name}_{normalized[len(prefix) :]}"
     return None
 
 
@@ -225,12 +259,45 @@ def rewrite_entry_paths(entry: dict, spec: AssetSpec, old_name: str, new_name: s
     return count
 
 
-def _named_file_dirs(project_dir: Path, spec: AssetSpec) -> list[tuple[Path, bool]]:
-    """按名命名的资产文件所在的目录，及该目录是否放行 ``名字_{序号}`` 形态。"""
-    base = project_dir / spec.subdir
+def _named_file_layout(spec: AssetSpec) -> tuple[tuple[PurePosixPath, bool], ...]:
+    """按名命名的资产文件所在的目录（项目相对），及该目录是否放行 ``名字_{序号}`` 形态。"""
+    base = PurePosixPath(spec.subdir)
     sequenced_refs = "reference_images" in spec.extra_list_fields
-    candidates = ((base, False), (base / "refs", sequenced_refs), (base / "refs_audio", False))
+    return ((base, False), (base / "refs", sequenced_refs), (base / "refs_audio", False))
+
+
+def _named_file_dirs(project_dir: Path, spec: AssetSpec) -> list[tuple[Path, bool]]:
+    candidates = ((project_dir.joinpath(*directory.parts), allow) for directory, allow in _named_file_layout(spec))
     return [(directory, allow_sequence) for directory, allow_sequence in candidates if directory.is_dir()]
+
+
+#: 资产条目里登记上传原件的路径字段（参考图、参考音频、多图序列），按名归属。
+REFERENCE_FILE_FIELDS = ("reference_image", "reference_audio", "reference_images")
+
+
+def named_file_fields(spec: AssetSpec) -> tuple[str, ...]:
+    """该类型条目里按名归属的文件字段：资产图字段，与该类型登记的参考文件字段。"""
+    return (
+        spec.sheet_field,
+        *(
+            field
+            for field in REFERENCE_FILE_FIELDS
+            if field in spec.extra_string_fields or field in spec.extra_list_fields
+        ),
+    )
+
+
+def owns_named_file(spec: AssetSpec, name: str, rel: str) -> bool:
+    """项目相对路径 *rel* 是 *name* 名下的文件，与 :func:`asset_files_named` 同一判据。
+
+    资产图、参考图与参考音频按名归属、不跨资产共用：改名只迁移、删除只带走、恢复只加回本资产名下的文件，
+    指向别处的字段在这些操作之后可能悬空，所以写入时只接受本资产名下的路径。
+    """
+    path = PurePosixPath(rel.replace("\\", "/"))
+    for directory, allow_sequence in _named_file_layout(spec):
+        if path.parent == directory:
+            return renamed_file_stem(path.stem, name, name, allow_sequence=allow_sequence) is not None
+    return False
 
 
 def asset_files_named(project_dir: Path, spec: AssetSpec, name: str) -> list[Path]:
@@ -291,16 +358,40 @@ def plan_asset_file_renames(
     return moves
 
 
+def foreign_named_file_field(
+    spec: AssetSpec, name: str, entry: Mapping[str, object], values: Mapping[str, object]
+) -> str | None:
+    """*values* 新写进按名归属的文件字段的路径里有不在 *name* 名下的，返回第一个这样的字段；都在则为 ``None``。
+
+    只看新写入的值：条目里已有的值原样提交不算新写入。
+    """
+    for field in named_file_fields(spec):
+        value, current = values.get(field), entry.get(field)
+        written = value if isinstance(value, list) else [value]
+        kept = current if isinstance(current, list) else [current]
+        if any(
+            isinstance(item, str) and item and item not in kept and not owns_named_file(spec, name, item)
+            for item in written
+        ):
+            return field
+    return None
+
+
 __all__ = [
+    "REFERENCE_FILE_FIELDS",
     "AssetRenameConflictError",
     "AssetRenameFileCollisionError",
     "AssetRenameHistoryCollisionError",
     "AssetRenameNotFoundError",
     "AssetRenameReport",
     "asset_files_named",
+    "foreign_named_file_field",
+    "named_file_fields",
+    "owns_named_file",
     "plan_asset_file_renames",
     "renamed_file_stem",
     "renamed_relpath",
     "rewrite_entry_paths",
+    "rewrite_grid_reference_images",
     "rewrite_payload_references",
 ]

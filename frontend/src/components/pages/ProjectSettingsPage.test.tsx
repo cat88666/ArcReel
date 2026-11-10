@@ -50,10 +50,12 @@ const FAKE_CANDIDATES = {
   image: {
     default: ["gemini/nano-banana"],
     buckets: { t2i: ["gemini/nano-banana"], i2i: ["gemini/nano-banana"] },
+    filtered: {},
   },
   video: {
     default: ["gemini/veo-3"],
     buckets: { i2v: ["gemini/veo-3"], r2v: [] },
+    filtered: {},
   },
   provider_names: {},
 };
@@ -108,7 +110,8 @@ beforeEach(() => {
     narration_voice: "Ethan",
     narration_speed: 1.2,
   });
-  vi.spyOn(API, "getTtsModelCapabilities").mockResolvedValue({ supports_speed: true });
+  vi.spyOn(API, "getAutoBackends").mockResolvedValue({ t2i: null, i2i: null, i2v: null, r2v: null, text: null });
+  vi.spyOn(API, "getTtsModelCapabilities").mockResolvedValue({ supports_speed: true, voices: [] });
 });
 
 describe("ProjectSettingsPage – 分页与一次保存", () => {
@@ -375,9 +378,28 @@ describe("ProjectSettingsPage – 模型分页的覆盖来源", () => {
     expect(screen.getByText("跟随全局 · veo-3")).toBeInTheDocument();
   });
 
-  it("全局也未指定模型时显示自动选择", async () => {
+  it("全局也未指定模型时显示自动选中的模型", async () => {
     mockConfig();
     mockProject({});
+    vi.spyOn(API, "getAutoBackends").mockResolvedValue({
+      t2i: "gemini/nano-banana",
+      i2i: "gemini/nano-banana",
+      i2v: "gemini/veo-3",
+      r2v: "gemini/veo-3",
+      text: null,
+    });
+    renderAt("/app/projects/demo/settings?tab=models");
+
+    expect(await screen.findByText("跟随全局 · 自动选择（当前：veo-3）")).toBeInTheDocument();
+    expect(screen.getByText("跟随全局 · 自动选择（当前：nano-banana）")).toBeInTheDocument();
+    expect(screen.getByText("跟随全局 · 自动选择（没有可用的供应商）")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: /^默认视频模型$/ })).toHaveTextContent(/自动选择（当前：.*veo-3）/);
+  });
+
+  it("读不到自动选择结果时只显示自动选择", async () => {
+    mockConfig();
+    mockProject({});
+    vi.spyOn(API, "getAutoBackends").mockRejectedValue(new Error("boom"));
     renderAt("/app/projects/demo/settings?tab=models");
 
     expect(await screen.findAllByText("跟随全局 · 自动选择")).toHaveLength(3);

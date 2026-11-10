@@ -1,7 +1,7 @@
 ---
 id: faq
 title: Frequently Asked Questions
-sidebar_position: 7
+sidebar_position: 8
 update_docs: fact-check
 ---
 
@@ -65,6 +65,18 @@ docker compose up -d --force-recreate
 
 For a source deployment, restart the ArcReel service. Do not disable authentication on a public deployment.
 
+### Why didn't my `.env` changes take effect? {#env-changes-not-applied}
+
+A Docker deployment reads `.env` when the container is created. After that, `docker compose restart`, automatic restarts after a crash, and host reboots all keep the environment variables captured at that time. After editing `.env`, run the following in the Compose directory you actually use:
+
+```bash
+docker compose up -d
+```
+
+Do not use `docker compose restart` to apply changes. If startup finds that a process environment variable differs from the mounted `.env`, the log shows one WARNING that lists only the variable names, never their values.
+
+If `AUTH_PASSWORD` is empty, ArcReel generates it only once on first startup and reuses the value in `.env` after restarts. If `AUTH_TOKEN_SECRET` is empty, the signing secret is saved to `runtime/auth-token-secret` in the data directory (`projects/` under the Compose directory for Docker deployments), so signed-in sessions stay valid after restarts; once you set it in `.env`, the value you set takes precedence.
+
 ### How do I update Docker? Will an update delete my projects? {#docker-update}
 
 Create a backup first, then run these commands in the appropriate Compose directory:
@@ -119,6 +131,18 @@ These messages mean that the Agent process did not start normally or could not i
 4. Download diagnostic logs from the About section of Settings and inspect the specific upstream status code near the time of the error.
 
 A successful connectivity check proves only that a minimal request succeeded. Long sessions may still be affected by quotas, context limits, rate limits, or proxy timeouts.
+
+### After starting from source on Windows, the Agent reports that the event loop cannot create subprocesses. What should I do? {#windows-reload-agent}
+
+When the backend is started with `--reload` on native Windows, uvicorn switches to an event loop that cannot create subprocesses, so the Agent cannot launch Claude Code. The UI says that the backend's event loop can't create subprocesses; earlier versions show only `Failed to start Claude Code:` with nothing after the colon.
+
+Restart the backend without `--reload`:
+
+```bash
+uv run uvicorn server.app:app --port 1241
+```
+
+You can also run `uv run python -m server.app`. It does not enable reload on Windows and reads the listen address from `LISTEN_HOST` and `LISTEN_PORT`. Without reload, restart the backend manually after changing code.
 
 ## Providers, models, and APIs {#providers-models-api}
 
@@ -277,11 +301,21 @@ Validate the model, prompts, and reference-image results with a few shots before
 
 There is no fixed “price per minute” that applies to every project. Evaluate costs using the project estimate, actual call details, and provider bill.
 
+### Can I recover content I deleted by mistake? {#recover-deleted-content}
+
+Yes. Every deletion inside a project, whether you or the Agent starts it, becomes a deletion record in the project trash and is kept for 30 days. Open the **Project trash** section under **Files** in the workspace, select a record, and click **Restore**. A restore only adds and does not overwrite existing content. If the original name or number is already taken, the restored object gets a new name or number, and the notification states it.
+
+Deleting a whole project moves it to **Deleted projects** on the project list page. For how each type of object is deleted and restored, restoring after an asset merge, and what the Agent can delete and restore, see [File View and Project Trash](./files-and-trash.md).
+
 ### What is the difference between a project ZIP and a full-instance backup? {#project-zip-vs-full-backup}
 
-A project ZIP imports or migrates a single project and can include only the current version or the complete version history. It does not include global provider settings, login configuration, task and cost records, Agent sessions, or Agent memory.
+A project ZIP imports or migrates a single project and can include only the current version or the complete version history. It does not include global provider settings, login configuration, task and cost records, Agent sessions, or Agent memory. Available provider asset links of the images go along with the project ZIP; see [Project ZIPs and Provider Asset Links](./providers.md#asset-library-in-project-zip) for how they are used after import.
 
-When an imported project has the same name as an existing one, choosing **Overwrite Existing Project** is the same as deleting the existing project and then importing: the existing project's queued tasks are cancelled; its tasks, usage records, and Agent sessions stay with the deleted project instead of carrying over to the imported one; and its Agent memory is deleted with it. To keep both projects, choose **Auto Rename and Import**.
+The project trash is not included in a project ZIP, while a full data-root backup keeps its deletion records. For how to use the project trash, see [File View and Project Trash](./files-and-trash.md).
+
+A deleted project goes to **Deleted projects** on the project list page, together with its project trash, and is kept for 30 days. You can restore it as a whole or delete it permanently; see [Deleted projects](./files-and-trash.md#deleted-projects).
+
+When an imported project has the same name as an existing one, choosing **Overwrite Existing Project** is the same as deleting the existing project and then importing: the existing project's queued tasks are cancelled; its tasks, usage records, and Agent sessions stay with the deleted project instead of carrying over to the imported one; and the existing project, including its Agent memory, goes to **Deleted projects**. To keep both projects, choose **Auto Rename and Import**.
 
 For disaster recovery, use the full-instance backup approach described above and save the project directory, database, and required credentials together.
 

@@ -11,11 +11,11 @@ import { formatNameList } from "@/utils/list-format";
 import { catalogDisplayNames, catalogDurations } from "@/utils/provider-models";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { isValidEpisodeTargetDuration } from "@/components/shared/EpisodeTargetDurationField";
-import { isValidSpeechRate } from "@/components/shared/SpeechRateField";
-import { executingImageModel, executingVideoModel } from "@/components/shared/LayeredModelFields";
+import { isValidEpisodeTargetDuration } from "@/components/shared/episode-target-duration";
+import { isValidSpeechRate } from "@/components/shared/speech-rate";
+import { executingImageModel, executingVideoModel } from "@/components/shared/model-layers";
 import type { ModelConfigValue } from "@/components/shared/ModelConfigSection";
-import { narrationDeliveryProblem, type NarrationDeliveryValue } from "@/components/shared/NarrationDeliveryFields";
+import { narrationDeliveryProblem, type NarrationDeliveryValue } from "@/components/shared/narration-delivery";
 import { StylePicker, type StylePickerValue } from "@/components/shared/StylePicker";
 import { WizardStepBasics, type WizardBasicsValue } from "./create-project/WizardStepBasics";
 import {
@@ -42,12 +42,14 @@ const EMPTY_MODELS: ModelConfigValue = {
 
 /** 读取第二步的可选模型与全局默认；供应商与模型名由后端按界面语言成文。 */
 async function loadGenerationData(signal: AbortSignal) {
-  const [sysConfig, providersRes, customRes, narrationDefaults] = await Promise.all([
+  const [sysConfig, providersRes, customRes, narrationDefaults, auto] = await Promise.all([
     API.getSystemConfig({ signal }),
     API.getProviders({ signal }),
     API.listCustomProviders({ signal }),
     // 预填只是便利：读不到全局默认时 TTS 字段留空，由用户自选
     API.getNarrationDefaults({ signal }).catch(() => null),
+    // 自动选择的实际模型只用于展示与能力查询，读不到时退回只显示「自动选择」
+    API.getAutoBackends({ signal }).catch(() => null),
   ]);
   const catalogNames = catalogDisplayNames(providersRes.providers, customRes.providers);
   const data: WizardGenerationData = {
@@ -72,6 +74,7 @@ async function loadGenerationData(signal: AbortSignal) {
       textDefault: sysConfig.settings.default_text_backend ?? "",
       textSimple: sysConfig.settings.text_backend_simple ?? "",
       textComplex: sysConfig.settings.text_backend_complex ?? "",
+      auto,
     },
   };
   return { data, narrationDefaults };
@@ -125,6 +128,7 @@ export function CreateProjectModal() {
   const [generationData, setGenerationData] = useState<WizardGenerationData | null>(null);
   const [generationError, setGenerationError] = useState<string | null>(null);
 
+  // react-doctor-disable-next-line react-doctor/no-set-state-after-await-in-effect -- await 后的写入都先检查 controller.signal.aborted，cleanup 中 abort 作废上一轮
   useEffect(() => {
     const controller = new AbortController();
     voidCall((async () => {
@@ -149,22 +153,6 @@ export function CreateProjectModal() {
     })());
     return () => controller.abort();
   }, [i18n.language]);
-
-  // 页面持有独立的预览地址，选择器切换步骤卸载时只收回自己的地址。
-  const changeStyle = (next: StylePickerValue) => {
-    const uploadedPreview = next.uploadedFile
-      ? next.uploadedFile === style.uploadedFile
-        ? style.uploadedPreview
-        : URL.createObjectURL(next.uploadedFile)
-      : next.uploadedPreview;
-    setStyle({ ...next, uploadedPreview });
-  };
-  // 页面地址在变更或卸载时收回；已保存的服务端地址无需收回。
-  useEffect(() => {
-    const url = style.uploadedPreview;
-    if (!url?.startsWith("blob:")) return;
-    return () => URL.revokeObjectURL(url);
-  }, [style.uploadedPreview]);
 
   const close = () => setShowCreateModal(false);
 
@@ -341,7 +329,7 @@ export function CreateProjectModal() {
               error={generationError}
             />
           )}
-          {step === 3 && <StylePicker value={style} onChange={changeStyle} />}
+          {step === 3 && <StylePicker value={style} onChange={setStyle} />}
         </DialogBody>
 
         <DialogFooter>

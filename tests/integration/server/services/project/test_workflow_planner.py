@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from lib.config.resolver import ConfigResolver
 from lib.episode.episode_ledger import SOURCE_FINGERPRINTS_KEY, compute_source_fingerprints
 from lib.episode.episode_sources import discover_sources
 from lib.generation.batch_admission import BatchAdmission, UnitAdmissionTicket
@@ -279,6 +280,56 @@ async def test_planner_uses_shared_admission_and_never_reads_the_real_task_singl
     assert admission_calls[0]["selection"] is GenerationSelectionMode.MISSING_ONLY
     assert first.next_action.type == "generate_videos"
     assert next(step for step in first.steps if step.id == "video").admission["decision"] == "admitted"
+
+
+async def test_reference_plan_selects_targets_from_the_real_artifact_manifest(tmp_path: Path, db_factory) -> None:
+    """真实计划只对缺视频且不在生成中的 unit 做准入；读清单与产物不占用事件循环。"""
+    pm = ProjectManager(tmp_path / "projects")
+    pm.create_project("demo")
+    pm.create_project_metadata(
+        "demo",
+        "Demo",
+        "",
+        "ad",
+        target_duration=30,
+        extras={"generation_mode": "reference_video", "grid_storyboard": False},
+    )
+    pm.save_script(
+        "demo",
+        {
+            "episode": 1,
+            "title": "广告",
+            "content_mode": "ad",
+            "video_units": [
+                {"unit_id": "E1U1", "text": "空镜头", "duration_seconds": 3},
+                {"unit_id": "E1U2", "text": "空镜头", "duration_seconds": 3},
+            ],
+        },
+        "episode_1.json",
+    )
+    queue = GenerationQueue(session_factory=db_factory, project_manager=pm)
+    task = await queue.enqueue_task(
+        project_name="demo",
+        task_type="reference_video",
+        media_type="video",
+        resource_id="E1U2",
+        script_file="episode_1.json",
+        source="web",
+    )
+
+    plan = await workflow_planner.WorkflowPlanner(pm).get_plan(
+        "demo",
+        WorkflowPlanRequest(),
+        queue=queue,
+        config_resolver=ConfigResolver(db_factory),
+    )
+
+    video = next(step for step in plan.steps if step.id == "video")
+    assert video.artifacts["missing_ids"] == ["E1U1", "E1U2"]
+    assert video.admission is not None
+    assert video.admission["selection"] == "missing_only"
+    assert [unit["unit_id"] for unit in video.admission["units"]] == ["E1U1"]
+    assert [(item.unit_id, item.task_id) for item in video.tasks] == [("E1U2", task["task_id"])]
 
 
 async def test_active_task_and_provider_checkpoint_are_reported_as_separate_axes(

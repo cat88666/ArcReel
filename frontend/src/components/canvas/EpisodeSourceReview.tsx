@@ -4,6 +4,7 @@ import { Anchor, ChevronRight } from "lucide-react";
 import { Link } from "wouter";
 import { cn } from "cn";
 import { API } from "@/api";
+import { episodeSourceOrigin } from "@/components/canvas/episode-page/episode-view";
 import { useStaysInEpisodeView } from "@/components/canvas/episode-page/EpisodeViewScope";
 import { ImpactConfirmDialog } from "@/components/canvas/episodes/ImpactConfirmDialog";
 import { SourceKindSelect } from "@/components/canvas/episodes/SourceKindSelect";
@@ -32,12 +33,6 @@ import { episodeDisplayName, episodePosition } from "@/utils/episode-display";
  * 脚本规划过期时，保存前先确认。
  */
 
-type SourceOrigin = NonNullable<EpisodeMeta["source_origin"]>;
-
-function sourceOriginOf(meta: EpisodeMeta | undefined): SourceOrigin {
-  return meta?.source_origin ?? (meta?.source_range ? "whole_source" : "none");
-}
-
 // ---------------------------------------------------------------------------
 // 本集导览：节拍是顺序，保留编号；尾钩子单独一块
 // ---------------------------------------------------------------------------
@@ -55,6 +50,7 @@ function GuideContent({ meta }: { meta: EpisodeMeta | undefined }) {
       {beats.length > 0 && (
         <ol className="flex flex-col gap-2.5">
           {beats.map((beat, index) => (
+            // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 节拍是只读的有序文本，不重排不增删、无行内状态，位置即身份，文本可能重复不能作 key
             <li key={index} className="flex gap-2.5 text-sm leading-relaxed">
               <span aria-hidden className="w-4 shrink-0 text-right font-semibold text-primary tabular-nums">
                 {index + 1}
@@ -157,7 +153,14 @@ function SourceRangeNote({ meta }: { meta: EpisodeMeta | undefined }) {
   );
 }
 
-const READING_CLS = "max-w-[40em] font-editorial text-base leading-loose whitespace-pre-wrap text-subtle-foreground";
+/** 集原文的阅读排版：编辑体、保留原文换行，长串折行。 */
+export function EpisodeSourceText({ text }: { text: string }) {
+  return (
+    <p className="max-w-[40em] font-editorial text-base leading-loose wrap-break-word whitespace-pre-wrap text-subtle-foreground">
+      {text}
+    </p>
+  );
+}
 
 interface SourceValue {
   text: string;
@@ -333,7 +336,7 @@ function EpisodeSource({
   const { t } = useTranslation("dashboard");
   const titleId = useId();
   const isDrama = useProjectsStore((s) => s.currentProjectData?.content_mode === "drama");
-  const origin = sourceOriginOf(meta);
+  const origin = episodeSourceOrigin(meta);
   const editable = origin !== "whole_source";
   // 无原文的集没有集原文文件：盘上同名的 episode_N.txt 是未登记文件，不当作本集原文读取
   const withoutSource = meta !== undefined && origin === "none";
@@ -379,7 +382,7 @@ function EpisodeSource({
       />
     );
   } else if (text) {
-    body = <p className={READING_CLS}>{text}</p>;
+    body = <EpisodeSourceText text={text} />;
   } else {
     body = <p className="text-sm text-muted-foreground">{t("episode_workspace_source_missing")}</p>;
   }

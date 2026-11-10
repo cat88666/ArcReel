@@ -82,4 +82,10 @@ export default {
   'episode_position_name': 'Tập {{position}}',
   'episode_unlisted_name': 'Tập chưa đặt tên',
   'episode_agent_ref': '"{{name}}" (ID tập {{id}})',
+  'item_position_shot': 'Phân cảnh {{position}}',
+  'item_position_unit': 'Đơn vị video {{position}}',
+  'item_position_of_total': '{{position}} / {{total}}',
+  'item_internal_id': 'Mã nội bộ {{id}}',
+  'item_agent_ref': '{{label}} (ID {{id}})',
+  "error_details": "Chi tiết",
 } satisfies Record<keyof typeof enCommon, string>;

@@ -26,27 +26,28 @@ import {
   DraftSoftViolationList,
   DraftViolationList,
   InvalidDraftBar,
-  draftFallbackText,
-  draftFixRequestText,
-  prefillAssistant,
 } from "@/components/shared/DraftStatus";
+import { draftFallbackText, draftFixRequestText } from "@/components/shared/draft-text";
+import { prefillAssistant } from "@/components/shared/prefill-assistant";
 import { EpisodeDurationSummary } from "@/components/shared/EpisodeDurationSummary";
 import { ScriptPlanButton } from "@/components/canvas/shared/ScriptPlanButton";
 import { StartBlankScriptButton } from "@/components/canvas/shared/StartBlankScriptButton";
-import { NewAssetsSection, hasValidNewAssets, type NewAssetEntryRefs } from "@/components/canvas/shared/NewAssetsSection";
+import { NewAssetsSection, type NewAssetEntryRefs } from "@/components/canvas/shared/NewAssetsSection";
 import { ScriptOverwriteConfirmDialog } from "@/components/shared/ScriptOverwriteConfirmDialog";
 import { VideoModelUnresolvedNotice } from "@/components/shared/VideoModelUnresolvedNotice";
 import { useModelCapabilities, type DurationOutOfRangeReason } from "@/hooks/useModelCapabilities";
-import { PlanDurationSelect, durationIncompatibleLabel } from "@/components/canvas/shared/PlanDurationSelect";
+import { durationIncompatibleLabel } from "@/components/canvas/shared/duration-incompatible";
+import { PlanDurationSelect } from "@/components/canvas/shared/PlanDurationSelect";
 import { PlanStructureHint } from "@/components/canvas/shared/PlanStructureHint";
-import { speakerCandidates } from "@/utils/plan-new-assets";
+import { hasValidNewAssets, speakerCandidates } from "@/utils/plan-new-assets";
 import { ScriptPlanStart } from "@/components/canvas/shared/ScriptPlanStart";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { sumItemDuration } from "@/utils/script-shape";
 import { useEpisodeLedger } from "@/hooks/useEpisodeLedger";
-import { episodeAgentRef, itemIdWithinEpisode } from "@/utils/episode-display";
+import { episodeAgentRef } from "@/utils/episode-display";
+import { ItemPositionBadge } from "@/components/shared/episode-item/ItemPositionBadge";
 import { UtteranceListEditor } from "./UtteranceListEditor";
 import { ReferencesSection } from "./ReferencesSection";
 import { SegmentBreakToggle } from "./SegmentBreakToggle";
@@ -107,9 +108,9 @@ function MetaChips({ items }: { items: string[] }) {
   );
 }
 
-/** 条目头部：ID、时长与章节切分点；可编辑时时长用档位下拉、切分点用开关，越档就地标红说明。 */
+/** 条目头部：位置、时长与章节切分点；可编辑时时长用档位下拉、切分点用开关，越档就地标红说明。 */
 function ItemHeader({
-  id,
+  position,
   durationSeconds,
   segmentBreak,
   readOnly,
@@ -117,7 +118,8 @@ function ItemHeader({
   context,
   onChange,
 }: {
-  id: string;
+  /** 条目在规划里的位置，从 1 起。 */
+  position: number;
   durationSeconds: number;
   segmentBreak: boolean;
   readOnly: boolean;
@@ -126,14 +128,12 @@ function ItemHeader({
   onChange: (patch: { duration_seconds?: number; segment_break?: boolean }) => void;
 }) {
   const { t } = useTranslation("dashboard");
-  const shortId = itemIdWithinEpisode(id);
+  const itemLabel = t("common:item_position_shot", { position });
   const outOfTier = !readOnly && durationOutOfTier(durationSeconds, context.durationOptions);
   return (
     <div className="flex min-w-0 flex-col gap-1">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="rounded-sm bg-muted px-1.5 py-0.5 text-xs font-medium text-subtle-foreground tabular-nums">
-          {shortId}
-        </span>
+        <ItemPositionBadge position={position} kind="shot" />
         {readOnly ? (
           <>
             <span className="text-xs text-muted-foreground tabular-nums">{durationSeconds}s</span>
@@ -146,7 +146,7 @@ function ItemHeader({
               options={context.durationOptions}
               onChange={(duration_seconds) => onChange({ duration_seconds })}
               disabled={disabled}
-              label={t("review_item_duration_label", { item: shortId })}
+              label={t("review_item_duration_label", { item: itemLabel })}
               endpointFixed={context.durationEndpointFixed}
             />
             <SegmentBreakToggle
@@ -219,6 +219,7 @@ function ReadOnlyUtterances({ utterances }: { utterances: Utterance[] }) {
   return (
     <ul className="flex flex-col gap-1.5">
       {utterances.map((u, i) => (
+        // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 只读的台词列表，随剧本整体替换、不在此重排增删，行内无状态，台词没有 ID
         <li key={String(i)} className="flex items-start gap-2 text-sm leading-relaxed">
           <Badge variant="outline" className="mt-0.5">
             {u.kind === "dialogue" ? u.speaker : t("utterance_kind_voiceover")}
@@ -257,6 +258,7 @@ function ItemCardShell({ notes, children }: { notes?: ItemDraftNotes; children: 
 
 function DramaSceneCard({
   scene,
+  position,
   disabled,
   readOnly,
   notes,
@@ -264,6 +266,8 @@ function DramaSceneCard({
   onChange,
 }: {
   scene: DramaSceneContent;
+  /** 条目在规划里的位置，从 1 起。 */
+  position: number;
   disabled: boolean;
   readOnly: boolean;
   notes?: ItemDraftNotes;
@@ -275,7 +279,7 @@ function DramaSceneCard({
     <ItemCardShell notes={notes}>
       <div className={`flex items-start justify-between gap-2 ${readOnly ? "mb-3" : "mb-2"}`}>
         <ItemHeader
-          id={scene.scene_id}
+          position={position}
           durationSeconds={scene.duration_seconds}
           segmentBreak={scene.segment_break}
           readOnly={readOnly}
@@ -327,6 +331,7 @@ function DramaSceneCard({
 
 function NarrationSegmentCard({
   segment,
+  position,
   disabled,
   readOnly,
   notes,
@@ -334,6 +339,8 @@ function NarrationSegmentCard({
   onChange,
 }: {
   segment: NarrationScriptPlanSegment;
+  /** 条目在规划里的位置，从 1 起。 */
+  position: number;
   disabled: boolean;
   readOnly: boolean;
   notes?: ItemDraftNotes;
@@ -345,7 +352,7 @@ function NarrationSegmentCard({
     <ItemCardShell notes={notes}>
       <div className={`flex items-start justify-between gap-2 ${readOnly ? "mb-3" : "mb-2"}`}>
         <ItemHeader
-          id={segment.segment_id}
+          position={position}
           durationSeconds={segment.duration_seconds}
           segmentBreak={segment.segment_break}
           readOnly={readOnly}
@@ -447,8 +454,10 @@ function reviewItems(content: ReviewDraft | null): { id: string }[] {
 function newAssetEntries(content: ReviewDraft | null): NewAssetEntryRefs[] {
   if (content == null) return [];
   return "scenes" in content
-    ? content.scenes.map((scene) => ({
+    ? content.scenes.map((scene, i) => ({
         id: scene.scene_id,
+        position: i + 1,
+        kind: "shot" as const,
         names: [
           ...scene.characters_in_scene,
           ...scene.scenes,
@@ -457,8 +466,10 @@ function newAssetEntries(content: ReviewDraft | null): NewAssetEntryRefs[] {
         ],
         snippet: scene.source_text,
       }))
-    : content.segments.map((segment) => ({
+    : content.segments.map((segment, i) => ({
         id: segment.segment_id,
+        position: i + 1,
+        kind: "shot" as const,
         names: [...segment.characters_in_segment, ...segment.scenes, ...segment.props],
         snippet: segment.novel_text,
       }));
@@ -669,7 +680,7 @@ export function ScriptReviewGate({
           violationCount={quarantine.violations.length}
           itemJumps={[...groups.byItem.entries()].map(([index, list]) => ({
             index,
-            label: items[index]?.id ? itemIdWithinEpisode(items[index].id) : `#${index + 1}`,
+            label: t("common:item_position_shot", { position: index + 1 }),
             count: list.length,
           }))}
           episodeLevelCount={groups.episodeLevel.length}
@@ -715,8 +726,10 @@ export function ScriptReviewGate({
             {"scenes" in content
               ? content.scenes.map((scene, i) => (
                   <DramaSceneCard
+                    // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 待修复草稿的 scene_id 可能缺失或重复（正是违约所在），批注、锚点与修改都按位置寻址且不重排；带上 ID 让换内容时重新挂载
                     key={`${String(i)}-${scene.scene_id}`}
                     scene={scene}
+                    position={i + 1}
                     disabled={draftBusy}
                     readOnly={false}
                     notes={notesFor(i)}
@@ -726,8 +739,10 @@ export function ScriptReviewGate({
                 ))
               : content.segments.map((segment, i) => (
                   <NarrationSegmentCard
+                    // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 待修复草稿的 segment_id 可能缺失或重复（正是违约所在），批注、锚点与修改都按位置寻址且不重排；带上 ID 让换内容时重新挂载
                     key={`${String(i)}-${segment.segment_id}`}
                     segment={segment}
+                    position={i + 1}
                     disabled={draftBusy}
                     readOnly={false}
                     notes={notesFor(i)}
@@ -881,8 +896,10 @@ export function ScriptReviewGate({
         {contentMode === "drama" && draft != null && "scenes" in draft
           ? draft.scenes.map((scene, i) => (
               <DramaSceneCard
+                // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 以 scene_id 为 key，只在 Agent 草稿缺 ID 时以位置兜底；卡片只就地修改、不重排增删
                 key={scene.scene_id || i}
                 scene={scene}
+                position={i + 1}
                 disabled={busy}
                 readOnly={readOnly}
                 context={itemContext}
@@ -893,8 +910,10 @@ export function ScriptReviewGate({
         {contentMode === "narration" && draft != null && "segments" in draft
           ? draft.segments.map((segment, i) => (
               <NarrationSegmentCard
+                // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 以 segment_id 为 key，只在 Agent 草稿缺 ID 时以位置兜底；卡片只就地修改、不重排增删
                 key={segment.segment_id || i}
                 segment={segment}
+                position={i + 1}
                 disabled={busy}
                 readOnly={readOnly}
                 context={itemContext}

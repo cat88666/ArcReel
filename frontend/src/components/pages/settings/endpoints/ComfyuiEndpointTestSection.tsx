@@ -1,4 +1,4 @@
-import { useCallback, useId, useMemo, useState } from "react";
+import { useCallback, useId, useMemo, useRef, useState } from "react";
 import { Loader2, Play } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { API } from "@/api";
@@ -22,6 +22,7 @@ import type {
   TrialRunStageState,
 } from "@/types";
 import { TRIAL_RUN_STAGES } from "@/types";
+import { isListBindingKey } from "./comfyui-bindings";
 import { RequestPreview, TestCard, TestField, TestSelect } from "./endpoint-test-primitives";
 import { useTrialRun } from "./use-trial-run";
 
@@ -40,8 +41,8 @@ const NATIVE_RESOLUTION = "native";
 /** 时长输入清空时按这个秒数发出，占位符把它写在空输入框里。 */
 const DEFAULT_DURATION_SECONDS = 5;
 
-/** 能从节点绑定推出素材格子的三个语义键，按渲染次序。 */
-const ASSET_KEYS = ["start_image", "end_image", "reference_images"] as const;
+/** 能从节点绑定推出素材格子的四个语义键，按渲染次序。 */
+const ASSET_KEYS = ["start_image", "end_image", "reference_images", "reference_audio"] as const;
 
 type ComfyuiAssetKey = (typeof ASSET_KEYS)[number];
 
@@ -93,12 +94,15 @@ export function ComfyuiEndpointTestSection({ definition, providers, blocked }: C
   const { t } = useTranslation(["dashboard", "common"]);
   const idBase = useId();
   const isVideo = definition.media_type === "video";
+  const pixelsDriven = Boolean(definition.bindings.width?.length && definition.bindings.height?.length);
+  const aspectDriven = pixelsDriven || Boolean(definition.bindings.aspect_ratio?.length);
 
   const [prompt, setPrompt] = useState("");
   const [aspectRatio, setAspectRatio] = useState<string>(ASPECT_RATIOS[0]);
   const [resolution, setResolution] = useState(NATIVE_RESOLUTION);
   const [durationSeconds, setDurationSeconds] = useState<number | null>(DEFAULT_DURATION_SECONDS);
-  const [assetFiles, setAssetFiles] = useState<Partial<Record<ComfyuiAssetKey, File[]>>>({});
+  // 文件输入框自己显示选中的文件，这份记录只在发请求时读，不需要重渲
+  const assetFiles = useRef<Partial<Record<ComfyuiAssetKey, File[]>>>({});
 
   const [credSource, setCredSource] = useState<"provider" | "inline">(
     providers.length > 0 ? "provider" : "inline",
@@ -125,13 +129,14 @@ export function ComfyuiEndpointTestSection({ definition, providers, blocked }: C
     [definition.bindings],
   );
 
-  const assets = useMemo(() => {
+  const pickAssets = useCallback(() => {
     const picked: EndpointTestAssets = {};
     for (const { key } of assetSlots) {
-      if (assetFiles[key]?.length) picked[key] = assetFiles[key];
+      const files = assetFiles.current[key];
+      if (files?.length) picked[key === "reference_audio" ? "reference_audio_files" : key] = files;
     }
     return picked;
-  }, [assetFiles, assetSlots]);
+  }, [assetSlots]);
 
   const credentials = useCallback((): EndpointTestCredentials => {
     if (credSource === "provider") return { provider_id: `custom-${providerId}` };
@@ -156,7 +161,7 @@ export function ComfyuiEndpointTestSection({ definition, providers, blocked }: C
     setPreviewing(true);
     try {
       setPreview(
-        await API.previewEndpointRequest({ definition, parameters, credentials: credentials() }, { assets }),
+        await API.previewEndpointRequest({ definition, parameters, credentials: credentials() }, { assets: pickAssets() }),
       );
     } catch (e) {
       setPreview(null);
@@ -164,11 +169,11 @@ export function ComfyuiEndpointTestSection({ definition, providers, blocked }: C
     } finally {
       setPreviewing(false);
     }
-  }, [definition, parameters, credentials, assets]);
+  }, [definition, parameters, credentials, pickAssets]);
 
   const handleStartTrial = useCallback(
-    () => startTrial({ definition, parameters, credentials: credentials() }, assets),
-    [startTrial, definition, parameters, credentials, assets],
+    () => startTrial({ definition, parameters, credentials: credentials() }, pickAssets()),
+    [startTrial, definition, parameters, credentials, pickAssets],
   );
 
   const running = trial.run !== null && !trial.finished;
@@ -194,12 +199,14 @@ export function ComfyuiEndpointTestSection({ definition, providers, blocked }: C
         </TestField>
         <TestSelect
           label={t("ce_cf_test_aspect")}
+          disabled={!aspectDriven}
           value={aspectRatio}
           onValueChange={setAspectRatio}
           items={ASPECT_RATIOS.map((ratio) => ({ value: ratio, label: ratio }))}
         />
         <TestSelect
           label={t("ce_cf_test_resolution")}
+          disabled={!pixelsDriven}
           value={resolution}
           onValueChange={setResolution}
           items={[
@@ -237,7 +244,7 @@ export function ComfyuiEndpointTestSection({ definition, providers, blocked }: C
               label={
                 <>
                   {t(`ce_cf_key_${key}`)}
-                  {key === "reference_images" && (
+                  {isListBindingKey(key) && (
                     <span className="font-normal text-muted-foreground">{t("ce_cf_test_slots", { n: slots })}</span>
                   )}
                 </>
@@ -246,11 +253,10 @@ export function ComfyuiEndpointTestSection({ definition, providers, blocked }: C
               <Input
                 id={id}
                 type="file"
-                accept="image/*"
-                multiple={key === "reference_images"}
+                accept={key === "reference_audio" ? "audio/*" : "image/*"}
+                multiple={isListBindingKey(key)}
                 onChange={(e) => {
-                  const files = Array.from(e.target.files ?? []);
-                  setAssetFiles((current) => ({ ...current, [key]: files }));
+                  assetFiles.current = { ...assetFiles.current, [key]: Array.from(e.target.files ?? []) };
                 }}
               />
             </TestField>

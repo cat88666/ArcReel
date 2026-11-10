@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Router } from "wouter";
@@ -141,7 +141,7 @@ describe("ProjectsPage", () => {
     vi.spyOn(API, "listProjects").mockImplementation(() => new Promise(() => {}));
 
     renderPage();
-    expect(screen.getByRole("status")).toHaveTextContent("加载项目列表...");
+    expect(screen.getByRole("status")).toHaveTextContent("加载项目列表…");
   });
 
   it("explains a failed load instead of showing an empty lobby", async () => {
@@ -401,6 +401,122 @@ describe("ProjectsPage", () => {
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("项目名称 'second' 非法");
   });
 
+  const deletedDemo = {
+    id: "demo#deleted-20261020T080000Z",
+    name: "demo",
+    title: "Old",
+    deleted_at: "2026-10-20T08:00:00+00:00",
+    expires_at: "2026-11-19T08:00:00+00:00",
+    size: 3 * 1024 * 1024,
+  };
+
+  it("shows how much space each deleted project takes", async () => {
+    vi.spyOn(API, "listProjects").mockResolvedValue({ projects: [] });
+    vi.spyOn(API, "listDeletedProjects").mockResolvedValue({ projects: [deletedDemo], retention_days: 30 });
+
+    renderPage();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "已删除项目" }));
+    const dialog = await screen.findByRole("dialog", { name: "已删除项目" });
+
+    expect(await within(dialog).findByText(/占用 3\.0 MB$/)).toBeInTheDocument();
+  });
+
+  it("reloads deleted projects after a restore cancels the reopened dialog's in-flight listing", async () => {
+    vi.spyOn(API, "listProjects").mockResolvedValue({ projects: [] });
+    const deletedMeanwhile = { ...deletedDemo, id: "other#deleted-20261021T080000Z", name: "other", title: "Other" };
+    vi.spyOn(API, "listDeletedProjects")
+      .mockResolvedValueOnce({ projects: [deletedDemo], retention_days: 30 })
+      .mockReturnValueOnce(new Promise(() => {}))
+      .mockResolvedValue({ projects: [deletedMeanwhile], retention_days: 30 });
+    vi.spyOn(API, "restoreDeletedProject").mockResolvedValue({ name: "demo" });
+
+    renderPage();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "已删除项目" }));
+    const first = await screen.findByRole("dialog", { name: "已删除项目" });
+    await within(first).findByRole("button", { name: "恢复「Old」" });
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "已删除项目" })).not.toBeInTheDocument());
+
+    // 重开时先显示缓存的列表，新的列表请求还在途；恢复缓存里的项目会作废它，之后要补拉
+    await user.click(screen.getByRole("button", { name: "已删除项目" }));
+    const dialog = await screen.findByRole("dialog", { name: "已删除项目" });
+    await user.click(await within(dialog).findByRole("button", { name: "恢复「Old」" }));
+
+    expect(await within(dialog).findByRole("button", { name: "恢复「Other」" })).toBeInTheDocument();
+  });
+
+  it("restores a deleted project under a new name when the original is taken, and reloads the grid", async () => {
+    vi.spyOn(API, "listProjects")
+      .mockResolvedValueOnce({ projects: [summary("demo", { title: "New" })] })
+      .mockResolvedValueOnce({
+        projects: [summary("demo", { title: "New" }), summary("demo-2", { title: "Old" })],
+      });
+    vi.spyOn(API, "listDeletedProjects")
+      .mockResolvedValueOnce({ projects: [deletedDemo], retention_days: 30 })
+      .mockResolvedValue({ projects: [], retention_days: 30 });
+    vi.spyOn(API, "restoreDeletedProject").mockResolvedValue({ name: "demo-2" });
+
+    renderPage();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "已删除项目" }));
+    const dialog = await screen.findByRole("dialog", { name: "已删除项目" });
+    await user.click(await within(dialog).findByRole("button", { name: "恢复「Old」" }));
+
+    expect(API.restoreDeletedProject).toHaveBeenCalledWith("demo#deleted-20261020T080000Z");
+    expect(await within(dialog).findByText("没有已删除项目")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(useAppStore.getState().toast?.text).toBe("原名已被占用，「Old」已恢复为 demo-2");
+    });
+    // 对话框是模态的，背后的网格对无障碍树隐藏：按重新加载的请求判断网格已刷新
+    await waitFor(() => expect(API.listProjects).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not report a restore as successful when the project list fails to reload", async () => {
+    vi.spyOn(API, "listProjects")
+      .mockResolvedValueOnce({ projects: [] })
+      .mockRejectedValueOnce(new Error("network down"));
+    vi.spyOn(API, "listDeletedProjects")
+      .mockResolvedValueOnce({ projects: [deletedDemo], retention_days: 30 })
+      .mockResolvedValue({ projects: [], retention_days: 30 });
+    vi.spyOn(API, "restoreDeletedProject").mockResolvedValue({ name: "demo" });
+    const toasts: string[] = [];
+    const unsubscribe = useAppStore.subscribe((state, previous) => {
+      if (state.toast && state.toast !== previous.toast) toasts.push(state.toast.text);
+    });
+
+    renderPage();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "已删除项目" }));
+    const dialog = await screen.findByRole("dialog", { name: "已删除项目" });
+    await user.click(await within(dialog).findByRole("button", { name: "恢复「Old」" }));
+
+    await waitFor(() => expect(toasts).toEqual(["项目列表加载失败：network down"]));
+    unsubscribe();
+  });
+
+  it("purges a deleted project only after a second confirmation", async () => {
+    vi.spyOn(API, "listProjects").mockResolvedValue({ projects: [] });
+    vi.spyOn(API, "listDeletedProjects")
+      .mockResolvedValueOnce({ projects: [deletedDemo], retention_days: 30 })
+      .mockResolvedValue({ projects: [], retention_days: 30 });
+    vi.spyOn(API, "purgeDeletedProject").mockResolvedValue({ success: true });
+
+    renderPage();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "已删除项目" }));
+    const dialog = await screen.findByRole("dialog", { name: "已删除项目" });
+    await user.click(await within(dialog).findByRole("button", { name: "彻底删除「Old」" }));
+    const confirm = await screen.findByRole("alertdialog", { name: "彻底删除「Old」？" });
+    expect(API.purgeDeletedProject).not.toHaveBeenCalled();
+
+    await user.click(within(confirm).getByRole("button", { name: "彻底删除" }));
+
+    expect(API.purgeDeletedProject).toHaveBeenCalledWith("demo#deleted-20261020T080000Z");
+    expect(await within(dialog).findByText("没有已删除项目")).toBeInTheDocument();
+  });
+
   it("exports the chosen scope of a card's project", async () => {
     vi.spyOn(API, "listProjects").mockResolvedValue({ projects: [summary("second", { title: "Second" })] });
     vi.spyOn(API, "requestExportToken").mockResolvedValue({
@@ -441,7 +557,7 @@ describe("ProjectsPage", () => {
     vi.spyOn(API, "importProject").mockResolvedValue(
       importResult("imported-demo", {
         auto_fixed: [{ code: "missing_clues_field", message: "segments[0]: 补全缺失字段 clues_in_segment" }],
-        warnings: [{ code: "validation_warning", message: "发现未识别的附加文件/目录: extras" }],
+        warnings: [{ code: "validation_warning", message: "发现未识别的附加文件/目录：extras" }],
       }),
     );
 
@@ -584,5 +700,92 @@ describe("ProjectsPage", () => {
     );
 
     await waitFor(() => expect(API.importProject).toHaveBeenNthCalledWith(3, file, "rename", { confirmReport: true }));
+  });
+
+  describe("when the user has left the lobby before the import finishes", () => {
+    /** 选好文件后让导入请求悬起，卸载页面（离开大厅），再返回收尾导入请求的 resolve / reject。 */
+    async function leaveWhileImporting() {
+      vi.spyOn(API, "listProjects").mockResolvedValue({ projects: [] });
+      let resolve!: (value: Awaited<ReturnType<typeof API.importProject>>) => void;
+      let reject!: (error: Error) => void;
+      vi.spyOn(API, "importProject").mockImplementation(
+        () =>
+          new Promise((res, rej) => {
+            resolve = res;
+            reject = rej;
+          }),
+      );
+      const { container, location, unmount } = renderPage();
+      await screen.findByText("还没有项目");
+      chooseZip(container);
+      await waitFor(() => expect(API.importProject).toHaveBeenCalledTimes(1));
+      unmount();
+      return { location, resolve: (v: Awaited<ReturnType<typeof API.importProject>>) => act(async () => resolve(v)), reject: (e: Error) => act(async () => reject(e)) };
+    }
+
+    it("does not navigate after a clean import, and offers to open the new project", async () => {
+      const { location, resolve } = await leaveWhileImporting();
+      await resolve(importResult("imported-demo", { auto_fixed: [], warnings: [] }));
+
+      expect(location.history?.at(-1)).toBe("/app/projects");
+      const toast = useAppStore.getState().toast;
+      expect(toast?.tone).toBe("success");
+      expect(toast?.text).toBe("项目「Imported Demo」已导入");
+      expect(toast?.action?.label).toBe("打开项目");
+      act(() => toast?.action?.onClick());
+      expect(location.history?.at(-1)).toBe("/app/projects/imported-demo");
+    });
+
+    it("reports the auto-fixed issues in the toast instead of a dialog", async () => {
+      const { location, resolve } = await leaveWhileImporting();
+      await resolve(
+        importResult("imported-demo", {
+          auto_fixed: [{ code: "missing_clues_field", message: "补全缺失字段" }],
+          warnings: [],
+        }),
+      );
+
+      expect(location.history?.at(-1)).toBe("/app/projects");
+      expect(useAppStore.getState().toast?.text).toContain("自动修复 1 个问题");
+      expect(useAppStore.getState().toast?.action?.label).toBe("打开项目");
+    });
+
+    it("says the import failed and what to do next", async () => {
+      const { reject } = await leaveWhileImporting();
+      await reject(
+        importError("导入包校验失败", {
+          diagnostics: { blocking: [{ code: "validation_error", message: "缺少 project.json" }], auto_fixable: [], warnings: [] },
+        }),
+      );
+
+      const toast = useAppStore.getState().toast;
+      expect(toast?.tone).toBe("error");
+      expect(toast?.text).toBe("项目导入失败：导入包校验失败。回到项目大厅可以重新导入。");
+    });
+
+    it("says the import did not happen because of a duplicate project ID", async () => {
+      const { reject } = await leaveWhileImporting();
+      await reject(importError("检测到项目编号冲突", { status: 409, conflict_project_name: "demo" }));
+
+      const toast = useAppStore.getState().toast;
+      expect(toast?.tone).toBe("warning");
+      expect(toast?.text).toContain("项目未导入");
+      expect(toast?.text).toContain("项目 ID「demo」已被现有项目占用");
+    });
+
+    it("says the import needs the upgrade report confirmed", async () => {
+      const { reject } = await leaveWhileImporting();
+      await reject(
+        importError("导入包升级时调整了部分内容，请确认后再导入", {
+          status: 409,
+          confirmation_required: true,
+          migration_report: UPGRADE_REPORT,
+        }),
+      );
+
+      const toast = useAppStore.getState().toast;
+      expect(toast?.tone).toBe("warning");
+      expect(toast?.text).toContain("需要确认");
+    });
   });
 });

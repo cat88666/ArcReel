@@ -108,6 +108,8 @@ describe("AssetGallery", () => {
       "查看大图",
       "重新生成资产图",
       "上传资产图",
+      "上传到供应商素材库",
+      "从供应商素材库选择",
       "局部修改",
       "版本历史",
       "加入资产库",
@@ -186,6 +188,29 @@ describe("AssetGallery", () => {
     expect(uploadFile).not.toHaveBeenCalled();
   });
 
+  it("从素材库选择时复核弹窗打开后的资源占用", async () => {
+    vi.spyOn(API, "listAssetLibraryAccounts").mockResolvedValue({
+      sites: [], default_project_name: "default",
+      accounts: [{ id: 7, site: "volcengine", name: "TEST-account", region: "cn-beijing", project_name: "film",
+        access_key_id_masked: "TEST…key", secret_access_key_masked: "TEST…key", created_at: "2026-11-03T00:00:00Z" }],
+    });
+    vi.spyOn(API, "listProviderAssets").mockResolvedValue({
+      items: [{ id: "TEST-asset", name: "供应商庭院", asset_type: "Image", status: "active", error_code: null, created_at: null }],
+      total: 1, page: 1, page_size: 20,
+    });
+    const importAsset = vi.spyOn(API, "importProviderAsset");
+    const user = userEvent.setup();
+    renderGallery();
+    await user.click(within(await openMenu(user, "庭院")).getByRole("menuitem", { name: "从供应商素材库选择" }));
+    const select = await screen.findByRole("button", { name: "选择 供应商庭院" });
+    act(() => useTasksStore.setState({
+      tasks: [makeTask({ project_name: "demo", task_type: "scene", media_type: "image", resource_id: "庭院", status: "running" })],
+    }));
+    await user.click(select);
+    expect(importAsset).not.toHaveBeenCalled();
+    expect(useAppStore.getState().toast?.text).toBe("资产图正在生成或修改，请等它结束后再操作");
+  });
+
   describe("deleting an asset", () => {
     beforeEach(() => {
       const project = {
@@ -223,7 +248,7 @@ describe("AssetGallery", () => {
 
       const dialog = await screen.findByRole("alertdialog", { name: "删除场景「庭院」？" });
       expect(
-        await within(dialog).findByText("被「开端」等 2 集共 5 处引用，删除后这些分镜在生成时会被拦下，资产也无法恢复。"),
+        await within(dialog).findByText("被「开端」等 2 集共 5 处引用，删除后这些分镜在生成时会被拦下。资产将连同资产图、版本历史与衍生移入项目回收站，保留 30 天，期间可以在「文件」视图的项目回收站里恢复。"),
       ).toBeInTheDocument();
       expect(within(dialog).getByText("夜访")).toBeInTheDocument();
       expect(preview).toHaveBeenCalledWith("demo", "scene", "庭院", { signal: expect.any(AbortSignal) });
@@ -249,7 +274,7 @@ describe("AssetGallery", () => {
 
       await user.click(within(await openMenu(user, "书房")).getByRole("menuitem", { name: "删除" }));
       const dialog = await screen.findByRole("alertdialog", { name: "删除场景「书房」？" });
-      expect(await within(dialog).findByText("删除后无法恢复。")).toBeInTheDocument();
+      expect(await within(dialog).findByText("资产将连同资产图、版本历史与衍生移入项目回收站，保留 30 天，期间可以在「文件」视图的项目回收站里恢复。")).toBeInTheDocument();
       expect(within(dialog).queryByRole("button", { name: "改为并入…" })).not.toBeInTheDocument();
 
       await user.click(within(dialog).getByRole("button", { name: "删除" }));
@@ -293,7 +318,7 @@ describe("AssetGallery", () => {
         );
         await user.click(within(await openMenu(user, "书房")).getByRole("menuitem", { name: "删除" }));
         const dialog = await screen.findByRole("alertdialog", { name: "删除场景「书房」？" });
-        await within(dialog).findByText("删除后无法恢复。");
+        await within(dialog).findByText("资产将连同资产图、版本历史与衍生移入项目回收站，保留 30 天，期间可以在「文件」视图的项目回收站里恢复。");
         await user.click(within(dialog).getByRole("button", { name: "删除" }));
         return within(await screen.findByRole("alertdialog", { name: "有未保存的修改" }));
       }

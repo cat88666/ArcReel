@@ -16,7 +16,12 @@ import httpx
 import pytest
 
 from arcreel_market_core.endpoint_definition import validate_definition
-from lib.backends.image_backends.base import ImageCapability, ImageGenerationRequest, ReferenceImage
+from lib.backends.image_backends.base import (
+    ImageCapability,
+    ImageCapabilityError,
+    ImageGenerationRequest,
+    ReferenceImage,
+)
 from lib.custom_provider.comfyui.comfyui_image_backend import ComfyuiImageBackend
 from lib.custom_provider.comfyui.failures import ComfyuiError
 from lib.custom_provider.endpoint_resolution import endpoint_spec_from_row
@@ -109,14 +114,14 @@ class TestDeclaredCapabilities:
         backend = _backend()
 
         assert backend.capabilities == {ImageCapability.TEXT_TO_IMAGE}
-        assert backend.max_reference_images == 0
+        assert asyncio.run(backend.reference_image_limit()) is None
 
     def test_a_workflow_with_reference_slots_is_image_to_image_only(self):
         """有格子却不给图，构造层要么删读图节点要么提交一张空图——都不是「也支持文生图」。"""
         backend = _backend(_definition(reference_slots=2))
 
         assert backend.capabilities == {ImageCapability.IMAGE_TO_IMAGE}
-        assert backend.max_reference_images == 2
+        assert asyncio.run(backend.reference_image_limit()) == 2
 
     @pytest.mark.parametrize(
         ("reference_slots", "expected"),
@@ -146,7 +151,23 @@ class TestDeclaredCapabilities:
 
         assert isinstance(backend, CustomImageBackend)
         assert backend.capabilities == {ImageCapability.IMAGE_TO_IMAGE}
-        assert backend.max_reference_images == 1
+        assert asyncio.run(backend.reference_image_limit()) == 1
+
+    async def test_the_reference_limit_is_the_slot_count_and_ignores_the_matched_entry(self):
+        """模型行名字对上记 14 张的条目，生效上限仍是 workflow 的 2 个格子；编排层据此裁剪，候选也只看绑定。"""
+        from lib.backends.generation_type_buckets import custom_model_buckets
+        from lib.backends.image_capabilities import backend_reference_image_limit
+        from lib.backends.input_limits import InputLimit
+
+        definition = _definition(reference_slots=2)
+        spec = endpoint_spec_from_row(cast("Any", SimpleNamespace(id=7, definition=definition)))
+        provider = SimpleNamespace(provider_id="custom-1", base_url=BASE_URL, api_key="")
+        backend = create_custom_backend(
+            provider=cast("Any", provider), model_id="gemini-3-pro-image", endpoint="ce-7", endpoint_spec=spec
+        )
+
+        assert await backend_reference_image_limit(backend, provider_id="custom-1") == InputLimit.at_most(2)
+        assert custom_model_buckets(endpoint="ce-7", model_id="gemini-3-pro-image", endpoint_spec=spec) == {"i2i"}
 
 
 class TestGenerate:
@@ -185,28 +206,15 @@ class TestGenerate:
         assert result.seed == sent["prompt"]["3"]["inputs"]["seed"]
         assert result.image_uri == f"{BASE_URL}/view?filename=ArcReel_00001_.png&subfolder=&type=output"
 
-    async def test_only_as_many_references_as_there_are_slots_get_uploaded(self, tmp_path: Path):
-        """格子数就是这份 workflow 能收几张；多出来的图不会被任何节点读到。"""
-        definition = _definition(reference_slots=1)
-        references = []
-        for index in range(3):
-            path = tmp_path / f"ref{index}.png"
-            path.write_bytes(b"png")
-            references.append(ReferenceImage(path=str(path)))
+    async def test_excess_references_rejected_before_upload_or_submit(self, tmp_path: Path):
+        references = [ReferenceImage(path=str(tmp_path / f"ref{i}.png")) for i in range(3)]
+        with capture_http() as router, pytest.raises(ImageCapabilityError) as exc:
+            await _backend(_definition(reference_slots=1)).generate(_request(tmp_path, reference_images=references))
 
-        with capture_http() as router:
-            upload = router.post(f"{BASE_URL}/upload/image").mock(
-                return_value=httpx.Response(200, json={"name": "stored.png", "subfolder": "arcreel"})
-            )
-            router.post(f"{BASE_URL}/prompt").mock(return_value=httpx.Response(200, json={"prompt_id": "p-1"}))
-            router.get(f"{BASE_URL}/history/p-1").mock(
-                return_value=httpx.Response(200, json=_history({"9": _image_output()}))
-            )
-            router.get(f"{BASE_URL}/view").mock(return_value=httpx.Response(200, content=PNG_BYTES))
-
-            await _backend(definition).generate(_request(tmp_path, reference_images=references))
-
-        assert upload.call_count == 1
+        assert exc.value.code == "image_reference_images_exceeded"
+        assert exc.value.params["limit"] == 1
+        assert exc.value.params["count"] == 3
+        assert not router.calls
 
     async def test_a_text_to_image_generation_uploads_nothing(self, tmp_path: Path):
         with capture_http() as router:
@@ -447,3 +455,19 @@ class TestStoppingTheRemote:
                 await _backend().generate(_request(tmp_path))
 
         assert interrupt.call_count == 1
+
+
+async def test_missing_aspect_mapping_fails_before_image_upload(tmp_path):
+    definition = _definition(reference_slots=1)
+    definition["workflow"]["30"] = {"class_type": "ResolutionSelector", "inputs": {"aspect_ratio": "landscape"}}
+    definition["bindings"]["aspect_ratio"] = [
+        {
+            "node": "30",
+            "input": "aspect_ratio",
+            "class_type": "ResolutionSelector",
+            "values": {"16:9": "landscape"},
+        }
+    ]
+    with capture_http() as router, pytest.raises(ComfyuiError, match="comfyui_aspect_ratio_unmapped"):
+        await _backend(definition).generate(_request(tmp_path, reference_images=[tmp_path / "image.png"]))
+    assert not router.calls

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -56,9 +57,9 @@ class TestWhitelistConfig:
     def test_q2_aspect_ratio_includes_auto(self):
         assert "auto" in _ASPECT_RATIO_WHITELIST["viduq2"]
 
-    def test_max_reference_images_is_seven(self):
+    def test_reference_image_limit_is_seven(self):
         assert _MAX_REFERENCE_IMAGES == 7
-        assert ViduImageBackend(api_key="k", model="viduq2").max_reference_images == 7
+        assert asyncio.run(ViduImageBackend(api_key="k", model="viduq2").reference_image_limit()) == 7
 
     def test_prompt_truncation_limit(self):
         assert _PROMPT_MAX_LEN == 2000
@@ -109,11 +110,8 @@ class TestCapabilityMismatchRaises:
 
 
 class TestViduReferenceImageLimit:
-    async def test_declared_limit_equals_what_it_sends(self, tmp_path: Path, image_output_path: Path):
-        """声明的上限即超量时实际下传的张数——编排层按它裁剪，编号才不会指认没发出的图。
-
-        建任务请求以 400 短路（后端把它折成 ProviderRejectedError），只看已发出的请求体。
-        """
+    async def test_sends_every_reference_above_the_channel_limit(self, tmp_path: Path, image_output_path: Path):
+        """覆盖放行的参考图全部进入建任务请求。"""
         refs = []
         for index in range(9):
             ref_path = tmp_path / f"r{index}.png"
@@ -125,6 +123,16 @@ class TestViduReferenceImageLimit:
                 return_value=httpx.Response(400, json={"code": 1013, "message": "nope"})
             )
             backend = ViduImageBackend(api_key="k", model="viduq2", base_url="https://api.vidu.com/ent/v2")
+            from lib.backends.image_capabilities import gate_image_request
+            from lib.custom_provider.backends import CustomImageBackend
+
+            backend = CustomImageBackend(
+                provider_id="custom-1",
+                delegate=backend,
+                model=backend.model,
+                reference_limit_override=9,
+            )
+            await gate_image_request(backend, provider_id="custom-1", reference_count=9)
             with pytest.raises(ProviderRejectedError):
                 await backend.generate(
                     ImageGenerationRequest(prompt="x", output_path=image_output_path, reference_images=refs)
@@ -133,7 +141,7 @@ class TestViduReferenceImageLimit:
         import json
 
         body = json.loads(route.calls.last.request.content)
-        assert len(body["images"]) == backend.max_reference_images == 7
+        assert len(body["images"]) == 9
 
 
 class TestViduImageCreateTaskHttpErrors:

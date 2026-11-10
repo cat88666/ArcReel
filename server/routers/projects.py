@@ -32,6 +32,7 @@ from starlette.background import BackgroundTask
 
 logger = logging.getLogger(__name__)
 
+from lib.agent.agent_session_store import default_sdk_config_dir
 from lib.agent.profile_manifest import ContentMode
 from lib.backends.text_backends.base import TextOutputTruncatedError
 from lib.catalog.errors import ModelNotInCatalogError
@@ -55,12 +56,20 @@ from lib.episode.episode_target_duration import (
     is_valid_episode_target_duration,
 )
 from lib.episode.source_kinds import SourceKind
-from lib.generation.task_failure import FAILURE_CODE_KEYS
+from lib.generation.task_failure import failure_message_key
 from lib.generation.video_request_facts import ResolutionOverride, VideoRequestFactsError, planning_durations
 from lib.i18n import render_generation_input_error, render_message
 from lib.infra.api_errors import ApiError, BadRequestError, ConflictError, NotFoundError, UnprocessableError
-from lib.infra.async_thread import EventLoopBridge, run_noninterruptible_sync, run_sync_transaction
+from lib.infra.async_thread import (
+    EventLoopBridge,
+    run_noninterruptible_async,
+    run_noninterruptible_sync,
+    run_sync_transaction,
+)
+from lib.infra.data_root_layout import DataRootLayout
 from lib.infra.json_io import domain_error_on_value_error
+from lib.material.formal_objects import formal_commit_on, release_holder
+from lib.project import deleted_projects
 from lib.project.asset_fingerprints import compute_asset_fingerprints
 from lib.project.asset_types import asset_name_comparison_key
 from lib.project.project_change_hints import project_change_source
@@ -91,7 +100,7 @@ from lib.workflow.workflow_state import (
     WorkflowStateService,
     WorkflowStatus,
 )
-from server.auth import CurrentUser, create_download_token, verify_download_token
+from server.auth import CurrentUser, create_download_token, reject_embedded_agent, verify_download_token
 from server.dependencies import require_project_migration_ok
 from server.i18n import DisplayNamesCatalog, Locale, Translator
 from server.routers._coalesce import RequestCoalescer
@@ -105,6 +114,7 @@ from server.routers._validators import split_video_backend_query, validate_backe
 from server.services.admission.prompt_preview import ScriptItemNotFound, preview_item_prompts
 from server.services.project import workflow_planner as workflow_plan_service
 from server.services.project.episode_display import present_episode_diagnostics
+from server.services.project.episode_id_records import recorded_episode_ids_on
 from server.services.project.narration_settings import (
     NarrationSettingsInput,
     new_project_narration_fields,
@@ -115,9 +125,10 @@ from server.services.project.project_activity import project_last_activity_at
 from server.services.project.project_archive import (
     ProjectArchiveService,
     ProjectArchiveValidationError,
+    provider_asset_link_archive_on,
 )
 from server.services.project.project_cover import resolve_project_cover
-from server.services.project.project_retirement import retire_project, retire_project_on
+from server.services.project.project_retirement import restore_retired_project, retire_project_on, retiring_project
 from server.services.tasks.video_caps import (
     capability_request_facts,
     duration_constraints_payload,
@@ -181,10 +192,14 @@ def _merge_episode_summaries(project: dict[str, Any], summary: ProjectSummary) -
 
 
 async def get_archive_service() -> ProjectArchiveService:
-    # 在事件循环上构造：覆盖导入跑在工作线程里，经捕获的事件循环收尾现有项目的记录。
+    # 在事件循环上构造：导出与导入跑在工作线程里，经捕获的事件循环收尾覆盖掉的现有项目、把导入的图片按全局设置保存，
+    # 并读写归档随带的供应商素材关联。
+    bridge = EventLoopBridge.capture()
     return ProjectArchiveService(
         get_project_manager(),
-        retire_project=retire_project_on(EventLoopBridge.capture(), async_session_factory),
+        retire_project=retire_project_on(bridge, async_session_factory),
+        formal_commit=formal_commit_on(bridge, async_session_factory),
+        provider_asset_links=provider_asset_link_archive_on(bridge, async_session_factory),
     )
 
 
@@ -399,7 +414,7 @@ def _apply_narration_patch(project: dict, req: UpdateProjectRequest) -> None:
 
 def _cleanup_temp_file(path: str) -> None:
     try:
-        os.unlink(path)
+        os.unlink(path)  # hard-delete: temp -- 归档导入导出的临时文件
     except FileNotFoundError:
         return
 
@@ -466,6 +481,9 @@ async def import_project_archive(
                 **exc.extra,
             },
         )
+    except ApiError:
+        # 导入的图片按全局设置保存到对象存储失败（502）或未配置连接（409）：带明确原因返回，项目没有安装。
+        raise
     except Exception:
         logger.exception("请求处理失败")
         return JSONResponse(
@@ -496,7 +514,8 @@ async def create_export_token(
                 raise HTTPException(status_code=404, detail=_t("project_not_found", name=name))
             return archive_service.get_export_diagnostics(name, scope=scope, translate=_t)
 
-        diagnostics = await asyncio.to_thread(_sync)
+        async with archive_service.export_materials_held(name, scope=scope):
+            diagnostics = await asyncio.to_thread(_sync)
         username = current_user.sub
         download_token = create_download_token(username, name)
         return {
@@ -546,7 +565,9 @@ async def export_project_archive(
 
     handed_off = False
     try:
-        archive_path, download_name = await run_sync_transaction(_export)
+        # 归档带远端图片的真实内容：先取回被清理的工作文件，打包期间登记使用。
+        async with archive_service.export_materials_held(name, scope=scope):
+            archive_path, download_name = await run_sync_transaction(_export)
         response = FileResponse(
             archive_path,
             media_type="application/zip",
@@ -1185,13 +1206,20 @@ async def update_project(name: str, req: UpdateProjectRequest, _t: Translator):
 
 @router.delete("/projects/{name}")
 async def delete_project(name: str, _t: Translator):
-    """删除项目"""
+    """删除项目：整体移入「已删除项目」，保留期内可以恢复"""
     try:
         manager = get_project_manager()
         project_dir = await asyncio.to_thread(manager.get_project_path, name)
-        # 先收尾记录再删目录：排队任务不会在删了一半的目录上开跑，执行中的任务照常跑完但放弃落盘。
-        await retire_project(async_session_factory, project_dir.name)
-        await run_sync_transaction(manager.delete_project_directory, name)
+        # 收尾记录与移走目录在同一个事务里：移走或提交失败时记录回滚，目录移回原处。
+        # 排队任务不会在移走的目录上开跑，执行中的任务照常跑完但放弃落盘。
+        tombstone: str | None = None
+        try:
+            async with retiring_project(async_session_factory, project_dir) as tombstone:
+                await run_sync_transaction(deleted_projects.move_in, manager.layout, project_dir, tombstone)
+        except BaseException:
+            if tombstone is not None:
+                await run_sync_transaction(deleted_projects.move_back, manager.layout, project_dir, tombstone)
+            raise
         return {"success": True, "message": _t("project_deleted", name=name)}
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=name) from exc
@@ -1200,6 +1228,54 @@ async def delete_project(name: str, _t: Translator):
     except Exception as exc:
         logger.exception("请求处理失败")
         raise HTTPException(status_code=500, detail=_t("internal_server_error")) from exc
+
+
+@router.get("/deleted-projects")
+async def list_deleted_projects():
+    """已删除项目，最近删除的在前"""
+    entries = await asyncio.to_thread(deleted_projects.list_entries, get_project_manager().layout)
+    return {
+        "projects": [entry.to_dict() for entry in entries],
+        "retention_days": deleted_projects.RETENTION.days,
+    }
+
+
+@router.post("/deleted-projects/{deleted_id}/restore")
+async def restore_deleted_project(deleted_id: str):
+    """整体恢复已删除项目：原名被占用时加后缀，记录改回恢复后的名字，再走启动时的迁移链"""
+    # 整段不可中断：移出途中被取消时落点随返回值丢弃，目录已回原位而记录仍挂在墓碑名下。
+    project_dir = await run_noninterruptible_async(_restore_deleted_project(get_project_manager().layout, deleted_id))
+    return {"name": project_dir.name}
+
+
+async def _restore_deleted_project(layout: DataRootLayout, deleted_id: str) -> Path:
+    project_dir = await run_sync_transaction(deleted_projects.move_out, layout, deleted_id)
+    try:
+        await restore_retired_project(
+            async_session_factory, deleted_id, project_dir, sdk_config_dir=default_sdk_config_dir()
+        )
+    except BaseException:
+        await run_sync_transaction(project_dir.rename, layout.deleted_projects_dir / deleted_id)
+        raise
+    # 记录先改回：迁移链按项目名查历史集 ID。
+    await run_sync_transaction(
+        deleted_projects.migrate_restored,
+        project_dir,
+        recorded_episode_ids=recorded_episode_ids_on(asyncio.get_running_loop()),
+    )
+    return project_dir
+
+
+@router.delete("/deleted-projects/{deleted_id}", dependencies=[Depends(reject_embedded_agent)])
+async def purge_deleted_project(deleted_id: str):
+    """彻底删除已删除项目（只开放给创作者，不给 Agent 工具）"""
+    await run_sync_transaction(deleted_projects.purge, get_project_manager().layout, deleted_id)
+    try:
+        # 项目已彻底删除，它的正式对象引用随之撤下；失败时维护循环在保留期过后兜底
+        await release_holder(deleted_id)
+    except Exception:
+        logger.warning("撤下已删除项目的正式对象引用失败 deleted=%s", deleted_id, exc_info=True)
+    return {"success": True}
 
 
 @router.get("/projects/{name}/scripts/{script_file}")
@@ -1337,7 +1413,7 @@ async def insert_script_item(
     _t: Translator,
     make_script_batch_editor: ScriptBatchEditorFactoryDep,
 ):
-    """新增一条待编写分镜，按当前剧本 revision 执行 ``insert_after``；新分镜不继承同号旧分镜的产物。"""
+    """新增一条待编写分镜，按当前剧本 revision 执行 ``insert_after``；新分镜的编号由服务端另发，取本集从没用过的号。"""
     try:
 
         def _sync():
@@ -1366,8 +1442,10 @@ async def insert_script_item(
             require_script_edit_result(result, operation_not_found=True)
             saved_items, _id_field, _kind = resolve_items(manager.load_script(name, req.script_file))
             # 提交后到回读之间条目可能已被并发移除，此时 item 为 null。
+            # 批量编辑提交时由服务端发编号，blank_item_after 给的只是占位。
+            inserted_id = result.affected_ids[0] if result.affected_ids else None
             inserted = next(
-                (entry for entry in saved_items if isinstance(entry, dict) and entry.get(id_field) == item[id_field]),
+                (entry for entry in saved_items if isinstance(entry, dict) and entry.get(id_field) == inserted_id),
                 None,
             )
             return {"success": True, "item": inserted, "edit_result": result.model_dump(mode="json")}
@@ -1982,7 +2060,9 @@ async def set_project_source(
                 # 文本模型已不在供应商清单中：回传「重新选择模型」指引，而非笼统的生成失败
                 logger.warning("上传后概览生成失败：模型不在清单中 (%s)", ov_err)
                 result["overview"] = None
-                result["overview_error"] = render_message(FAILURE_CODE_KEYS[ov_err.code], ov_err.params, _t, names)
+                result["overview_error"] = render_message(
+                    failure_message_key(ov_err.code, ov_err.params), ov_err.params, _t, names
+                )
             except Exception as ov_err:
                 # 概览生成是上传的可选后续步骤，失败仅降级回传提示、不影响上传成功。
                 # 裸 str(ov_err) 可能携带服务器路径等内部细节，回传翻译后的通用文案。

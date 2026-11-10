@@ -13,12 +13,16 @@ import {
   type AssetKind,
   type ReferenceVideoUnit,
 } from "@/types/reference-video";
-import { itemIdWithinEpisode } from "@/utils/episode-display";
 
 // mention 胶囊改用 inline box-shadow 伪描边 + 背景色，不额外占宽：以前用 `px-0.5`
 // 每遇到一个 mention 视觉层比 textarea 字符宽度多 4px，导致光标定位与可见字符偏移。
 // 该类只应用颜色/背景/圆角，不改变盒模型宽度。
 const MENTION_SPAN_CLASS = "rounded-sm";
+
+// 着色镜像层与输入框必须逐像素同排版：preflight 给 pre 等宽字体、给 textarea `font: inherit`，
+// 两层都显式用正文比例字体，否则字宽不同，光标与选区落在可见字符旁边；输入框出现滚动条时
+// 可用宽度变窄、折行位置也会分叉，所以两层都预留滚动条槽位。
+const EDITOR_LAYER_CLASS = "p-3 font-sans text-sm leading-6 [scrollbar-gutter:stable]";
 
 /**
  * 渲染 pre 层的 token span 串；当 caretOffset 命中某个 token 内部或边界时，在该位置
@@ -78,11 +82,14 @@ function renderHighlightedTokens(
     const nextAcc = acc + tk.text.length;
     if (!inserted && caretOffset !== null && caretOffset >= acc && caretOffset <= nextAcc) {
       const local = caretOffset - acc;
+      // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 正文按位置切出的着色片段，只读、无状态，位置即身份
       out.push(<Fragment key={`pre-${i}`}>{renderPiece(tk, tk.text.slice(0, local), `pre-${i}`)}</Fragment>);
       if (anchorEl) out.push(anchorEl);
+      // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 同上：光标后半段的着色片段
       out.push(<Fragment key={`post-${i}`}>{renderPiece(tk, tk.text.slice(local), `post-${i}`)}</Fragment>);
       inserted = true;
     } else {
+      // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 同上：完整的着色片段
       out.push(<Fragment key={`t-${i}`}>{renderPiece(tk, tk.text, `t-${i}`)}</Fragment>);
     }
     acc = nextAcc;
@@ -311,10 +318,7 @@ export function ReferenceVideoCard({
 
   return (
     <div className="flex flex-1 flex-col">
-      <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
-        <span className="font-mono" translate="no">
-          {itemIdWithinEpisode(unit.unit_id)}
-        </span>
+      <div className="mb-1 flex items-center justify-end text-xs text-muted-foreground">
         <div className="flex items-center gap-2">
           <PromptPreviewButton
             title={t("reference_prompt_preview_title")}
@@ -328,6 +332,7 @@ export function ReferenceVideoCard({
                 {result.references.length ? (
                   <ol className="space-y-2">
                     {result.references.map((reference, index) => (
+                      // react-doctor-disable-next-line react-doctor/no-array-index-as-key -- 预览结果整份替换、只读，同一张参考图可出现多次，行内无状态
                       <li key={`${reference.path}-${index}`} className="flex items-center gap-3 text-xs text-subtle-foreground">
                         <ReferencePreviewImage projectName={projectName} path={reference.path} name={reference.name} />
                         <span>{t("reference_prompt_preview_image", { index: index + 1, name: reference.name })}</span>
@@ -357,7 +362,7 @@ export function ReferenceVideoCard({
           aria-hidden
           // 着色镜像层：只显示与输入框同步滚动的那一段，溢出部分由输入框自己滚动到达。
           data-overflow-ok="与输入框同步滚动的着色镜像层"
-          className="pointer-events-none absolute inset-0 m-0 overflow-hidden whitespace-pre-wrap break-words p-3 text-sm leading-6"
+          className={`pointer-events-none absolute inset-0 m-0 overflow-hidden whitespace-pre-wrap break-words ${EDITOR_LAYER_CLASS}`}
         >
           {pickerOpen
             ? renderHighlightedTokens(tokens, atStart, setAnchorEl, voiceoverLabel)
@@ -384,7 +389,7 @@ export function ReferenceVideoCard({
           placeholder={t("reference_editor_placeholder")}
           aria-label={t("reference_editor_aria_name")}
           spellCheck={false}
-          className="absolute inset-0 h-full w-full resize-none bg-transparent p-3 text-sm leading-6 text-transparent caret-foreground placeholder:text-muted-foreground focus:outline-none"
+          className={`absolute inset-0 h-full w-full resize-none bg-transparent ${EDITOR_LAYER_CLASS} text-transparent caret-foreground placeholder:text-muted-foreground focus:outline-none`}
         />
 
         {pickerOpen && anchorEl && (

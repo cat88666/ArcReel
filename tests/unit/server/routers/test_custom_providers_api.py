@@ -25,7 +25,6 @@ from lib.custom_provider.endpoints import (
     declarative_endpoint_spec,
     get_endpoint_spec,
 )
-from server.routers import custom_providers
 from tests.factories import custom_endpoint_definition
 from tests.fakes import use_project_manager
 from tests.http_capture import capture_http, only_request
@@ -210,26 +209,55 @@ class TestEndpointCatalog:
             "openai-images-generations",
             "openai-images-edits",
             "openai-chat-image",
+            "openrouter-images",
             "gemini-image",
             "openai-video",
             "newapi-video",
             "v2-video-generations",
-            "ark-seedance",
-            "vidu-video",
+            "ark-seedance-1",
+            "ark-seedance-2",
+            "ark-seedance-2-5",
+            "ark-seedream-3",
+            "ark-seedream-4",
+            "vidu-video-q3-turbo",
+            "vidu-video-generic",
+            "vidu-video-q3-pro",
+            "vidu-video-q3-fast",
+            "vidu-video-q3-reference",
+            "vidu-video-q2",
+            "vidu-video-q2-pro",
+            "vidu-video-q2-fast",
+            "vidu-video-q1",
+            "vidu-video-q1-classic",
+            "vidu-video-2",
+            "vidu-video-q4",
             "openrouter-video",
             "xai-video",
-            "dashscope-image",
-            "dashscope-async-video",
+            "dashscope-qwen-image",
+            "dashscope-wan-image",
+            "dashscope-qwen-image-edit",
+            "dashscope-video",
+            "dashscope-always-on-video",
+            "dashscope-reference-video",
+            "dashscope-reference-voice-video",
+            "dashscope-wan3-video",
             "minimax-image",
             "minimax-hailuo-v1",
             "minimax-hailuo-v1-fast",
             "minimax-s2v-01",
             "minimax-h3",
             "kling-image",
-            "kling-video",
+            "kling-image-single",
+            "kling-video-pro-silent",
+            "kling-video-pro-audio",
+            "kling-video-audio",
+            "kling-video-silent",
+            "kling-video-model-path",
             "gemini-video",
+            "gemini-interactions-video",
             "openai-tts",
             "dashscope-tts",
+            "dashscope-speech-synthesizer",
             "minimax-tts",
             "gemini-tts",
         }
@@ -283,7 +311,7 @@ class TestEndpointCatalog:
         resp = custom_providers_client.get("/api/v1/custom-providers/endpoints")
         assert resp.status_code == 200
         by_key = {e["key"]: e for e in resp.json()["endpoints"]}
-        assert by_key["kling-video"]["end_image_capable"] is True
+        assert by_key["kling-video-pro-silent"]["end_image_capable"] is True
         assert by_key["openai-chat"]["end_image_capable"] is False
         assert by_key["openai-images"]["end_image_capable"] is False
         # 与注册表保持同源，不在响应层另立一份判断
@@ -886,75 +914,6 @@ class TestFullUpdateCleansStaleModelRefs:
         assert await svc.get_setting("default_image_backend", "") == f"custom-{pid}/dall-e-3"
         assert await svc.get_setting("text_backend_simple", "") == f"custom-{other_pid}/gpt-4o"
         assert await svc.get_setting("default_video_backend_i2v", "") == f"custom-{pid}/gpt-4o"
-
-
-class TestGlobalBucketRefsHint:
-    """能力编辑响应应非阻塞地提示模型正被哪些全局桶键引用。"""
-
-    async def test_referenced_model_lists_global_keys(
-        self, custom_providers_client: TestClient, db_session: AsyncSession
-    ):
-        resp = custom_providers_client.post("/api/v1/custom-providers", json=_PROVIDER_PAYLOAD)
-        pid = resp.json()["id"]
-
-        svc = ConfigService(db_session)
-        await svc.set_setting("default_text_backend", f"custom-{pid}/gpt-4o")
-        await svc.set_setting("default_video_backend_i2v", f"custom-{pid}/gpt-4o")
-        await db_session.commit()
-
-        get_resp = custom_providers_client.get(f"/api/v1/custom-providers/{pid}")
-        assert get_resp.status_code == 200
-        models = {m["model_id"]: m for m in get_resp.json()["models"]}
-        assert set(models["gpt-4o"]["global_bucket_refs"]) == {"default_text_backend", "default_video_backend_i2v"}
-        # 未被引用的模型不带提示
-        assert models["dall-e-3"]["global_bucket_refs"] is None
-
-    async def test_unreferenced_models_have_no_hint(self, custom_providers_client: TestClient):
-        resp = custom_providers_client.post("/api/v1/custom-providers", json=_PROVIDER_PAYLOAD)
-        pid = resp.json()["id"]
-
-        get_resp = custom_providers_client.get(f"/api/v1/custom-providers/{pid}")
-        for m in get_resp.json()["models"]:
-            assert m["global_bucket_refs"] is None
-
-    async def test_save_not_blocked_when_referenced(
-        self, custom_providers_client: TestClient, db_session: AsyncSession
-    ):
-        """提示不阻塞保存：被全局桶引用的模型仍可正常被替换/删除。"""
-        resp = custom_providers_client.post("/api/v1/custom-providers", json=_PROVIDER_PAYLOAD)
-        pid = resp.json()["id"]
-
-        svc = ConfigService(db_session)
-        await svc.set_setting("default_video_backend_i2v", f"custom-{pid}/gpt-4o")
-        await db_session.commit()
-
-        replace_resp = custom_providers_client.put(
-            f"/api/v1/custom-providers/{pid}",
-            json={
-                "display_name": "Regression Test",
-                "base_url": "https://api.example.com/v1",
-                "models": [
-                    {
-                        "model_id": "gpt-4o",
-                        "display_name": "GPT-4o",
-                        "endpoint": "openai-chat",
-                        "is_default": True,
-                        "is_enabled": True,
-                    },
-                ],
-            },
-        )
-        assert replace_resp.status_code == 200
-        assert replace_resp.json()["models"][0]["global_bucket_refs"] == ["default_video_backend_i2v"]
-
-    def test_global_bucket_keys_have_i18n_labels(self):
-        """每个提示键都须有三语文案：前端按 `global_bucket_label_<key>` 动态取词，缺文案会把
-        原始 key 渲染给用户，而 zh/en/vi 三语一致性检查只比对彼此、看不见后端新增的键。"""
-        i18n_dir = Path(__file__).resolve().parents[4] / "frontend" / "src" / "i18n"
-        for locale in ("zh", "en", "vi"):
-            content = (i18n_dir / locale / "dashboard.ts").read_text(encoding="utf-8")
-            for key in custom_providers._GLOBAL_BUCKET_REFERENCE_KEYS:
-                assert f"'global_bucket_label_{key}'" in content, f"{locale} 缺 global_bucket_label_{key} 文案"
 
 
 class TestEmptyModelIdRejected:

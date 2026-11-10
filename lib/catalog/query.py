@@ -8,6 +8,9 @@
 （``lib/catalog/snapshot/``，加载时过 ``arcreel_catalog_core`` 的实例侧校验）与官方同步取回的数据
 （``lib.catalog.official_sync``）中较新的一份，用户修改的条目副本整条替换官方条目。
 价格是条目的价目表，见 :func:`provider_model_price`。
+生命周期（可用、即将下线、已下线）按当天日期现算（:func:`lib.catalog.lifecycle.entry_lifecycle`），不进索引缓存：已下线的模型仍在
+清单里（:func:`list_models` 标 ``hidden``），但不作默认模型（:func:`default_model`），也不能调用（:func:`require_callable`）。
+应用版本低于最低应用版本的官方收录模型不进清单，只经 :func:`version_gated_models` 供设置页列出（docs/adr/0103）。
 供应商模型一级的查询返回目录自己的值对象（:class:`CatalogModel`、:class:`CatalogSearchHit`）；按名字对应条目的
 :func:`find_entry` 返回 ``arcreel_catalog_core`` 的 ``CatalogEntry``，调用方要的正是条目本身的键、事实与价目表。
 """
@@ -42,6 +45,8 @@ from arcreel_catalog_core import (
 from lib.app_version import app_version
 from lib.catalog.composition import ComposedCatalog, EntrySource, compose_catalog, merge_official
 from lib.catalog.entry_matching import match_entry
+from lib.catalog.errors import ModelDiscontinuedError, ModelNotInCatalogError
+from lib.catalog.lifecycle import AVAILABLE, Lifecycle, entry_lifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +67,7 @@ ModelCapability = Literal[
 #: 两栖模型沿用的旧模型键。目录数据里供应商模型的身份是（API 模型名, 条目媒体类型），同一 API 模型名的
 #: 两个供应商模型在这里各取一个键；不在表中的供应商模型以 API 模型名为键。设置与项目里已存的键靠它保持可解析。
 _LEGACY_MODEL_KEYS: Mapping[tuple[str, str, str], str] = {
+    ("kling", "kling-v3", "image"): "kling-v3-image",
     ("kling", "kling-v3-omni", "image"): "kling-v3-omni-image",
 }
 
@@ -71,8 +77,8 @@ class CatalogModel:
     """供应商名下一个模型键在目录中的信息：模型条目的事实，加上这个供应商模型自己的事实。
 
     条目事实：``display_name``、``media_type``、``capabilities``、可选时长与时长约束、
-    ``resolutions``、``max_output_tokens``、``hidden``（条目已下架，不出现在候选里）。供应商模型事实：
-    ``default``（这个供应商在该媒体类型下的默认模型）、``api_model_name``（发给供应商的模型名，``None``
+    ``resolutions``、``max_output_tokens``、``max_reference_images``（图片与视频的参考图上限，``None`` 为未收录）、``hidden``（条目已下线，不出现在候选里，按当天日期现算）。供应商模型事实：
+    ``default``（这个供应商在该媒体类型下的默认模型；已下线时为假）、``api_model_name``（发给供应商的模型名，``None``
     时用模型键）。价格不在这里，经 :func:`provider_model_price` 取。
 
     字段名与顺序即设置接口里模型信息的序列化形状（``dataclasses.asdict``）。
@@ -89,6 +95,7 @@ class CatalogModel:
     hidden: bool = False
     api_model_name: str | None = None
     max_output_tokens: int | None = None
+    max_reference_images: int | None = None
 
 
 @functools.cache
@@ -132,6 +139,7 @@ def _to_catalog_model(entry: CatalogEntry, api_model_name: str, key: str, defaul
     reference_durations: list[int] = []
     resolutions: list[str] = []
     max_output_tokens: int | None = None
+    max_reference_images: int | None = None
     facts = entry.facts
     match facts:
         case TextFacts():
@@ -147,7 +155,9 @@ def _to_catalog_model(entry: CatalogEntry, api_model_name: str, key: str, defaul
             if facts.image_to_image:
                 capabilities.append("image_to_image")
             resolutions = list(facts.resolutions)
+            max_reference_images = facts.max_reference_images
         case VideoFacts():
+            max_reference_images = facts.max_reference_images
             durations = list(facts.durations)
             resolutions = list(facts.resolutions)
             constraints = facts.duration_constraints
@@ -166,9 +176,9 @@ def _to_catalog_model(entry: CatalogEntry, api_model_name: str, key: str, defaul
         duration_resolution_constraints=by_resolution,
         reference_image_durations=reference_durations,
         resolutions=resolutions,
-        hidden=entry.discontinued,
         api_model_name=None if key == api_model_name else api_model_name,
         max_output_tokens=max_output_tokens,
+        max_reference_images=max_reference_images,
     )
 
 
@@ -206,6 +216,7 @@ class UserAddedModel:
     ``fallback_durations`` 是对应不上条目的视频模型在运行时回落的可选时长（按名字推断的时长预设），由装入方给出。
     ``capability_overrides`` 是用户的能力覆盖（docs/adr/0104），装入方已按媒体类型滤掉不合法的键值：模型事实维度
     在这里整维替换目录信息，通道事实维度经 :func:`user_added_capability_overrides` 交给调用通道一侧合并。
+    ``endpoint`` 是用户为它选的内置调用端点，``None`` 表示没有记下（装配取供应商在这个媒体类型下的默认端点）。
     """
 
     provider_id: str
@@ -215,6 +226,7 @@ class UserAddedModel:
     entry_binding: str | None = None
     fallback_durations: tuple[int, ...] = ()
     capability_overrides: Mapping[str, object] = field(default_factory=dict)
+    endpoint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -231,12 +243,23 @@ class _IndexedModel:
     official: bool
     base_model: CatalogModel | None = None
     capability_overrides: Mapping[str, object] = field(default_factory=dict)
+    endpoint: str | None = None
+    min_app_version: str | None = None
+
+
+@dataclass(frozen=True)
+class _ProviderIndex:
+    """一个供应商的索引：``models`` 是清单（可作候选、默认与调用的模型，官方收录在前、用户添加在后）；
+    ``version_gated`` 是应用版本不满足最低应用版本的官方收录模型，按清单顺序，只供设置页列出。"""
+
+    models: dict[str, _IndexedModel]
+    version_gated: dict[str, _IndexedModel]
 
 
 def meets_min_app_version(required: str | None, current: str) -> bool:
     """应用版本 ``current`` 是否达到供应商模型标注的最低应用版本；没有标注时总是满足。
 
-    任一侧判不出高低时视为不满足：宁可不展示，也不让旧实例调用它的调用通道不会编码的模型。
+    任一侧判不出高低时视为不满足：宁可不启用，也不让旧实例调用它的调用通道不会编码的模型。
     """
     if required is None:
         return True
@@ -246,9 +269,10 @@ def meets_min_app_version(required: str | None, current: str) -> bool:
         return False
 
 
-def _official_models(data: CatalogData, provider_id: str, current_version: str) -> dict[str, _IndexedModel]:
+def _official_models(data: CatalogData, provider_id: str, current_version: str) -> _ProviderIndex:
     listing = data.builtin_providers[provider_id]
     models: dict[str, _IndexedModel] = {}
+    version_gated: dict[str, _IndexedModel] = {}
     for model in listing.models:
         entry = data.entry_of(model)
         if entry is None:
@@ -256,22 +280,23 @@ def _official_models(data: CatalogData, provider_id: str, current_version: str) 
                 "内置供应商 %s 的模型 %s 引用不到条目 %s，已跳过", provider_id, model.api_model_name, model.entry
             )
             continue
-        # 低于最低应用版本的实例不展示、也不启用它；它被指定为默认时，按没有默认处理（docs/adr/0103）。
-        if not meets_min_app_version(model.min_app_version, current_version):
-            continue
         key = _LEGACY_MODEL_KEYS.get((provider_id, model.api_model_name, entry.media_type), model.api_model_name)
-        if key in models:
+        if key in models or key in version_gated:
             logger.warning("内置供应商 %s 的模型键 %s 重复，已跳过后一个", provider_id, key)
             continue
-        default = listing.defaults.get(entry.media_type) == model.api_model_name
-        models[key] = _IndexedModel(
+        # 低于最低应用版本的实例不启用它，只在设置页列出；它被指定为默认时，按没有默认处理（docs/adr/0103）。
+        callable_here = meets_min_app_version(model.min_app_version, current_version)
+        default = callable_here and listing.defaults.get(entry.media_type) == model.api_model_name
+        (models if callable_here else version_gated)[key] = _IndexedModel(
             _to_catalog_model(entry, model.api_model_name, key, default),
             entry,
             model.multiplier,
             model.api_model_name,
             official=True,
+            endpoint=model.endpoint,
+            min_app_version=model.min_app_version,
         )
-    return models
+    return _ProviderIndex(models, version_gated)
 
 
 def _toggle(capabilities: list[ModelCapability], capability: ModelCapability, value: object) -> list[ModelCapability]:
@@ -335,20 +360,23 @@ def _user_added_model(data: CatalogData, user: UserAddedModel) -> _IndexedModel:
         official=False,
         base_model=base,
         capability_overrides=user.capability_overrides,
+        endpoint=user.endpoint,
     )
 
 
 def _build_index(
     data: CatalogData, user_models: tuple[UserAddedModel, ...], current_version: str
-) -> dict[str, dict[str, _IndexedModel]]:
+) -> dict[str, _ProviderIndex]:
     index = {
         provider_id: _official_models(data, provider_id, current_version) for provider_id in data.builtin_providers
     }
     for user in user_models:
-        models = index.setdefault(user.provider_id, {})
-        # 官方数据收录了同一模型键时，换成官方版本，只保留启用状态（docs/adr/0099）。
-        if user.model_id not in models:
-            models[user.model_id] = _user_added_model(data, user)
+        provider = index.setdefault(user.provider_id, _ProviderIndex({}, {}))
+        # 官方数据收录了同一模型键时，换成官方版本，只保留启用状态（docs/adr/0099）。官方版本因应用版本不够
+        # 用不了时，保留用户添加的那个，设置页也只列它。
+        if user.model_id not in provider.models:
+            provider.models[user.model_id] = _user_added_model(data, user)
+            provider.version_gated.pop(user.model_id, None)
     return index
 
 
@@ -356,7 +384,7 @@ def _build_index(
 _user_added: list[tuple[UserAddedModel, ...]] = [()]
 
 # 按快照对象缓存的索引：快照每进程只加载一次，索引随之只建一次；用户添加的模型变化时清空重建。
-_index_cache: list[tuple[CatalogData, dict[str, dict[str, _IndexedModel]]]] = []
+_index_cache: list[tuple[CatalogData, dict[str, _ProviderIndex]]] = []
 
 # 用户修改的条目副本：由用户条目表装入，见 install_user_entries。单元素列表当信箱。
 _user_entries: list[tuple[tuple[CatalogEntry, ...], frozenset[EntryKey]]] = [((), frozenset())]
@@ -414,15 +442,27 @@ def get_entry(key: EntryKey) -> CatalogEntry | None:
     return next((entry for entry in catalog_data().entries if entry.key == key), None)
 
 
-def _indexed_models(provider_id: str) -> dict[str, _IndexedModel]:
+def _provider_index(provider_id: str) -> _ProviderIndex | None:
     data = catalog_data()
     if not _index_cache or _index_cache[0][0] is not data:
         _index_cache[:] = [(data, _build_index(data, _user_added[0], app_version()))]
-    return _index_cache[0][1].get(provider_id, {})
+    return _index_cache[0][1].get(provider_id)
+
+
+def _indexed_models(provider_id: str) -> dict[str, _IndexedModel]:
+    provider = _provider_index(provider_id)
+    return provider.models if provider is not None else {}
+
+
+def _current_model(indexed: _IndexedModel) -> CatalogModel:
+    """索引项在今天的目录信息：条目已下线时标 ``hidden``、去掉默认标记。索引里缓存的是与日期无关的部分。"""
+    if not entry_lifecycle(indexed.entry).discontinued:
+        return indexed.model
+    return replace(indexed.model, hidden=True, default=False)
 
 
 def _provider_models(provider_id: str) -> dict[str, CatalogModel]:
-    return {key: indexed.model for key, indexed in _indexed_models(provider_id).items()}
+    return {key: _current_model(indexed) for key, indexed in _indexed_models(provider_id).items()}
 
 
 def reset_for_tests() -> None:
@@ -451,7 +491,79 @@ def get_model(provider_id: str, model_id: str, *, media_type: str | None = None)
     模型键引用到别的媒体类型与不在清单里同样不可用。
     """
     indexed = _indexed_model(provider_id, model_id, media_type)
-    return indexed.model if indexed is not None else None
+    return _current_model(indexed) if indexed is not None else None
+
+
+def _discontinued_error(provider_id: str, model_id: str, media_type: str, state: Lifecycle) -> ModelDiscontinuedError:
+    return ModelDiscontinuedError(
+        provider_id=provider_id,
+        model_id=model_id,
+        media_type=media_type,
+        shutdown_date=state.shutdown_date.isoformat() if state.shutdown_date is not None else None,
+        successor=state.successor,
+    )
+
+
+def require_callable(provider_id: str, model_id: str, media_type: str) -> CatalogModel:
+    """调用内置供应商模型前的检查：在该供应商这一媒体类型的清单里、且没有下线，返回它的目录信息。
+
+    已下线时抛 :class:`ModelDiscontinuedError`，带下线日期与后继。不在清单里时，按名字对应到本地保留的条目
+    （官方数据删除条目后本地仍保留最后一个版本），条目已下线的同样抛 :class:`ModelDiscontinuedError`；
+    其余抛 :class:`ModelNotInCatalogError`，由用户重新选择，不回落到别的模型。
+    """
+    reject_discontinued(provider_id, model_id, media_type)
+    return require_listed(provider_id, model_id, media_type)
+
+
+def require_listed(provider_id: str, model_id: str, media_type: str) -> CatalogModel:
+    """内置供应商模型在该供应商这一媒体类型的清单里时返回它的目录信息，否则抛 :class:`ModelNotInCatalogError`；不看生命周期。
+
+    供续跑已提交给厂商的任务使用：只轮询厂商侧已存在的任务、不发起新调用，模型已下线也照常取回结果。新调用一律经
+    :func:`require_callable`。
+    """
+    indexed = _indexed_model(provider_id, model_id, media_type)
+    if indexed is None:
+        raise ModelNotInCatalogError(provider_id=provider_id, model_id=model_id, media_type=media_type)
+    return indexed.model
+
+
+def reject_discontinued(provider_id: str, model_id: str, media_type: str) -> None:
+    """引用的内置供应商模型今天已下线时抛 :class:`ModelDiscontinuedError`；不检查它在不在清单里。
+
+    清单里的模型看它所引的条目（用户添加的看条目绑定或名字对应），不在清单里的按名字对应本地保留的条目。
+    供复用 backend 实例的调用方在取缓存前使用；完整的调用检查见 :func:`require_callable`。
+    """
+    reject_discontinued_entry(provider_id, model_id, media_type, referenced_entry(provider_id, model_id, media_type))
+
+
+def referenced_entry(provider_id: str, model_id: str, media_type: str) -> CatalogEntry | None:
+    """设置里引用的内置供应商模型所对应的条目，供生命周期判定使用。
+
+    清单里的模型取它所引的条目；不在清单里的按名字对应本地保留的条目（官方数据删除条目后本地仍保留最后一个版本）。
+    对应不上时为 ``None``。
+    """
+    indexed = _indexed_model(provider_id, model_id, media_type)
+    return indexed.entry if indexed is not None else find_entry(model_id, media_type=media_type)
+
+
+def reject_discontinued_entry(provider_id: str, model_id: str, media_type: str, entry: CatalogEntry | None) -> None:
+    """供应商模型所对应的条目今天已下线时抛 :class:`ModelDiscontinuedError`，带下线日期与后继。
+
+    调用方自己定好了条目：内置供应商经 :func:`reject_discontinued`，自定义供应商按条目绑定或名字对应
+    （``lib.custom_provider.model_facts.model_entry``）。``entry`` 为 ``None`` 时没有生命周期信息，不拦。
+    """
+    state = entry_lifecycle(entry)
+    if state.discontinued:
+        raise _discontinued_error(provider_id, model_id, media_type, state)
+
+
+def provider_model_entry(provider_id: str, model_id: str, media_type: str) -> CatalogEntry | None:
+    """内置供应商模型对应的条目：官方收录的取清单所引的条目，用户添加的取条目绑定或按名字现查的结果。
+
+    供应商或模型键不在目录中、模型不是这一媒体类型，或用户添加的模型对应不上条目时为 ``None``。
+    """
+    indexed = _indexed_model(provider_id, model_id, media_type)
+    return indexed.entry if indexed is not None else None
 
 
 def list_models(provider_id: str) -> dict[str, CatalogModel]:
@@ -474,40 +586,72 @@ class ProviderModelView:
     base_model: CatalogModel | None = None
     #: 用户添加的模型的能力覆盖（已滤掉不合法的键值）；官方收录的模型没有。
     capability_overrides: Mapping[str, object] = field(default_factory=dict)
+    #: 所对应条目在今天的生命周期；对应不上条目时为可用。
+    lifecycle: Lifecycle = AVAILABLE
+    #: 用户添加的模型记下的内置调用端点；官方收录的模型与没有记下端点的为 ``None``。
+    endpoint: str | None = None
+    #: 官方收录的模型标注的最低应用版本；没有标注、或是用户添加的模型时为 ``None``。
+    min_app_version: str | None = None
+    #: 应用版本达到 ``min_app_version``。不满足的只出现在 :func:`version_gated_models` 里。
+    min_app_version_satisfied: bool = True
+
+
+def _view(key: str, indexed: _IndexedModel, *, min_app_version_satisfied: bool = True) -> ProviderModelView:
+    return ProviderModelView(
+        key,
+        indexed.api_model_name,
+        _current_model(indexed),
+        indexed.entry,
+        indexed.official,
+        indexed.multiplier,
+        base_model=indexed.base_model or indexed.model,
+        capability_overrides=indexed.capability_overrides,
+        lifecycle=entry_lifecycle(indexed.entry),
+        endpoint=indexed.endpoint if not indexed.official else None,
+        min_app_version=indexed.min_app_version,
+        min_app_version_satisfied=min_app_version_satisfied,
+    )
 
 
 def provider_models(provider_id: str) -> list[ProviderModelView]:
     """列出内置供应商的全部供应商模型：官方收录的按清单顺序在前，用户添加的随后。
 
-    低于最低应用版本的官方收录模型不在其中。启用状态不在目录里，由内置供应商模型表决定。
+    低于最低应用版本的官方收录模型不在其中，见 :func:`version_gated_models`。启用状态不在目录里，由内置供应商
+    模型表决定。已下线的模型仍在其中，``lifecycle`` 标明状态。
     """
-    return [
-        ProviderModelView(
-            key,
-            indexed.api_model_name,
-            indexed.model,
-            indexed.entry,
-            indexed.official,
-            indexed.multiplier,
-            base_model=indexed.base_model or indexed.model,
-            capability_overrides=indexed.capability_overrides,
-        )
-        for key, indexed in _indexed_models(provider_id).items()
-    ]
+    return [_view(key, indexed) for key, indexed in _indexed_models(provider_id).items()]
+
+
+def version_gated_models(provider_id: str) -> list[ProviderModelView]:
+    """内置供应商下应用版本低于最低应用版本的官方收录模型，按清单顺序（docs/adr/0103）。
+
+    只供设置页的模型列表显示所需版本：它们不在 :func:`provider_models` 与 :func:`list_models` 里，因此不作候选、
+    不作默认模型，也不能调用或启用。用户添加了同一模型键的模型时，列的是用户添加的那个。
+    """
+    provider = _provider_index(provider_id)
+    if provider is None:
+        return []
+    return [_view(key, indexed, min_app_version_satisfied=False) for key, indexed in provider.version_gated.items()]
 
 
 def user_added_capability_overrides(provider_id: str, model_id: str) -> Mapping[str, object]:
     """内置供应商下用户添加的模型的能力覆盖；官方收录的模型、不在目录中的模型为空。
 
-    模型事实维度已并进 :func:`get_model` 的目录信息；通道事实维度（输入模式、参考上限、音轨形态等）由调用通道
-    一侧的能力声明合并（``lib.backends.backend_assembly.specs.builtin_video_capabilities_for_model``）。
+    模型事实维度已并进 :func:`get_model` 的目录信息；通道事实维度（输入模式、参考上限、音轨形态等）在调用通道
+    的声明与模型条目两侧求值之后整维替换（``lib.backends.backend_assembly.specs.builtin_video_capabilities_for_model``）。
     """
     indexed = _indexed_models(provider_id).get(model_id)
     return indexed.capability_overrides if indexed is not None else {}
 
 
+def provider_model_endpoint(provider_id: str, model_id: str, media_type: str) -> str | None:
+    """内置供应商模型声明或用户选择的调用端点；没有声明、不在目录中或不是这一媒体类型时为 ``None``。"""
+    indexed = _indexed_model(provider_id, model_id, media_type)
+    return indexed.endpoint if indexed is not None else None
+
+
 def default_model(provider_id: str, media_type: str) -> str | None:
-    """供应商在该媒体类型下的默认模型键；没有指定时返回 ``None``。"""
+    """供应商在该媒体类型下的默认模型键；没有指定、或指定的模型已下线时返回 ``None``（按没有默认处理）。"""
     for model_id, model in _provider_models(provider_id).items():
         if model.media_type == media_type and model.default:
             return model_id
@@ -609,7 +753,7 @@ def search_entries(query: str = "", media_type: str | None = None) -> list[Catal
 
     搜索词按空白切成若干词，每个词都要命中条目的官方模型名、模型别名或显示名之一（忽略大小写，
     点号视同连字符，写成「厂商/模型名」时忽略厂商）。空搜索词列出全部。整句与名称相同的排最前，
-    其次是以整句开头的，其余按目录顺序；已下架的条目一律排在后面。
+    其次是以整句开头的，其余按目录顺序；已下线的条目（按当天日期判定）一律排在后面。
     """
     tokens = [normalize_model_name(token) for token in query.split()]
     whole = normalize_model_name(query.strip())
@@ -624,7 +768,8 @@ def search_entries(query: str = "", media_type: str | None = None) -> list[Catal
             continue
         seen.add(identity)
         rank = 0 if whole in keys else 1 if any(key.startswith(whole) for key in keys) else 2
-        hit = CatalogSearchHit(entry.maker, entry.name, entry.media_type, entry.display_name, entry.discontinued)
-        ranked.append((entry.discontinued, rank, index, hit))
+        discontinued = entry_lifecycle(entry).discontinued
+        hit = CatalogSearchHit(entry.maker, entry.name, entry.media_type, entry.display_name, discontinued)
+        ranked.append((discontinued, rank, index, hit))
     ranked.sort(key=lambda item: item[:3])
     return [hit for *_, hit in ranked]

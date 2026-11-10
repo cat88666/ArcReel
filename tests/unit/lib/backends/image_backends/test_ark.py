@@ -17,10 +17,11 @@ from lib.backends.image_backends.base import (
     ImageCapability,
     ImageGenerationRequest,
     ImageGenerationResult,
+    ImageRequestFacts,
     ReferenceImage,
 )
 from lib.backends.providers import PROVIDER_ARK
-from tests.http_capture import capture_http, only_request
+from tests.http_capture import capture_http, only_request, request_json
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -110,7 +111,7 @@ class TestArkImageBackendInit:
             from lib.backends.image_backends.ark import ArkImageBackend
 
             ArkImageBackend(api_key="my-key")
-        assert created == [{"api_key": "my-key", "base_url": None}]
+        assert created == [{"api_key": "my-key", "base_url": None, "transport_layer": None}]
 
     def test_custom_base_url_passed_through(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("ARK_API_KEY", raising=False)
@@ -118,7 +119,9 @@ class TestArkImageBackendInit:
             from lib.backends.image_backends.ark import ArkImageBackend
 
             ArkImageBackend(api_key="k", base_url="https://ark.cn-beijing.volces.com/api/plan/v3")
-        assert created == [{"api_key": "k", "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3"}]
+        assert created == [
+            {"api_key": "k", "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3", "transport_layer": None}
+        ]
 
 
 class TestArkImageBackendProperties:
@@ -136,7 +139,7 @@ class TestArkImageBackendProperties:
         assert backend.name == PROVIDER_ARK
 
     def test_default_model(self, backend):
-        assert backend.model == "doubao-seedream-5-0-lite-260128"
+        assert backend.model == "doubao-seedream-5-0-pro-260628"
 
     def test_custom_model(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("ARK_API_KEY", raising=False)
@@ -152,22 +155,42 @@ class TestArkImageBackendProperties:
             ImageCapability.IMAGE_TO_IMAGE,
         }
 
-    @pytest.mark.parametrize(
-        "model",
-        [
-            "doubao-seedream-5-0-lite-260128",
-            "doubao-seedream-5-0-260128",
-            "doubao-seedream-4-5-251128",
-            "doubao-seedream-4-0-250828",
-        ],
-    )
-    def test_declares_seedream_reference_image_limit(self, monkeypatch: pytest.MonkeyPatch, model: str):
-        # Seedream 5.0 lite / 4.5 / 4.0 官方上限 14 张（输入 + 输出 ≤ 15）；5-0-260128 与 5.0 lite 同一模型。
-        monkeypatch.delenv("ARK_API_KEY", raising=False)
-        with patch("lib.backends.image_backends.ark.create_ark_client"):
-            from lib.backends.image_backends.ark import ArkImageBackend
 
-            assert ArkImageBackend(api_key="k", model=model).max_reference_images == 14
+class TestArkImageBackendReferenceLimitIsAModelFact:
+    """Seedream 各代的参考图上限记在条目上：通道不按型号名声明、不截断，计量按实发张数。"""
+
+    @pytest.mark.parametrize("model", ["doubao-seedream-5-0-pro-260628", "doubao-seedream-4-5-251128"])
+    async def test_channel_sends_every_reference_whatever_the_model_name(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str
+    ):
+        from lib.backends.ark_shared import ARK_BASE_URL
+        from lib.backends.image_backends.ark import ArkImageBackend
+
+        monkeypatch.delenv("ARK_API_KEY", raising=False)
+        backend = ArkImageBackend(api_key="k", model=model)
+        refs = []
+        for index in range(16):
+            ref_file = tmp_path / f"ref{index}.png"
+            ref_file.write_bytes(f"img-{index}".encode())
+            refs.append(ReferenceImage(path=str(ref_file)))
+
+        with capture_http() as router:
+            route = router.post(f"{ARK_BASE_URL}/images/generations").mock(
+                return_value=httpx.Response(200, json={"model": model, "created": 1, "data": [{"b64_json": FAKE_B64}]})
+            )
+            result = await backend.generate(
+                ImageGenerationRequest(prompt="merge", output_path=tmp_path / "out.png", reference_images=refs)
+            )
+
+        assert await backend.reference_image_limit() is None
+        assert len(request_json(only_request(route))["image"]) == 16
+        assert result.usage.quantities["input_images"] == 16
+
+    def test_estimate_reports_the_references_that_will_be_sent(self):
+        from lib.backends.image_backends.ark import ArkImageBackend
+
+        facts = ImageRequestFacts(model="doubao-seedream-5-0-pro-260628", aspect_ratio="16:9", reference_count=12)
+        assert ArkImageBackend.estimate_usage(facts).quantities["input_images"] == 12
 
 
 class TestArkImageBackendGenerate:
@@ -191,7 +214,7 @@ class TestArkImageBackendGenerate:
 
         # SDK called correctly
         call_kwargs = client.requests[-1]
-        assert call_kwargs["model"] == "doubao-seedream-5-0-lite-260128"
+        assert call_kwargs["model"] == "doubao-seedream-5-0-pro-260628"
         assert call_kwargs["prompt"] == "a cat"
         # 部分兼容网关即便吃 response_format 仍返回 url，所以请求端不再传该参数
         assert "response_format" not in call_kwargs
@@ -247,9 +270,9 @@ class TestArkImageBackendGenerate:
         """3.0-t2i 模型族单边像素 ∈ [512, 2048]，必须用 1K 表而非 2K 表。"""
         monkeypatch.delenv("ARK_API_KEY", raising=False)
         with _recorded_ark_client() as (_created, client):
-            from lib.backends.image_backends.ark import ArkImageBackend
+            from lib.backends.image_backends.ark import ArkSeedream3ImageBackend
 
-            backend = ArkImageBackend(api_key="test-key", model="doubao-seedream-3-0-t2i-250415")
+            backend = ArkSeedream3ImageBackend(api_key="test-key", model="doubao-seedream-3-0-t2i-250415")
 
         request = ImageGenerationRequest(prompt="x", output_path=tmp_path / "v.png", aspect_ratio="9:16")
         await backend.generate(request)
@@ -259,9 +282,9 @@ class TestArkImageBackendGenerate:
         """3.0-t2i 未识别比例必须回退到 '1K' 而非 '2K'（单边像素上限 2048）。"""
         monkeypatch.delenv("ARK_API_KEY", raising=False)
         with _recorded_ark_client() as (_created, client):
-            from lib.backends.image_backends.ark import ArkImageBackend
+            from lib.backends.image_backends.ark import ArkSeedream3ImageBackend
 
-            backend = ArkImageBackend(api_key="test-key", model="doubao-seedream-3-0-t2i-250415")
+            backend = ArkSeedream3ImageBackend(api_key="test-key", model="doubao-seedream-3-0-t2i-250415")
 
         request = ImageGenerationRequest(prompt="x", output_path=tmp_path / "u3.png", aspect_ratio="weird")
         await backend.generate(request)
@@ -295,23 +318,6 @@ class TestArkImageBackendGenerate:
 
         call_kwargs = client.requests[-1]
         assert call_kwargs["image"] == expected_data_uri
-
-    async def test_i2i_truncates_references_over_the_declared_limit(self, backend_and_client, tmp_path: Path):
-        """编排层未裁剪时的兜底：只发前 max_reference_images 张。"""
-        backend, client = backend_and_client
-        refs = []
-        for index in range(16):
-            ref_file = tmp_path / f"ref{index}.png"
-            ref_file.write_bytes(f"img-{index}".encode())
-            refs.append(ReferenceImage(path=str(ref_file)))
-
-        await backend.generate(
-            ImageGenerationRequest(prompt="merge", output_path=tmp_path / "out.png", reference_images=refs)
-        )
-
-        sent = client.requests[-1]["image"]
-        assert len(sent) == backend.max_reference_images == 14
-        assert sent[-1] == "data:image/png;base64," + base64.b64encode(b"img-13").decode()
 
     async def test_i2i_multiple_refs(self, backend_and_client, tmp_path: Path):
         backend, client = backend_and_client

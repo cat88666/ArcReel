@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -20,6 +21,7 @@ from pydantic import Field
 
 from lib.db.base import DEFAULT_USER_ID
 from lib.project.project_manager import ProjectManager
+from lib.project.project_path_text import project_path_spellings, relativize_project_paths
 from server.agent_toolset.declaration import (
     AgentToolDeclaration,
     ToolDeclaration,
@@ -59,6 +61,31 @@ def resolve_project_scope(project: object, projects: ProjectManager) -> ProjectS
     if not projects.project_exists(project_name):
         raise FileNotFoundError(f"项目 '{project_name}' 缺少 project.json")
     return ProjectScope(project_name=project_name, data_root=projects.data_root)
+
+
+def _relativize_payload(value: Any, spellings: tuple[str, ...]) -> Any:
+    if isinstance(value, str):
+        return relativize_project_paths(value, spellings)
+    if isinstance(value, dict):
+        return {key: _relativize_payload(item, spellings) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return type(value)(_relativize_payload(item, spellings) for item in value)
+    return value
+
+
+def _project_relative_outcome(outcome: ToolOutcome[Any], spellings: tuple[str, ...]) -> ToolOutcome[Any]:
+    """远程错误消息不外泄服务端文件系统布局：problem 的 detail / action / params 只用项目内相对路径。"""
+    problem = outcome.problem
+    if problem is None:
+        return outcome
+    return ToolOutcome(
+        problem=replace(
+            problem,
+            detail=relativize_project_paths(problem.detail, spellings),
+            action=relativize_project_paths(problem.action, spellings) if problem.action is not None else None,
+            params=_relativize_payload(problem.params, spellings),
+        )
+    )
 
 
 def remote_input_schema(declaration: AgentToolDeclaration) -> dict[str, Any]:
@@ -102,6 +129,11 @@ class _DeclaredRemoteTool(FastMCPTool):
         return await self.invoke(arguments)
 
 
+def _locate_project(project: object, projects: ProjectManager) -> tuple[ProjectScope, tuple[str, ...]]:
+    scope = resolve_project_scope(project, projects)
+    return scope, project_path_spellings(projects.get_project_path(scope.project_name))
+
+
 def remote_tool(
     declaration: AgentToolDeclaration,
     *,
@@ -117,12 +149,11 @@ def remote_tool(
         request_arguments = dict(arguments)
         project = request_arguments.pop("project", None)
         try:
-            scope = await asyncio.to_thread(resolve_project_scope, project, projects)
+            scope, spellings = await asyncio.to_thread(_locate_project, project, projects)
         except (FileNotFoundError, ValueError) as exc:
             return remote_result(declaration, ToolOutcome(problem=ToolProblem("invalid_project", str(exc))))
-        return remote_result(
-            declaration, await invoke_declaration(declaration, request_arguments, scope, caller(), services)
-        )
+        outcome = await invoke_declaration(declaration, request_arguments, scope, caller(), services)
+        return remote_result(declaration, _project_relative_outcome(outcome, spellings))
 
     async def unused() -> CallToolResult:
         raise RuntimeError("declared remote tools override run")
